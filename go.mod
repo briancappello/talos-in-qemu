@@ -1,4 +1,4 @@
-module github.com/coglative/tinq
+module github.com/coglative/talos-in-qemu
 
 go 1.26.0
 

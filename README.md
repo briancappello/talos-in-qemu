@@ -40,17 +40,20 @@ Requires macOS on Apple silicon.
 
 ```sh
 brew install qemu siderolabs/talos/talosctl
-go install github.com/coglative/tinq/cmd/tinq@latest
+go install github.com/coglative/talos-in-qemu/cmd/tinq@latest
 ```
 
-Then fetch a Talos `nocloud` image and drop it where TinQ resolves profile names
+Then fetch a Talos **ISO** and drop it where TinQ resolves profile names
 (default `~/.hvf/images`):
 
 ```sh
 mkdir -p ~/.hvf/images
-# from https://github.com/siderolabs/talos/releases — the arm64 nocloud image
-gunzip -c nocloud-arm64.raw.gz > ~/.hvf/images/talos-nocloud.img
+curl -Lo ~/.hvf/images/talos-v1.9.5.iso \
+  https://github.com/siderolabs/talos/releases/download/v1.9.5/metal-arm64.iso
 ```
+
+Note the version — you will pin the installer to it below, and that pin is not
+optional.
 
 ## Use
 
@@ -64,7 +67,7 @@ metadata:
 spec:
   site: clvc-local          # a path component in the state dir — see "Cleanup"
   role: talos-cp
-  image: talos-nocloud.img  # resolved under -image-root when not absolute
+  image: talos-v1.9.5.iso   # resolved under -image-root when not absolute
   cpu: 4
   memory: 6Gi
   disk: 20Gi
@@ -96,6 +99,73 @@ Anything else would be two ways to build a machine, and they would drift.
 
 Once the first node is bootstrapped it can host the CRD and TinQ itself, and
 every machine after that arrives the normal way.
+
+## From a booted VM to a cluster
+
+Not wrapped in a command yet (see Status), but this is the exact sequence, and
+every flag in it is load-bearing — each one corresponds to a way it fails.
+
+```sh
+tinq -apply machine.yaml          # ~5s to Talos maintenance mode
+
+cat > patch.yaml <<'YAML'
+machine:
+  install:
+    # SELECT BY SIZE, never /dev/vdX. Enumeration is decided by qemu arg order,
+    # and the read-only boot ISO is also a virtio disk — name it and you may
+    # install onto the install media.
+    diskSelector:
+      size: '> 10GB'
+    # PIN THE INSTALLER TO THE ISO'S VERSION. Unset, it defaults to talosctl's
+    # own version, silently turning a fresh install into a cross-version
+    # upgrade. Then nothing fits: a config generated for the newer version is
+    # REJECTED by the older maintenance system that has to apply it, and a
+    # config for the older one gets installed as the newer, which can hang at
+    # /sbin/init with no console output.
+    image: ghcr.io/siderolabs/installer:v1.9.5
+    # The installed system writes its OWN kernel cmdline and does NOT inherit
+    # the ISO's console=ttyAMA0, so it goes silent on serial at exactly the
+    # moment you need to watch it boot.
+    extraKernelArgs:
+      - console=ttyAMA0
+YAML
+
+talosctl gen config mycluster https://127.0.0.1:6443 \
+  --talos-version v1.9.5 --additional-sans 127.0.0.1 \
+  --config-patch @patch.yaml --output-dir . --force
+
+talosctl apply-config --insecure -n 127.0.0.1 -e 127.0.0.1 -f controlplane.yaml
+# installs (~25s), reboots, and now boots from DISK because of bootindex
+
+export TALOSCONFIG=$PWD/talosconfig
+# BOOTSTRAP WHILE THE NODE IS `booting`, NOT `running`. Waiting for running is
+# circular: the node cannot reach running until etcd is bootstrapped.
+talosctl -n 127.0.0.1 -e 127.0.0.1 bootstrap        # silent on success
+talosctl -n 127.0.0.1 -e 127.0.0.1 kubeconfig ./kubeconfig --force
+
+KUBECONFIG=$PWD/kubeconfig kubectl get nodes -w
+```
+
+Measured on an M5 Max: maintenance ~5s, install ~25s, Talos API ~20s after
+reboot, `running` ~10s after bootstrap, node registered ~70s, `Ready` ~30s later
+— roughly **3 minutes cold to Ready**.
+
+Two probes that look right and are not: a TCP connect to a forwarded port
+succeeds even when nothing listens in the guest (qemu accepts on the host), and
+`talosctl version` always prints the *client's* tag. Use `talosctl get
+machinestatus` for liveness.
+
+### If you plan to run workloads
+
+Talos is not kind, and three defaults differ:
+
+- Control-plane nodes are **tainted**. A single-node cluster schedules nothing
+  until `cluster.allowSchedulingOnControlPlanes: true`.
+- There is **no StorageClass**. kind bundles rancher local-path; install it
+  yourself if anything wants a PVC.
+- **PodSecurity is enforced** (`baseline`, only `kube-system` exempt). Anything
+  using `hostPath` — including local-path's own helper pod — needs its namespace
+  labelled `pod-security.kubernetes.io/enforce=privileged`.
 
 ## Unprivileged by construction
 
@@ -153,12 +223,22 @@ Working and exercised:
 - Controller mode against a cluster with the CRD installed
 - `Destroy` sweeps process + state directory
 
+- **A real cluster, end to end.** Single-node control plane, Kubernetes v1.36.1
+  on Talos v1.9.5, kernel 6.12.18-talos arm64, containerd 2.0.3, node `Ready`,
+  with Crossplane and a real workload serving HTTP on it. ~3 minutes cold.
+
 Not done yet — stated plainly rather than implied:
 
-- **No one-command cluster.** After `-apply` you still run `talosctl gen config`,
-  `apply-config`, `bootstrap`, `kubeconfig` by hand. Wrapping that is the next
-  thing, and it is what would make TinQ genuinely competitive with
-  `kind create cluster` on ergonomics.
+- **No one-command cluster.** After `-apply` you still run the sequence above by
+  hand. Wrapping it is the next thing, and it is what would make TinQ genuinely
+  competitive with `kind create cluster` on ergonomics.
+- **TCP-only host forwards.** `hostForwards` emits `hostfwd=tcp:` only, so a
+  UDP service (QUIC, WebTransport, DNS) has no path from the host. Multi-protocol
+  forwards are a small change and not yet made.
+- **Newer ISOs may not boot.** v1.9.5 boots in ~5s here; the v1.13.4 ISO hangs at
+  `executing /sbin/init` at 199% CPU with no console output and no API, on a blank
+  disk with 5.9 GB free. Uninvestigated. Pin the installer to whatever ISO you
+  find boots rather than assuming newer is safer.
 - **No multi-node topology.** One NIC on user-mode networking; no VM-to-VM
   links, so no multi-node cluster and no simulated switch fabric. The QEMU
   backends needed (`socket`/`hubport`) are unprivileged, so this is a modeling
