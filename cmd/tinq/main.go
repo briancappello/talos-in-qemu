@@ -1,0 +1,382 @@
+// provider-hvf — reconciles TalosMachine into a QEMU/HVF virtual machine.
+//
+// It runs HOST-RESIDENT, not as a pod: HVF is a macOS kernel API with no
+// network endpoint, so a controller inside the cluster cannot reach it. That is
+// the same shape Sidero's own omni-infra-provider-libvirt uses (a binary beside
+// the hypervisor, talking to the control plane over the API). The provisioning
+// layer is unaffected — it sees a resource, not a hypervisor.
+//
+// The GC contract lives in driverkit and is identical for every substrate. What
+// is HERE is only what qemu decides for itself: its SCC (process + disk + pflash
+// + state dir are ONE unit), where the site tag lives (a path component), and
+// how a neutral profile name resolves to a local artifact.
+//
+// tier: compute uses QEMU user-mode networking, which requires NO ROOT. Root is
+// a vmnet requirement, so it arrives with tier fabric-sim, not before.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/coglative/tinq/driverkit"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/yaml"
+)
+
+type hvf struct {
+	stateRoot string
+	// Where neutral profile names resolve. Provider config, not claim content
+	// (ARCHITECTURE.md D12).
+	imageRoot string
+}
+
+func main() {
+	driverkit.Kubeconfig()
+	stateRoot := flag.String("state-root", filepath.Join(os.Getenv("HOME"), ".hvf"), "per-machine state root")
+	imageRoot := flag.String("image-root", filepath.Join(os.Getenv("HOME"), ".hvf", "images"), "root for resolving non-absolute spec.image profile names")
+	interval := flag.Duration("interval", 5*time.Second, "reconcile interval")
+	apply := flag.String("apply", "", "BOOTSTRAP: reconcile ONE TalosMachine read from this YAML file, with no control plane, then exit")
+	destroyF := flag.String("destroy", "", "BOOTSTRAP: destroy the TalosMachine described by this YAML file, then exit")
+	flag.Parse()
+
+	if err := os.MkdirAll(*stateRoot, 0o755); err != nil {
+		log.Fatalf("state root: %v", err)
+	}
+	d := &hvf{stateRoot: *stateRoot, imageRoot: *imageRoot}
+
+	// BOOTSTRAP MODE — the chicken-and-egg door.
+	//
+	// This provider reconciles TalosMachine CRs, so it needs a control plane to
+	// read them from. On a laptop with no cluster yet, that is circular: the
+	// cluster is the thing we are trying to create. The escape used to be a
+	// kind cluster, which drags in a container runtime purely to bootstrap a
+	// hypervisor that does not need one.
+	//
+	// So: read ONE CR from a file and run it through the SAME Driver the
+	// controller loop uses. Not a second way to make a VM — the identical
+	// Observe/Create/Destroy, identical qemu invocation, identical SCC and
+	// state layout. The only thing bypassed is where the CR came from.
+	// Anything else would be two truths about how a machine gets built, and
+	// they would drift.
+	//
+	// Once the first node is up and bootstrapped it becomes the management
+	// cluster, and this same binary runs against it in controller mode for
+	// every machine after.
+	if *apply != "" || *destroyF != "" {
+		path, verb := *apply, "apply"
+		if *destroyF != "" {
+			path, verb = *destroyF, "destroy"
+		}
+		if err := standalone(context.Background(), d, path, verb); err != nil {
+			log.Fatalf("%s %s: %v", verb, path, err)
+		}
+		return
+	}
+
+	log.Fatal(driverkit.Run(context.Background(), driverkit.Config{
+		GVR: schema.GroupVersionResource{
+			Group: "machine.hvf.fleet.io", Version: "v1alpha1", Resource: "talosmachines",
+		},
+		Finalizer: "machine.hvf.fleet.io/vm",
+		Interval:  *interval,
+	}, d))
+}
+
+// standalone runs one CR through the Driver with no control plane. It is
+// deliberately thin: decode, Observe, then Create or Destroy. Every decision
+// about WHAT a machine is stays in the driver, so bootstrap and steady state
+// cannot disagree.
+//
+// Create is skipped when Observe reports present, which is the same
+// already-exists rule the controller applies — so re-running is safe and does
+// not start a second qemu against the same state dir.
+func standalone(ctx context.Context, d *hvf, path, verb string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var obj map[string]interface{}
+	if err := yaml.Unmarshal(b, &obj); err != nil {
+		return fmt.Errorf("parse: %w", err)
+	}
+	m := &unstructured.Unstructured{Object: obj}
+	if m.GetUID() == "" {
+		// The controller gets a UID from the API server; here there is none, so
+		// derive a STABLE one from namespace/name. It keys the state dir, so it
+		// must be identical across runs or a re-apply would orphan the first VM
+		// and boot a second beside it.
+		m.SetUID(types.UID(fmt.Sprintf("bootstrap-%s-%s", m.GetNamespace(), m.GetName())))
+	}
+
+	exists, status, err := d.Observe(ctx, m)
+	if err != nil {
+		return fmt.Errorf("observe: %w", err)
+	}
+
+	switch verb {
+	case "destroy":
+		if !exists {
+			log.Printf("already gone: %s", d.dir(m))
+			return nil
+		}
+		return d.Destroy(ctx, m)
+	default:
+		if exists {
+			log.Printf("already running: %v", status)
+			return nil
+		}
+		if err := d.Create(ctx, m); err != nil {
+			return err
+		}
+		_, status, err = d.Observe(ctx, m)
+		if err != nil {
+			return fmt.Errorf("observe after create: %w", err)
+		}
+		log.Printf("created: %v", status)
+		return nil
+	}
+}
+
+// dir keys state by SITE then UID. The site is IN THE PATH on purpose: artifacts
+// must carry the identity they belong to or they cannot be garbage-collected —
+// the residue check greps for it, and it is the same property that makes gcp
+// labels and aws tags work. UID underneath so a recreated resource never reuses
+// a stale directory.
+func (h *hvf) dir(m *unstructured.Unstructured) string {
+	return filepath.Join(h.stateRoot, driverkit.Str(m, "spec", "site"), string(m.GetUID()))
+}
+
+// Observe reads the pidfile the hypervisor itself wrote and checks LIVENESS.
+// Never trust a state file alone: talosctl's `cluster show` deserialises
+// state.yaml and reports a long-dead cluster as present.
+func (h *hvf) Observe(ctx context.Context, m *unstructured.Unstructured) (bool, map[string]interface{}, error) {
+	dir := h.dir(m)
+	pid := readPid(dir)
+	if pid <= 0 || !processAlive(pid) {
+		return false, nil, nil
+	}
+	api := ""
+	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
+		hh, _ := hf.(map[string]interface{})
+		if toInt(hh["guestPort"]) == 50000 {
+			api = fmt.Sprintf("127.0.0.1:%d", toInt(hh["hostPort"]))
+		}
+	}
+	return true, map[string]interface{}{
+		"pid": int64(pid), "stateDir": dir, "apiEndpoint": api,
+	}, nil
+}
+
+func (h *hvf) Create(ctx context.Context, m *unstructured.Unstructured) error {
+	_, err := h.create(m, h.dir(m))
+	return err
+}
+
+// Destroy takes the WHOLE SCC: the process (which sweeps everything inside the
+// VM) and the state dir (everything outside it). Idempotent — it is called on
+// every delete tick until it succeeds.
+func (h *hvf) Destroy(ctx context.Context, m *unstructured.Unstructured) error {
+	return destroy(h.dir(m))
+}
+
+func readPid(dir string) int {
+	b, err := os.ReadFile(filepath.Join(dir, "qemu.pid"))
+	if err != nil {
+		return 0
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	return pid
+}
+
+func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
+	spec, _, _ := unstructured.NestedMap(m.Object, "spec")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, err
+	}
+
+	image, _ := spec["image"].(string)
+	if image == "" {
+		return 0, fmt.Errorf("spec.image is required")
+	}
+	// The claim carries a NEUTRAL PROFILE NAME (talos-nocloud.img), not a path.
+	// Resolving it to a local artifact is substrate-local configuration and
+	// belongs to the provider — same argument as GCP's project. An absolute path
+	// in the claim would be a leak: it cannot travel to GCP or AWS, where the
+	// same profile resolves to an image URI or an AMI.
+	if !filepath.IsAbs(image) {
+		image = filepath.Join(h.imageRoot, image)
+	}
+	if _, err := os.Stat(image); err != nil {
+		return 0, fmt.Errorf("resolve profile %q under %s: %w", spec["image"], h.imageRoot, err)
+	}
+
+	cpu := int64(2)
+	if v, ok := spec["cpu"].(int64); ok {
+		cpu = v
+	}
+	mem := toMB(str(spec["memory"], "2Gi"))
+	diskPath := filepath.Join(dir, "system.qcow2")
+	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
+		size := strings.TrimSuffix(str(spec["disk"], "16Gi"), "i")
+		out, err := exec.Command("qemu-img", "create", "-f", "qcow2", diskPath, size).CombinedOutput()
+		if err != nil {
+			return 0, fmt.Errorf("qemu-img: %v: %s", err, out)
+		}
+	}
+
+	// UEFI vars must be per-machine and writable; a shared copy is how two VMs
+	// end up fighting over boot state.
+	varsPath := filepath.Join(dir, "efivars.fd")
+	if _, err := os.Stat(varsPath); os.IsNotExist(err) {
+		if err := makeEFIVars(varsPath); err != nil {
+			return 0, err
+		}
+	}
+
+	// user-mode networking: unprivileged by construction. hostfwd is how the
+	// control plane reaches the Talos API without a bridge.
+	netdev := "user,id=n0"
+	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
+		h, _ := hf.(map[string]interface{})
+		hp, gp := toInt(h["hostPort"]), toInt(h["guestPort"])
+		if hp > 0 && gp > 0 {
+			netdev += fmt.Sprintf(",hostfwd=tcp:127.0.0.1:%d-:%d", hp, gp)
+		}
+	}
+
+	args := []string{
+		"-machine", "virt,accel=hvf", "-cpu", "host",
+		"-smp", strconv.FormatInt(cpu, 10),
+		"-m", strconv.Itoa(mem),
+		"-drive", "if=pflash,format=raw,readonly=on,file=" + edk2Code(),
+		"-drive", "if=pflash,format=raw,file=" + varsPath,
+		"-drive", "if=virtio,format=qcow2,file=" + diskPath,
+		"-drive", "if=none,id=cd,media=cdrom,file=" + image,
+		"-device", "virtio-blk-pci,drive=cd",
+		"-netdev", netdev,
+		"-device", "virtio-net-pci,netdev=n0",
+		"-display", "none",
+		"-serial", "file:" + filepath.Join(dir, "serial.log"),
+		"-pidfile", filepath.Join(dir, "qemu.pid"),
+		"-daemonize",
+	}
+
+	cmd := exec.Command("qemu-system-aarch64", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("qemu: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "qemu.pid"))
+	if err != nil {
+		return 0, fmt.Errorf("pidfile: %w", err)
+	}
+	return strconv.Atoi(strings.TrimSpace(string(b)))
+}
+
+// destroy is idempotent — it is called on every delete tick until it succeeds.
+func destroy(dir string) error {
+	if b, err := os.ReadFile(filepath.Join(dir, "qemu.pid")); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+			for i := 0; i < 50 && processAlive(pid); i++ {
+				time.Sleep(100 * time.Millisecond)
+			}
+			if processAlive(pid) {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	// Reap the now-empty <stateRoot>/<site> parent. os.Remove fails harmlessly
+	// while siblings remain, so the last machine of a site takes the site dir
+	// with it. An empty directory is trivial residue — and trivial residue is
+	// how "zero" quietly becomes "nearly zero".
+	os.Remove(filepath.Dir(dir))
+	return nil
+}
+
+func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
+
+func edk2Code() string {
+	for _, p := range []string{
+		"/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
+		"/usr/local/share/qemu/edk2-aarch64-code.fd",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+}
+
+// EDK2 expects a 64MiB flash volume; the shipped vars template is smaller.
+func makeEFIVars(path string) error {
+	src := strings.Replace(edk2Code(), "code.fd", "vars.fd", 1)
+	b, err := os.ReadFile(src)
+	if err != nil {
+		b = []byte{}
+	}
+	buf := make([]byte, 64*1024*1024)
+	copy(buf, b)
+	return os.WriteFile(path, buf, 0o644)
+}
+
+// ── tiny helpers ────────────────────────────────────────────────────────────
+
+func str(v interface{}, def string) string {
+	if s, ok := v.(string); ok && s != "" {
+		return s
+	}
+	return def
+}
+
+func toInt(v interface{}) int {
+	switch n := v.(type) {
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return 0
+}
+
+func toMB(s string) int {
+	s = strings.TrimSpace(s)
+	mult := 1
+	switch {
+	case strings.HasSuffix(s, "Gi"), strings.HasSuffix(s, "G"):
+		mult = 1024
+	case strings.HasSuffix(s, "Mi"), strings.HasSuffix(s, "M"):
+		mult = 1
+	}
+	n := strings.TrimRight(s, "GiMB")
+	v, err := strconv.Atoi(n)
+	if err != nil || v <= 0 {
+		return 2048
+	}
+	return v * mult
+}
+
+func nested(m *unstructured.Unstructured, f ...string) int64 {
+	v, _, _ := unstructured.NestedInt64(m.Object, f...)
+	return v
+}
+
+func nestedSlice(m *unstructured.Unstructured, f ...string) []interface{} {
+	v, _, _ := unstructured.NestedSlice(m.Object, f...)
+	return v
+}
+

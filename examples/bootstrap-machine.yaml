@@ -1,0 +1,39 @@
+# The BOOTSTRAP node: the first Talos control-plane VM on this laptop.
+#
+# It is an ordinary TalosMachine — the same kind the controller reconciles, the
+# same schema, the same driver. The only difference is HOW it is delivered:
+#
+#   provider-hvf -apply bootstrap-machine.yaml
+#
+# reads it from disk instead of from an API server, because at this point there
+# is no API server. Once this node is bootstrapped it BECOMES the control plane,
+# the CRD is installed into it, and every machine after this one arrives the
+# normal way. This file is the seam between "no cluster" and "cluster", and it
+# exists so that seam is not a kind cluster and a container runtime.
+#
+# Ports are forwarded on loopback because qemu user-mode networking needs no
+# root (see the tier note in main.go). 50000 is the Talos API — talosctl
+# targets 127.0.0.1:50000 to apply config and bootstrap etcd. 6443 is the
+# Kubernetes API, so a kubeconfig pointing at 127.0.0.1:6443 works from the
+# host with no bridge, no vmnet, and no privilege.
+apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata:
+  name: clvc-cp0
+  namespace: default
+spec:
+  # The site tag is a PATH COMPONENT in the state dir, which is what makes the
+  # artifacts garbage-collectable — the residue check greps for it. Same
+  # property as a gcp label or an aws tag.
+  site: clvc-local
+  role: talos-cp
+  # Resolved under -image-root (~/.hvf/images) when not absolute.
+  image: talos-nocloud.img
+  cpu: 4
+  memory: 6Gi
+  disk: 20Gi
+  hostForwards:
+    - hostPort: 50000
+      guestPort: 50000
+    - hostPort: 6443
+      guestPort: 6443

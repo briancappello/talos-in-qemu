@@ -1,0 +1,24 @@
+# Let Crossplane compose TalosMachine.
+#
+# Crossplane aggregates RBAC for managed resources from installed PROVIDER
+# PACKAGES. TalosMachine is a plain CRD reconciled by a host-resident
+# controller (HVF has no in-cluster endpoint), so nothing aggregates it and
+# composition fails with:
+#
+#   cannot compose resources: ... talosmachines.machine.hvf.fleet.io
+#   "..." is forbidden: User "system:serviceaccount:crossplane-system:crossplane"
+#   cannot patch resource "talosmachines" ... at the cluster scope
+#
+# The aggregation label is the supported way to extend Crossplane's own role;
+# it disappears once this ships as an xpkg, which is the reason to keep it in
+# one obvious file rather than folded into a Composition.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: crossplane:compose:talosmachines
+  labels:
+    rbac.crossplane.io/aggregate-to-crossplane: "true"
+rules:
+  - apiGroups: ["machine.hvf.fleet.io"]
+    resources: ["talosmachines", "talosmachines/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

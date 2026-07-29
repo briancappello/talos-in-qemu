@@ -1,0 +1,115 @@
+# TalosMachine — ONE VM. The single resource we own.
+#
+# Everything Talos-side (secrets, machine config, config-apply, bootstrap,
+# kubeconfig, Image Factory schematics) is crossplane-contrib/provider-talos.
+# This owns only the thing no project anywhere provides: a QEMU/HVF virtual
+# machine on macOS, where there is no network-addressable hypervisor API for an
+# existing provider to talk to.
+#
+# GRANULARITY IS DELIBERATE: one resource == one VM == one chargeable thing,
+# matching provider-gcp's Instance and provider-aws's Instance. Talos's own
+# pkg/provision is whole-CLUSTER (Create(ClusterRequest) / Destroy(Cluster)),
+# and adopting that shape would put a Talos cost into our contract and make the
+# local Composition structurally unlike every cloud one. So we do not use it.
+#
+# GC: the controller holds a finalizer. Delete -> kill the qemu process, remove
+# that machine's state directory. The VM sweeps everything inside itself; the
+# state dir is everything outside it. Nothing is shared, so nothing is orphaned.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: talosmachines.machine.hvf.fleet.io
+spec:
+  group: machine.hvf.fleet.io
+  scope: Cluster
+  names:
+    kind: TalosMachine
+    plural: talosmachines
+    singular: talosmachine
+    shortNames: [tm]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - { name: Site,  type: string, jsonPath: .spec.site }
+        - { name: Role,  type: string, jsonPath: .spec.role }
+        - name: Ready
+          type: string
+          jsonPath: ".status.conditions[?(@.type=='Ready')].status"
+        - { name: PID,   type: integer, jsonPath: .status.pid }
+        - { name: API,   type: string, jsonPath: .status.apiEndpoint }
+        - { name: Age,   type: date,   jsonPath: .metadata.creationTimestamp }
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [site, role, image, cpu, memory, disk]
+              properties:
+                site:
+                  type: string
+                  description: >-
+                    The XSite this machine belongs to. Load-bearing for GC: it is
+                    the identity tag the residue check greps for, and it is what
+                    makes the same check work for gcp labels and aws tags.
+                role:
+                  type: string
+                  enum: [talos-cp, talos-worker]
+                  description: >-
+                    Only the compute roles. sonic-leaf / routeros-* belong to
+                    tier fabric-sim and above; a compute-tier site DECLINES them
+                    rather than pretending to provide them.
+                image:
+                  type: string
+                  description: Path to the Talos boot image (ISO or raw disk) on the host.
+                cpu: { type: integer, minimum: 1 }
+                memory:
+                  type: string
+                  description: e.g. 4Gi — passed to qemu -m.
+                disk:
+                  type: string
+                  description: e.g. 16Gi — size of the sparse system disk.
+                machineConfigSecretRef:
+                  type: object
+                  description: >-
+                    Secret holding the machineconfig produced by
+                    provider-talos's Configuration resource. We consume it; we
+                    never generate it.
+                  properties:
+                    name: { type: string }
+                    namespace: { type: string }
+                    key: { type: string, default: machineconfig }
+                hostForwards:
+                  type: array
+                  description: >-
+                    Host port -> guest port maps. tier compute uses QEMU USER-MODE
+                    networking, which needs NO ROOT — the privilege requirement
+                    belongs to vmnet, i.e. to tier fabric-sim and above.
+                  items:
+                    type: object
+                    required: [hostPort, guestPort]
+                    properties:
+                      name: { type: string }
+                      hostPort: { type: integer }
+                      guestPort: { type: integer }
+            status:
+              type: object
+              properties:
+                pid: { type: integer }
+                stateDir: { type: string, description: Per-machine state root — removed on delete. }
+                apiEndpoint: { type: string }
+                observedGeneration: { type: integer }
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string }
