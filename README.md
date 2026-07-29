@@ -1,4 +1,4 @@
-# TinQ — Talos in QEMU
+# Talos in QEMU (TinQ)
 
 Kubernetes nodes on macOS as **real VMs running the real production OS**, driven
 by a Kubernetes custom resource. No Docker. No root. No nested virtualization.
@@ -169,4 +169,4 @@ Not done yet — stated plainly rather than implied:
 
 ## License
 
-Not yet chosen — do not depend on this until a LICENSE file lands.
+MIT — see [LICENSE](LICENSE).
