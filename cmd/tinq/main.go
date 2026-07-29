@@ -251,7 +251,27 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
 		h, _ := hf.(map[string]interface{})
 		hp, gp := toInt(h["hostPort"]), toInt(h["guestPort"])
-		if hp > 0 && gp > 0 {
+		if hp <= 0 || gp <= 0 {
+			continue
+		}
+		// PROTOCOL IS PER-FORWARD, and defaults to tcp only.
+		//
+		// This emitted tcp unconditionally, which silently has no path for any
+		// UDP service — QUIC, WebTransport, DNS. The failure is nasty because
+		// the TCP half usually works: an HTTP/3 origin serves its page over h2
+		// and then the browser's WebTransport dial goes nowhere, which presents
+		// as a certificate rejection rather than a missing route.
+		//
+		// `both` is the common case for an HTTP/3 endpoint (h2 on TCP and H3 on
+		// UDP at the same port), so it is spelled once here rather than forcing
+		// two entries that must be kept in step.
+		switch strings.ToLower(str(h["protocol"], "tcp")) {
+		case "udp":
+			netdev += fmt.Sprintf(",hostfwd=udp:127.0.0.1:%d-:%d", hp, gp)
+		case "both", "tcp+udp":
+			netdev += fmt.Sprintf(",hostfwd=tcp:127.0.0.1:%d-:%d", hp, gp)
+			netdev += fmt.Sprintf(",hostfwd=udp:127.0.0.1:%d-:%d", hp, gp)
+		default:
 			netdev += fmt.Sprintf(",hostfwd=tcp:127.0.0.1:%d-:%d", hp, gp)
 		}
 	}

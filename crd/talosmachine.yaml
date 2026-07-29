@@ -96,6 +96,15 @@ spec:
                       name: { type: string }
                       hostPort: { type: integer }
                       guestPort: { type: integer }
+                      # tcp (default), udp, or both. `both` is the HTTP/3 case:
+                      # h2 on TCP and H3 on UDP at the SAME port. Omitting this
+                      # gives tcp only, which leaves a QUIC/WebTransport service
+                      # with no path from the host — and the TCP half still
+                      # works, so it presents as a cert rejection.
+                      protocol:
+                        type: string
+                        enum: [tcp, udp, both]
+                        default: tcp
             status:
               type: object
               properties:
