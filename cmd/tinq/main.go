@@ -262,9 +262,32 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		"-m", strconv.Itoa(mem),
 		"-drive", "if=pflash,format=raw,readonly=on,file=" + edk2Code(),
 		"-drive", "if=pflash,format=raw,file=" + varsPath,
-		"-drive", "if=virtio,format=qcow2,file=" + diskPath,
+		// BOOT ORDER IS THE WHOLE INSTALL LIFECYCLE, and it has to be explicit.
+		//
+		// Talos ships a bootable ISO: you boot it, it installs to disk, and from
+		// then on the machine must boot the DISK. If the ISO keeps winning, Talos
+		// refuses to install-loop — it halts with
+		//
+		//   "Talos is already installed to disk but booted from another media
+		//    and talos.halt_if_installed=1"
+		//
+		// which is a dead node, forever. The obvious fix (detach the ISO once
+		// install finishes) needs the provider to track installed-ness, i.e. new
+		// state that can disagree with reality. `bootindex` gets it for free and
+		// STATELESSLY: firmware tries the disk first and only falls through to
+		// the ISO while the disk is still blank. Install flips the behaviour
+		// because the disk becomes bootable, not because anything recorded that
+		// it did.
+		//
+		// Explicit `-device` for BOTH (rather than the `if=virtio` shorthand) is
+		// required to carry bootindex, and it also pins guest enumeration: the
+		// system disk is vda and the ISO is vdb. Do not depend on that order for
+		// the install target anyway — select by size (see README); qemu arg order
+		// deciding a device name is not a contract worth resting on.
+		"-drive", "if=none,id=sys,format=qcow2,file=" + diskPath,
+		"-device", "virtio-blk-pci,drive=sys,bootindex=0",
 		"-drive", "if=none,id=cd,media=cdrom,file=" + image,
-		"-device", "virtio-blk-pci,drive=cd",
+		"-device", "virtio-blk-pci,drive=cd,bootindex=1",
 		"-netdev", netdev,
 		"-device", "virtio-net-pci,netdev=n0",
 		"-display", "none",
