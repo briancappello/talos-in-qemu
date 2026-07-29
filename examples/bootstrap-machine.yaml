@@ -28,7 +28,7 @@ spec:
   site: clvc-local
   role: talos-cp
   # Resolved under -image-root (~/.hvf/images) when not absolute.
-  image: metal-arm64-v1.13.4.iso  # matches your talosctl version — see README
+  image: talos-nocloud.img  # v1.9.5 ISO (misnamed .img)
   cpu: 4
   memory: 6Gi
   disk: 20Gi
