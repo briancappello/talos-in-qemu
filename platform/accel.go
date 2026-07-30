@@ -31,16 +31,22 @@ func accelFor(goos string) (string, error) {
 
 // diagnoseKVM reports whether /dev/kvm is usable, and if not, why. Opening
 // read-write is the real test: the device can exist and still be unusable.
-func diagnoseKVM(path string) kvmDiag {
+//
+// The underlying error is returned alongside the diagnosis because kvmNoPerm
+// covers every errno that is not ENOENT -- EBUSY (another hypervisor holds the
+// device) looks identical to EACCES from here, and only the raw error can tell
+// the user which one they are actually in. It is nil for kvmOK and non-nil for
+// both failure cases, kvmMissing included.
+func diagnoseKVM(path string) (kvmDiag, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err == nil {
 		f.Close()
-		return kvmOK
+		return kvmOK, nil
 	}
 	if os.IsNotExist(err) {
-		return kvmMissing
+		return kvmMissing, err
 	}
-	return kvmNoPerm
+	return kvmNoPerm, err
 }
 
 // parseAccels reads `qemu-system-X -accel help`, which prints a header line
@@ -68,7 +74,10 @@ func compiledAccels(qemuBinary string) ([]string, error) {
 	return parseAccels(string(out)), nil
 }
 
-func accelUnavailable(goos, goarch, accel string, compiled bool, diag kvmDiag) error {
+// accelUnavailable explains why no accelerator is usable. diagErr is the raw
+// error from diagnoseKVM; it is quoted verbatim so the message never asserts a
+// cause the errno does not support.
+func accelUnavailable(goos, goarch, accel string, compiled bool, diag kvmDiag, diagErr error) error {
 	var reason, fix string
 	switch {
 	case !compiled:
@@ -79,8 +88,10 @@ func accelUnavailable(goos, goarch, accel string, compiled bool, diag kvmDiag) e
 		fix = "load the kvm module (modprobe kvm_intel or kvm_amd), or enable\n" +
 			"       virtualization in firmware; in a VM, enable nested virtualization"
 	case goos == "linux" && diag == kvmNoPerm:
-		reason = fmt.Sprintf("/dev/kvm exists but is not usable by uid %d", os.Getuid())
-		fix = "sudo usermod -aG kvm $USER   (then log out and back in)"
+		reason = fmt.Sprintf("/dev/kvm exists but could not be opened by uid %d: %v", os.Getuid(), diagErr)
+		fix = "if this is a permission error: sudo usermod -aG kvm $USER\n" +
+			"       (then log out and back in); if another hypervisor holds\n" +
+			"       /dev/kvm, stop it first"
 	default:
 		reason = accel + " is not available"
 		fix = "ensure hardware virtualization is enabled on this host"

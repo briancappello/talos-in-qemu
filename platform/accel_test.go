@@ -1,8 +1,10 @@
 package platform
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -19,8 +21,8 @@ func TestAccelFor(t *testing.T) {
 }
 
 func TestDiagnoseKVM(t *testing.T) {
-	if got := diagnoseKVM(filepath.Join(t.TempDir(), "nope")); got != kvmMissing {
-		t.Errorf("absent device => %v, want kvmMissing", got)
+	if got, err := diagnoseKVM(filepath.Join(t.TempDir(), "nope")); got != kvmMissing || err == nil {
+		t.Errorf("absent device => %v, %v; want kvmMissing and a non-nil error", got, err)
 	}
 	p := filepath.Join(t.TempDir(), "kvm")
 	if err := os.WriteFile(p, nil, 0o000); err != nil {
@@ -29,17 +31,23 @@ func TestDiagnoseKVM(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: permission check is meaningless")
 	}
-	if got := diagnoseKVM(p); got != kvmNoPerm {
+	got, err := diagnoseKVM(p)
+	if got != kvmNoPerm {
 		t.Errorf("unreadable device => %v, want kvmNoPerm", got)
+	}
+	// kvmNoPerm covers every non-ENOENT errno, so the caller can only tell
+	// EACCES from EBUSY if the raw error survives.
+	if err == nil {
+		t.Error("kvmNoPerm must carry the underlying error")
 	}
 }
 
 // The three failure modes must be distinguishable. "enable hardware
 // acceleration" alone does not tell the user which case they are in.
 func TestAccelUnavailableMessagesDiffer(t *testing.T) {
-	missing := accelUnavailable("linux", "amd64", "kvm", true, kvmMissing).Error()
-	noperm := accelUnavailable("linux", "amd64", "kvm", true, kvmNoPerm).Error()
-	notbuilt := accelUnavailable("linux", "amd64", "kvm", false, kvmOK).Error()
+	missing := accelUnavailable("linux", "amd64", "kvm", true, kvmMissing, os.ErrNotExist).Error()
+	noperm := accelUnavailable("linux", "amd64", "kvm", true, kvmNoPerm, os.ErrPermission).Error()
+	notbuilt := accelUnavailable("linux", "amd64", "kvm", false, kvmOK, nil).Error()
 
 	if missing == noperm || missing == notbuilt || noperm == notbuilt {
 		t.Fatal("the three accelerator failures must produce distinct messages")
@@ -54,6 +62,17 @@ func TestAccelUnavailableMessagesDiffer(t *testing.T) {
 		if !contains(m, "hang") {
 			t.Errorf("message must explain why TCG is refused, got: %s", m)
 		}
+	}
+}
+
+// Every non-ENOENT errno lands in kvmNoPerm, so EBUSY ("another hypervisor
+// holds /dev/kvm") would otherwise be reported as a group-membership problem
+// and send the user down a dead end. The raw error has to be in the message.
+func TestAccelUnavailableSurfacesRawError(t *testing.T) {
+	busy := &fs.PathError{Op: "open", Path: "/dev/kvm", Err: syscall.EBUSY}
+	msg := accelUnavailable("linux", "amd64", "kvm", true, kvmNoPerm, busy).Error()
+	if !contains(msg, busy.Error()) {
+		t.Errorf("message must quote the underlying error %q, got: %s", busy, msg)
 	}
 }
 
