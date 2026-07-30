@@ -27,6 +27,10 @@ func TestCheckVersion(t *testing.T) {
 		// The contract is major.minor only, so a newer PATCH is not newer.
 		// Talos does not change config contracts in a patch release.
 		{"newer patch, same minor", "v1.13.99", true, false},
+		// Major outranks minor: a hand-rolled `img.Major > gen.Major ||
+		// img.Minor > gen.Minor` passes every other row here and then refuses
+		// this one, which is a genuinely OLDER Talos.
+		{"older major with a higher minor", "v0.14.0", true, false},
 		{"newer minor", "v1.14.0", true, true},
 		{"absurdly newer minor", "v1.99.0", true, true},
 		{"newer major", "v2.0.0", true, true},
@@ -47,6 +51,11 @@ func TestCheckVersion(t *testing.T) {
 			}
 			if checked != tc.wantChecked {
 				t.Errorf("CheckVersion(%q) checked=%v, want %v", tc.image, checked, tc.wantChecked)
+			}
+			// The fourth combination is not a documented outcome: a guard that
+			// did not run has nothing to refuse. Asserted rather than assumed.
+			if !checked && err != nil {
+				t.Errorf("(checked=false, err=%v) must never occur: unknown is not an error state", err)
 			}
 		})
 	}
@@ -96,13 +105,24 @@ func TestRefusalCountsAsChecked(t *testing.T) {
 
 // The message must name BOTH versions and say what to do — the failure it
 // prevents is a config silently generated for a Talos that does not exist.
+//
+// The assertions are PHRASES, not bare tokens, because the message formats four
+// verbs over only two distinct values: check for presence alone and swapping any
+// pair of arguments still passes, shipping a guard that tells the user to do the
+// exact opposite of the fix.
 func TestCheckVersionMessageIsActionable(t *testing.T) {
 	_, err := CheckVersion("v1.99.0")
 	if err == nil {
 		t.Fatal("expected an error")
 	}
 	msg := err.Error()
-	for _, want := range []string{"v1.99.0", GeneratorVersion(), "silently"} {
+	for _, want := range []string{
+		"image is Talos v1.99.0",
+		"generates configs for " + GeneratorVersion(),
+		"use an image of " + GeneratorVersion() + " or older",
+		"rebuild tinq against machinery v1.99.0",
+		"silently",
+	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message must contain %q, got: %s", want, msg)
 		}
