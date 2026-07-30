@@ -333,7 +333,14 @@ func TestScanRegistryAgainstHostRegistry(t *testing.T) {
 
 	code, vars, ok := scanRegistry(registryDirs, ai.fwArch, ai.machine)
 	if !ok {
-		t.Fatalf("registry %s exists but resolved nothing for %s/%s", dir, ai.fwArch, ai.machine)
+		// NOT a failure. A registry that holds only descriptors for OTHER
+		// architectures is normal — cross-arch qemu is common, so an aarch64
+		// box with x86 OVMF installed has the directory and matches nothing.
+		// Falling through to the static table is exactly what it is for, and
+		// Detect() still succeeds there. Only a descriptor that matched and
+		// then named files that are absent is a real defect, and that is the
+		// t.Errorf below.
+		t.Skipf("registry %s holds no descriptor for this host's %s/%s", dir, ai.fwArch, ai.machine)
 	}
 	for _, p := range []string{code, vars} {
 		if !fileExists(p) {
