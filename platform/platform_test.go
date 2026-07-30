@@ -92,5 +92,17 @@ func TestDetectOnThisHost(t *testing.T) {
 			t.Errorf("%s = %q, which is not a readable file", f.field, f.path)
 		}
 	}
+	// Existence alone is far too weak to be the ONLY check on these two: swap
+	// them in Detect, or pass nil for registryDirs, and both still name real
+	// files. Re-resolve from the same inputs and compare the ORDERED pair, so
+	// the wiring — not merely the outcome — is what is asserted.
+	wantCode, wantVars, err := resolveFirmware(registryDirs, fallbackTable, runtime.GOOS, ai.fwArch, ai.machine)
+	if err != nil {
+		t.Fatalf("resolveFirmware failed for a host Detect just succeeded on: %v", err)
+	}
+	if p.FirmwareCode != wantCode || p.FirmwareVars != wantVars {
+		t.Errorf("firmware pair = (code %q, vars %q), want (code %q, vars %q)",
+			p.FirmwareCode, p.FirmwareVars, wantCode, wantVars)
+	}
 	t.Logf("Detect() = %+v", *p)
 }

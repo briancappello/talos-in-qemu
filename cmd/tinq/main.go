@@ -266,30 +266,9 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		}
 	}
 
-	// UEFI vars must be per-machine and writable; a shared copy is how two VMs
-	// end up fighting over boot state.
-	//
-	// SIZE — not mere absence — IS THE REGENERATION TRIGGER. An earlier version
-	// of this tool padded the vars file to 64 MiB (right on aarch64 only by
-	// coincidence, fatal on x86_64: "combined size of system firmware exceeds
-	// 8388608 bytes"). Any state dir that version touched still holds that
-	// poisoned file, and an absence-only check would preserve it forever —
-	// re-running would keep failing on exactly the bug this replaces.
-	//
-	// It is deliberately NOT regenerated unconditionally: the guest writes its
-	// UEFI boot entries here, and discarding them on every re-create would lose
-	// real state. A size that disagrees with the firmware template is the signal
-	// that the file did not come from this template and cannot be trusted.
 	varsPath := filepath.Join(dir, "efivars.fd")
-	tmplSt, err := os.Stat(p.FirmwareVars)
-	if err != nil {
-		// Unreachable in practice: Detect resolves FirmwareVars by statting it.
-		return 0, fmt.Errorf("stat nvram template %s: %w", p.FirmwareVars, err)
-	}
-	if st, err := os.Stat(varsPath); err != nil || st.Size() != tmplSt.Size() {
-		if err := makeEFIVars(varsPath, p.FirmwareVars); err != nil {
-			return 0, err
-		}
+	if err := ensureEFIVars(varsPath, p.FirmwareVars); err != nil {
+		return 0, err
 	}
 
 	// user-mode networking: unprivileged by construction. hostfwd is how the
@@ -405,17 +384,36 @@ func destroy(dir string) error {
 
 func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
-// makeEFIVars copies the firmware's own nvram template VERBATIM.
+// ensureEFIVars makes path a per-machine, writable copy of the firmware's own
+// nvram template, VERBATIM. UEFI vars must be per-machine: a shared copy is how
+// two VMs end up fighting over boot state.
 //
-// The previous version padded to 64 MiB, which was correct on aarch64 only by
-// coincidence — edk2's aarch64 vars template genuinely is 67108864 bytes. The
-// x86_64 template is 540672 bytes, and padding it makes QEMU refuse to start:
+// Verbatim, because the previous version padded to 64 MiB — correct on aarch64
+// only by coincidence, since edk2's aarch64 vars template genuinely is 67108864
+// bytes. The x86_64 template is 540672 bytes, and padding it makes QEMU refuse
+// to start:
 //
 //	combined size of system firmware exceeds 8388608 bytes
 //
-// Copying the template is correct on both arches for the SAME reason instead of
-// being right on one by accident.
-func makeEFIVars(path, template string) error {
+// SIZE — not mere absence — IS THE REGENERATION TRIGGER. Any state dir the
+// padding version touched still holds that poisoned file, and an absence-only
+// check would preserve it forever: re-running would keep failing on exactly the
+// bug this replaces.
+//
+// It is deliberately NOT regenerated unconditionally. The guest writes its own
+// UEFI boot entries here, and discarding them on every re-create would lose real
+// state. A size that disagrees with the template is the signal that the file did
+// not come from this template and cannot be trusted; a size that agrees is left
+// strictly alone.
+func ensureEFIVars(path, template string) error {
+	tmplSt, err := os.Stat(template)
+	if err != nil {
+		// Unreachable in practice: Detect resolves FirmwareVars by statting it.
+		return fmt.Errorf("stat nvram template %s: %w", template, err)
+	}
+	if st, err := os.Stat(path); err == nil && st.Size() == tmplSt.Size() {
+		return nil
+	}
 	b, err := os.ReadFile(template)
 	if err != nil {
 		return fmt.Errorf("read nvram template %s: %w", template, err)
