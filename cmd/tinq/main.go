@@ -261,8 +261,25 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 
 	// UEFI vars must be per-machine and writable; a shared copy is how two VMs
 	// end up fighting over boot state.
+	//
+	// SIZE — not mere absence — IS THE REGENERATION TRIGGER. An earlier version
+	// of this tool padded the vars file to 64 MiB (right on aarch64 only by
+	// coincidence, fatal on x86_64: "combined size of system firmware exceeds
+	// 8388608 bytes"). Any state dir that version touched still holds that
+	// poisoned file, and an absence-only check would preserve it forever —
+	// re-running would keep failing on exactly the bug this replaces.
+	//
+	// It is deliberately NOT regenerated unconditionally: the guest writes its
+	// UEFI boot entries here, and discarding them on every re-create would lose
+	// real state. A size that disagrees with the firmware template is the signal
+	// that the file did not come from this template and cannot be trusted.
 	varsPath := filepath.Join(dir, "efivars.fd")
-	if _, err := os.Stat(varsPath); os.IsNotExist(err) {
+	tmplSt, err := os.Stat(p.FirmwareVars)
+	if err != nil {
+		// Unreachable in practice: Detect resolves FirmwareVars by statting it.
+		return 0, fmt.Errorf("stat nvram template %s: %w", p.FirmwareVars, err)
+	}
+	if st, err := os.Stat(varsPath); err != nil || st.Size() != tmplSt.Size() {
 		if err := makeEFIVars(varsPath, p.FirmwareVars); err != nil {
 			return 0, err
 		}
