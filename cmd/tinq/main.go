@@ -241,14 +241,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 			"  this is not a hang — it is the wrong image: %s", got, p.ImageArch, image)
 	}
 
-	// sigs.k8s.io/yaml routes through JSON, so a bootstrap file yields float64
-	// here and NEVER int64 — a bare .(int64) assertion silently dropped every
-	// user-specified cpu count back to the default. toInt takes both, which is
-	// also what the API server (int64) path needs.
-	cpu := 2
-	if v := toInt(spec["cpu"]); v > 0 {
-		cpu = v
-	}
+	cpu := specCPU(spec)
 	mem := toMB(str(spec["memory"], "2Gi"))
 	diskPath := filepath.Join(dir, "system.qcow2")
 	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
@@ -418,6 +411,22 @@ func str(v interface{}, def string) string {
 		return s
 	}
 	return def
+}
+
+// specCPU resolves spec.cpu, defaulting to 2.
+//
+// sigs.k8s.io/yaml routes through JSON, so a bootstrap file yields float64 here
+// and NEVER int64 — a bare .(int64) assertion silently dropped every
+// user-specified cpu count back to the default. toInt takes both, which is also
+// what the API server (int64) path needs.
+//
+// It lives out here so the resolution is testable through the real YAML decoder
+// without dragging argv construction along.
+func specCPU(spec map[string]interface{}) int {
+	if v := toInt(spec["cpu"]); v > 0 {
+		return v
+	}
+	return 2
 }
 
 func toInt(v interface{}) int {
