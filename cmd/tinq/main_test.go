@@ -1,11 +1,34 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
+	"github.com/coglative/talos-in-qemu/platform"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/yaml"
 )
+
+// Detect must stay INSIDE create, never hoisted to main: on a host with no
+// usable accelerator Detect fails, and teardown of an already-created VM must
+// still work. Destroy touching it would make cleanup require a working
+// hypervisor — the one thing that must never need one.
+func TestDestroyDoesNotProbeThePlatform(t *testing.T) {
+	h := &hvf{
+		stateRoot: t.TempDir(),
+		imageRoot: t.TempDir(),
+		detect: func() (*platform.Platform, error) {
+			t.Error("Destroy must not probe the host platform")
+			return nil, fmt.Errorf("no accelerator on this host")
+		},
+	}
+	m := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	m.SetUID("bootstrap-default-gone")
+	if err := h.Destroy(context.Background(), m); err != nil {
+		t.Fatalf("Destroy of an absent machine must succeed: %v", err)
+	}
+}
 
 // specFromYAML decodes through the SAME path standalone() uses. That routing is
 // the entire point: sigs.k8s.io/yaml goes via JSON, so `cpu: 4` arrives as

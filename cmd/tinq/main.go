@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,6 +42,15 @@ type hvf struct {
 	// Where neutral profile names resolve. Provider config, not claim content
 	// (ARCHITECTURE.md D12).
 	imageRoot string
+	// platform.Detect execs `qemu-system-X -accel help` and walks two registry
+	// directories. create() runs on EVERY reconcile tick where Observe reports
+	// absent, so a VM that fails to start would re-run the whole probe forever
+	// and re-write the multi-line accel diagnostic into a status condition each
+	// pass. Host facts do not change while the process runs, so probe once.
+	//
+	// Deliberately NOT hoisted into main(): destroy must keep working on a host
+	// with no usable accelerator. Teardown cannot require a live hypervisor.
+	detect func() (*platform.Platform, error)
 }
 
 func main() {
@@ -55,7 +65,7 @@ func main() {
 	if err := os.MkdirAll(*stateRoot, 0o755); err != nil {
 		log.Fatalf("state root: %v", err)
 	}
-	d := &hvf{stateRoot: *stateRoot, imageRoot: *imageRoot}
+	d := &hvf{stateRoot: *stateRoot, imageRoot: *imageRoot, detect: sync.OnceValues(platform.Detect)}
 
 	// BOOTSTRAP MODE — the chicken-and-egg door.
 	//
@@ -206,7 +216,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 
 	// Resolve host facts BEFORE creating any state. Failing here costs nothing;
 	// failing after the disk exists leaves residue behind.
-	p, err := platform.Detect()
+	p, err := h.detect()
 	if err != nil {
 		return 0, err
 	}
