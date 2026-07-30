@@ -43,6 +43,7 @@ spec:
   # between the OS target and your PVCs. Select by serial and the ambiguity is
   # gone:
   #
+  #   # in your Talos machine config (not here):
   #   install:
   #     diskSelector:
   #       serial: talos-system

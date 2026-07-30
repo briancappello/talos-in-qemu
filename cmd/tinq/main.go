@@ -411,8 +411,13 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 // specified!". Both spellings mean the same power-of-two bytes, so dropping the
 // "i" is exact, not a rounding.
 func ensureQcow2(path, size string) error {
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
+	// Only ENOENT means "create it". EACCES, ENOTDIR or a symlink loop are
+	// reported: treating them as "already there" skips creation and then
+	// launches QEMU against a file that does not exist.
+	if _, err := os.Stat(path); err == nil {
 		return nil
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	out, err := exec.Command("qemu-img", "create", "-f", "qcow2", path, strings.TrimSuffix(size, "i")).CombinedOutput()
 	if err != nil {

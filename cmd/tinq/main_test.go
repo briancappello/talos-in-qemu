@@ -91,6 +91,12 @@ func TestSpecDataDisk(t *testing.T) {
 		// spec.disk must not leak into spec.dataDisk: reading the wrong key
 		// would give every single-disk machine a second disk.
 		{"disk-only-is-not-a-data-disk", "spec:\n  disk: 20Gi\n  cpu: 4\n", ""},
+		// -apply reads this YAML with NO API server in front of it, so the
+		// CRD's `type: string` never validates. `dataDisk: 40` (unit omitted)
+		// decodes as float64 and must read as "not set" — never a panic, and
+		// never a silently coerced 40-byte disk.
+		{"unquoted-number-is-not-a-size", "spec:\n  dataDisk: 40\n", ""},
+		{"bool-is-not-a-size", "spec:\n  dataDisk: true\n", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := specDataDisk(specFromYAML(t, tc.doc)); got != tc.want {
@@ -257,6 +263,24 @@ func TestEnsureQcow2(t *testing.T) {
 		if string(b) != "the installed OS" {
 			t.Errorf("an existing disk was rewritten (%q) — that is the installed "+
 				"system, or the user's PVCs, gone", b)
+		}
+	})
+
+	t.Run("reports-a-non-ENOENT-stat-error", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("running as root: an unreadable directory is still readable")
+		}
+		dir := filepath.Join(t.TempDir(), "locked")
+		if err := os.Mkdir(dir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		// t.TempDir's cleanup has to be able to descend into it again.
+		t.Cleanup(func() { os.Chmod(dir, 0o755) })
+		// EACCES is not "already there". Reading it as such skips creation and
+		// then launches QEMU against a disk that was never made, surfacing as
+		// an unexplained qemu error instead of the permission problem.
+		if err := ensureQcow2(filepath.Join(dir, "data.qcow2"), "64Mi"); err == nil {
+			t.Fatal("an unreadable parent directory must be an error, not a silent skip")
 		}
 	})
 }
