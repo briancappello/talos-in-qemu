@@ -15,6 +15,9 @@ import (
 // SUSE's ovmf-x86_64-code.bin all self-describe through this one schema, so we
 // never maintain a path table that rots.
 type descriptor struct {
+	// Never read — it is here to document the schema, and because a decoded
+	// struct that silently omits the field a human reads first is confusing to
+	// anyone diffing this against firmware.json.
 	Description    string   `json:"description"`
 	InterfaceTypes []string `json:"interface-types"`
 	Mapping        struct {
@@ -40,13 +43,20 @@ type descriptor struct {
 // `pc-q35-11.0`, and descriptors glob on `pc-q35-*`. filepath.Match("pc-q35-*",
 // "q35") is FALSE, so a naive matcher misses for both machine types we use and
 // silently falls through to the static table. Trimming the trailing "-*" and
-// comparing against the alias recovers it without matching unrelated families.
+// comparing against the alias recovers it.
 //
 // Scope: this heuristic only recovers SUFFIX-FORM aliases, where the alias is
 // the tail of the glob's stem ("pc-q35-*"->"q35", "virt-*"->"virt"). It does
 // NOT recover QEMU's "pc" alias for "pc-i440fx-*", whose stem does not end in
 // "-pc". That is fine because we never invoke -machine pc, but a caller that
 // did would need real alias resolution here, not a suffix trim.
+//
+// It is also LOOSER than a real alias table in the other direction: the suffix
+// test would accept an unrelated family whose name merely ends in the alias —
+// HasSuffix("xlnx-versal-virt", "-virt") is true, so a "xlnx-versal-virt-*"
+// descriptor would match -machine virt. Left as is deliberately: no distro
+// ships such a descriptor, and a real alias table is a lot of machinery to
+// prevent a match that does not exist in the wild.
 func machineMatches(pattern, machine string) bool {
 	if ok, _ := filepath.Match(pattern, machine); ok {
 		return true
@@ -200,9 +210,9 @@ func resolveFirmware(dirs []string, table map[string][][2]string, goos, fwArch, 
 	// tried can be empty — an architecture with no table entry and no
 	// descriptor match reaches here — and a "then these paths:" heading over
 	// nothing reads like the list was lost. Say so instead.
-	paths := "\n\nthen these paths:\n  " + strings.Join(tried, "\n  ")
-	if len(tried) == 0 {
-		paths = fmt.Sprintf("\n\nno fallback firmware paths are known for architecture %q", fwArch)
+	paths := fmt.Sprintf("\n\nno fallback firmware paths are known for architecture %q", fwArch)
+	if len(tried) > 0 {
+		paths = "\n\nthen these paths:\n  " + strings.Join(tried, "\n  ")
 	}
 	return "", "", fmt.Errorf(
 		"no UEFI firmware found for %s/%s on %s\n\nsearched descriptor registries:\n  %s%s\n\ninstall your distribution's edk2/OVMF package",

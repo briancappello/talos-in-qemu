@@ -23,8 +23,10 @@ const sectorSize = 2048
 //   - the arm64 Image magic at 0x38: ABSENT from the arm64 ISO, because that
 //     kernel is an EFI-stub PE rather than a raw Image.
 //
-// Only the kernel at /BOOT/VMLINUZ* is authoritative. Reads ~8 KB, not the
-// whole 100 MB file.
+// Only the kernel at /BOOT/VMLINUZ* is authoritative. Reads ~8 KB of a real
+// 100 MB image, never the whole file — but the directory lengths are read FROM
+// the image, so a hostile one can drive the two findChild calls to their cap of
+// 1 MiB each: ~2 MiB worst case, bounded, and still not the whole file.
 //
 // Every length and extent below comes from the file itself, so treat all of it
 // as hostile: a malformed image must fall out as "" and never panic.
@@ -39,7 +41,12 @@ func InspectImageArch(path string) string {
 	if _, err := f.ReadAt(pvd, 16*sectorSize); err != nil {
 		return ""
 	}
-	if string(pvd[1:6]) != "CD001" {
+	// CD001 identifies a volume descriptor; byte 0 is its TYPE, and only type 1
+	// is the primary descriptor whose byte 156 holds the root directory record.
+	// A boot record (type 0) or a supplementary descriptor (type 2) also says
+	// CD001 at sector 16 on some images, and reading a root extent out of one
+	// is reading a different structure.
+	if string(pvd[1:6]) != "CD001" || pvd[0] != 1 {
 		return ""
 	}
 
@@ -100,7 +107,10 @@ func findChild(f *os.File, extent, length uint32, match func(string) bool) (uint
 		if rl < 33 || off+rl > len(buf) {
 			break
 		}
-		rec := buf[off : off+rl]
+		// Three-index: nameLen is read from the record and indexes into rec, so
+		// capping rec's CAPACITY at the record makes that bound structural
+		// rather than a property of the 33+nameLen <= rl check below.
+		rec := buf[off : off+rl : off+rl]
 		nameLen := int(rec[32])
 		if 33+nameLen <= rl {
 			name := string(rec[33 : 33+nameLen])

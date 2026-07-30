@@ -1,15 +1,25 @@
-// provider-hvf — reconciles TalosMachine into a QEMU/HVF virtual machine.
+// tinq — reconciles TalosMachine into a QEMU virtual machine.
 //
-// It runs HOST-RESIDENT, not as a pod: HVF is a macOS kernel API with no
-// network endpoint, so a controller inside the cluster cannot reach it. That is
-// the same shape Sidero's own omni-infra-provider-libvirt uses (a binary beside
-// the hypervisor, talking to the control plane over the API). The provisioning
-// layer is unaffected — it sees a resource, not a hypervisor.
+// It runs HOST-RESIDENT, not as a pod, because a hardware accelerator is a
+// KERNEL API on the machine the VM runs on with no network endpoint: HVF on
+// macOS, /dev/kvm on Linux. A controller inside the cluster cannot reach either.
+// That is the same shape Sidero's own omni-infra-provider-libvirt uses (a binary
+// beside the hypervisor, talking to the control plane over the API). The
+// provisioning layer is unaffected — it sees a resource, not a hypervisor.
+//
+// Which binary, machine type, accelerator and firmware this host needs is
+// resolved at RUNTIME by the platform package, not by build tags — see its
+// package comment for why.
 //
 // The GC contract lives in driverkit and is identical for every substrate. What
 // is HERE is only what qemu decides for itself: its SCC (process + disk + pflash
 // + state dir are ONE unit), where the site tag lives (a path component), and
 // how a neutral profile name resolves to a local artifact.
+//
+// The `hvf` type and the ~/.hvf state root keep their names from when this was
+// macOS-only. They are load-bearing — the state path and the
+// machine.hvf.fleet.io API group are what installed machines already use — so
+// renaming them is a migration, not a rename.
 //
 // tier: compute uses QEMU user-mode networking, which requires NO ROOT. Root is
 // a vmnet requirement, so it arrives with tier fabric-sim, not before.
@@ -399,6 +409,12 @@ func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 // padding version touched still holds that poisoned file, and an absence-only
 // check would preserve it forever: re-running would keep failing on exactly the
 // bug this replaces.
+//
+// The heal is NOT universal, and the x86_64 case is the only one that needs it.
+// On aarch64 the template is itself 67108864 bytes, so a file the padding
+// version wrote MATCHES the template size and is left alone here. That is
+// benign: the 8 MiB combined-firmware limit is an x86_64 limit, and a blank
+// 64 MiB varstore is what edk2 reformats in-guest on first boot anyway.
 //
 // It is deliberately NOT regenerated unconditionally. The guest writes its own
 // UEFI boot entries here, and discarding them on every re-create would lose real
