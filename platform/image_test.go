@@ -29,6 +29,7 @@ const (
 	rootDirOff  = rootLBA * isoSector
 	rootBootRec = rootDirOff + 68
 	kernelOff   = kernelLBA * isoSector
+	pvdVolID    = pvdOff + 40
 )
 
 func isoDirRecord(name string, extent, size uint32, isDir bool) []byte {
@@ -122,9 +123,20 @@ func writeImage(t *testing.T, img []byte) string {
 	return p
 }
 
+// synthISOWithVolID stamps the ISO9660 volume identifier — PVD offset 40, 32
+// bytes, SPACE-padded, which is the padding InspectImageVersion has to trim.
+// copy caps at the 32-byte field, so an over-long id truncates instead of
+// overrunning the PVD.
+func synthISOWithVolID(t *testing.T, machine uint16, kernelName, volID string) string {
+	t.Helper()
+	img := buildISO(peKernel(machine), kernelName)
+	copy(img[pvdVolID:pvdVolID+32], fmt.Sprintf("%-32s", volID))
+	return writeImage(t, img)
+}
+
 func synthISO(t *testing.T, machine uint16, kernelName string) string {
 	t.Helper()
-	return writeImage(t, buildISO(peKernel(machine), kernelName))
+	return synthISOWithVolID(t, machine, kernelName, "TALOS_V1_13_7")
 }
 
 func TestInspectImageArch(t *testing.T) {
@@ -382,6 +394,124 @@ func TestInspectImageArchRealISOs(t *testing.T) {
 				t.Skipf("%s not present", p)
 			}
 			if got := InspectImageArch(p); got != tc.want {
+				t.Errorf("%s => %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// The volume identifier is the whole input, so the table is the whole parser.
+// Anything that is not exactly TALOS_V<n>_<n>_<n> is unknown, including strings
+// that are version-SHAPED but not Talos — "1_13_7" is what a parser that
+// forgot to require the prefix would happily accept.
+func TestInspectImageVersion(t *testing.T) {
+	for _, tc := range []struct{ volID, want string }{
+		{"TALOS_V1_13_7", "v1.13.7"},
+		{"TALOS_V1_9_5", "v1.9.5"},
+		{"TALOS_V1_0_0", "v1.0.0"},
+		{"UBUNTU_24_04", ""},
+		{"", ""},
+		{"1_13_7", ""},          // version-shaped, no TALOS_V prefix
+		{"TALOS_V1_13", ""},     // too few components
+		{"TALOS_V1_13_7_1", ""}, // too many components
+		{"TALOS_V1__7", ""},     // empty component
+		{"TALOS_VX_Y_Z", ""},    // non-numeric
+		{"TALOS_V1_13_7a", ""},  // trailing junk inside a component
+		// The two bytes that sit either side of '0'..'9' in ASCII. Anything
+		// looser than an exact digit range admits one of these and yields a
+		// version string like "v1.1.:" that nothing downstream can parse.
+		{"TALOS_V1_1_/", ""},
+		{"TALOS_V1_1_:", ""},
+	} {
+		p := synthISOWithVolID(t, 0x8664, "VMLINUZ.;1", tc.volID)
+		if got := InspectImageVersion(p); got != tc.want {
+			t.Errorf("volID %q => %q, want %q", tc.volID, got, tc.want)
+		}
+	}
+}
+
+// Unknown must never be an error: it disables the version guard, it does not
+// break the run.
+func TestInspectImageVersionUnknownIsSilent(t *testing.T) {
+	dir := t.TempDir()
+	notISO := filepath.Join(dir, "raw.img")
+	if err := os.WriteFile(notISO, make([]byte, 4*isoSector), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := InspectImageVersion(notISO); got != "" {
+		t.Errorf("non-ISO => %q, want empty", got)
+	}
+	if got := InspectImageVersion(filepath.Join(dir, "absent.iso")); got != "" {
+		t.Errorf("missing file => %q, want empty", got)
+	}
+}
+
+// The three ways a volume id can be present in the bytes and still not be a
+// Talos version to trust. Each fixture carries a VALID id, so the only thing
+// under test is the descriptor check that precedes reading it — and the intact
+// image is asserted first, otherwise these would pass on a fixture that never
+// classified anything.
+func TestInspectImageVersionRequiresPrimaryDescriptor(t *testing.T) {
+	if got := InspectImageVersion(synthISOWithVolID(t, 0x8664, "VMLINUZ.;1", "TALOS_V1_13_7")); got != "v1.13.7" {
+		t.Fatalf("intact fixture => %q, want v1.13.7 — the corruptions below would prove nothing", got)
+	}
+	for _, tc := range []struct {
+		name    string
+		corrupt func(img []byte) []byte
+	}{
+		// A boot record (type 0) or supplementary descriptor (type 2) also says
+		// CD001 at sector 16 on some images, and its offset 40 is a different
+		// field entirely.
+		{"not a primary descriptor", func(img []byte) []byte { img[pvdOff] = 2; return img }},
+		{"no CD001 magic", func(img []byte) []byte { copy(img[pvdOff+1:], "XXXXX"); return img }},
+		// A truncated download whose bytes stop mid-PVD. The id itself arrived
+		// intact at offset 40, so ignoring the short read reports a version off
+		// a descriptor that was never fully written.
+		{"PVD sector truncated", func(img []byte) []byte { return img[:pvdOff+200] }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			img := buildISO(peKernel(0x8664), "VMLINUZ.;1")
+			copy(img[pvdVolID:pvdVolID+32], fmt.Sprintf("%-32s", "TALOS_V1_13_7"))
+			if got := InspectImageVersion(writeImage(t, tc.corrupt(img))); got != "" {
+				t.Errorf("=> %q, want empty", got)
+			}
+		})
+	}
+}
+
+// Random bytes behind a valid descriptor header: the parser reaches the volume
+// id with 32 bytes of noise in it and must fall out as unknown, never panic.
+func TestInspectImageVersionNeverPanics(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 64; i++ {
+		img := make([]byte, 20*isoSector)
+		rng.Read(img)
+		img[pvdOff] = 1
+		copy(img[pvdOff+1:], "CD001")
+		if got := InspectImageVersion(writeImage(t, img)); got != "" {
+			t.Errorf("noise image %d => %q, want empty", i, got)
+		}
+	}
+}
+
+// Runs against the real Talos images when present. Arch differs between the
+// last two, the version does not — the id is the same field either way.
+func TestInspectImageVersionRealISOs(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	for _, tc := range []struct{ name, want string }{
+		{"talos-v1.9.5-amd64.iso", "v1.9.5"},
+		{"talos-v1.13.7-amd64.iso", "v1.13.7"},
+		{"talos-v1.9.5-arm64.iso", "v1.9.5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(home, ".hvf", "images", tc.name)
+			if _, err := os.Stat(p); err != nil {
+				t.Skipf("%s not present", p)
+			}
+			if got := InspectImageVersion(p); got != tc.want {
 				t.Errorf("%s => %q, want %q", tc.name, got, tc.want)
 			}
 		})

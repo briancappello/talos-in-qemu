@@ -77,6 +77,61 @@ func InspectImageArch(path string) string {
 	return ""
 }
 
+// InspectImageVersion reports the Talos version of a boot ISO from its ISO9660
+// volume identifier, or "" when it cannot tell. Like InspectImageArch it never
+// errors: unknown disables the version guard rather than blocking an image we
+// merely fail to classify.
+//
+// Talos writes the volume id as TALOS_V<major>_<minor>_<patch>, e.g.
+// TALOS_V1_13_7. This is far cheaper than parsing the kernel and is the same
+// string file(1) reports. The id is a fixed 32-byte field at PVD offset 40,
+// space-padded, so the whole read is one bounded sector and every index below
+// is into a slice we allocated at a fixed size.
+func InspectImageVersion(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	pvd := make([]byte, sectorSize)
+	// A SHORT read is a truncated download, not a usable descriptor: the id at
+	// offset 40 can arrive intact in a PVD that was never fully written, and
+	// reporting a version off that is reporting one the image may not boot.
+	if _, err := f.ReadAt(pvd, 16*sectorSize); err != nil {
+		return ""
+	}
+	// Same reasoning as InspectImageArch: CD001 only says "a volume
+	// descriptor", and only type 1 is the PRIMARY one whose offset 40 is the
+	// volume identifier.
+	if pvd[0] != 1 || string(pvd[1:6]) != "CD001" {
+		return ""
+	}
+
+	volID := strings.TrimSpace(string(pvd[40:72]))
+	rest, ok := strings.CutPrefix(volID, "TALOS_V")
+	if !ok {
+		return ""
+	}
+	parts := strings.Split(rest, "_")
+	if len(parts) != 3 {
+		return ""
+	}
+	for _, p := range parts {
+		// Split yields empty strings for "1__7", and the digit loop below
+		// accepts an empty component by iterating zero times.
+		if p == "" {
+			return ""
+		}
+		for _, r := range p {
+			if r < '0' || r > '9' {
+				return ""
+			}
+		}
+	}
+	return "v" + strings.Join(parts, ".")
+}
+
 // recordExtent pulls the little-endian extent LBA and byte length out of an
 // ISO9660 directory record.
 func recordExtent(rec []byte) (uint32, uint32) {
