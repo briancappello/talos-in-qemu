@@ -80,7 +80,7 @@ Measured, not assumed:
 
 | | Link `pkg/machinery` | Shell out to `talosctl` |
 |---|---|---|
-| `go.sum` modules | **45 → 81** | unchanged |
+| `go.sum` modules | **45 → 84** | unchanged |
 | External install | none | user must install, and can change it underneath us |
 | Version location | pinned in `go.mod` | ambient on `PATH` |
 
@@ -105,25 +105,33 @@ Pin machinery to **v1.13.7**, matching the ISO verified to boot.
 > generate configs for Talos 0.9 and 0.8). Matching version of the machinery
 > package is required to generate configs for the current version of Talos.
 
-Verified with machinery v1.13.7 — the contract genuinely changes output:
+Verified with machinery v1.13.7 (`gendata.VersionTag == "v1.13.7"`) — the
+contract genuinely changes output:
 
 ```
-target      contract   bytes   kubePrism  hostDNS
-v1.0.0      1.0        30210   false      false
-v1.5.0      1.5        30781   false      false
-v1.9.5      1.9        35258   true       true
-v1.13.7     1.13       35262   true       true
+target      bytes    kubePrism  hostDNS
+v1.0.0      20833    false      false
+v1.9.5      25788    true       true
+v1.13.7     25873    true       true
 ```
 
-Machinery v1.13.7 carries contracts `TalosVersion1_0` through `TalosVersion1_10`
-plus current, so **the pin is a floor, not a ceiling**: the newest machinery
-supports every older ISO. Pinning an old machinery would be exactly backwards.
+Machinery v1.13.7 carries contracts `TalosVersion1_0` through
+`TalosVersion1_13` — one per minor release up to its own. So **the pin is a
+floor, not a ceiling**: the newest machinery supports every older ISO. Pinning
+an old machinery would be exactly backwards.
 
 **The failure that makes the guard mandatory:**
 
 ```
-target v1.99.0 -> contract 1.99, 35258 bytes, NO ERROR
+target v1.99.0 -> 25881 bytes, NO ERROR
+                  (identical to the nil/current contract)
 ```
+
+This was also confirmed against a real version gap rather than only a synthetic
+one: machinery **v1.9.5** asked to target **v1.13.7** likewise produced a config
+with no error and no warning. That is the exact scenario a contributor hits by
+pinning an older machinery and using a current ISO, and nothing in the library
+surfaces it.
 
 `ParseContractFromVersion` accepts a version it has never heard of, every
 `contract.XxxSupported()` predicate returns true because 99 outranks
