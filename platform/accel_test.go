@@ -52,8 +52,21 @@ func TestAccelUnavailableMessagesDiffer(t *testing.T) {
 	if missing == noperm || missing == notbuilt || noperm == notbuilt {
 		t.Fatal("the three accelerator failures must produce distinct messages")
 	}
+	// The distinctness check above is satisfied by the interpolated errno
+	// alone, so it would still pass if kvmMissing and kvmNoPerm were collapsed
+	// into one branch. "modprobe" appears only in the kvmMissing branch and
+	// cannot leak in from an errno string, so it pins that branch to its own
+	// remedy.
+	if !contains(missing, "modprobe") {
+		t.Errorf("device-missing failure must give its own remedy, got: %s", missing)
+	}
 	if !contains(noperm, "usermod") {
 		t.Errorf("permission failure must give the actionable fix, got: %s", noperm)
+	}
+	// kvmNoPerm covers EBUSY too, so the usermod advice must stay a
+	// conditional suggestion rather than regress to a stated diagnosis.
+	if !contains(noperm, "if this is a permission error") {
+		t.Errorf("permission advice must stay conditional, got: %s", noperm)
 	}
 	if !contains(notbuilt, "not built") {
 		t.Errorf("not-compiled-in failure must say so, got: %s", notbuilt)
@@ -73,6 +86,20 @@ func TestAccelUnavailableSurfacesRawError(t *testing.T) {
 	msg := accelUnavailable("linux", "amd64", "kvm", true, kvmNoPerm, busy).Error()
 	if !contains(msg, busy.Error()) {
 		t.Errorf("message must quote the underlying error %q, got: %s", busy, msg)
+	}
+}
+
+// The success path depends on which QEMU binaries the host has, but the error
+// path does not: a binary that cannot exist fails identically everywhere. This
+// pins the "%s -accel help: %w" contract so the binary name stays in the message.
+func TestCompiledAccelsErrorNamesBinary(t *testing.T) {
+	const bin = "qemu-system-definitely-not-installed"
+	got, err := compiledAccels(bin)
+	if err == nil {
+		t.Fatalf("compiledAccels(%q) => %v, nil; want an error", bin, got)
+	}
+	if !contains(err.Error(), bin) {
+		t.Errorf("error must name the binary it tried, got: %s", err)
 	}
 }
 

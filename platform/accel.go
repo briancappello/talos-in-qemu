@@ -93,6 +93,10 @@ func accelUnavailable(goos, goarch, accel string, compiled bool, diag kvmDiag, d
 			"       (then log out and back in); if another hypervisor holds\n" +
 			"       /dev/kvm, stop it first"
 	default:
+		// TODO(macos-verify): this is the HVF failure path, and its advice is
+		// unverified from Linux. There is no HVF analogue of diagnoseKVM --
+		// HVF exposes no device node to probe -- so this branch cannot say
+		// which of the HVF failure modes the user is in.
 		reason = accel + " is not available"
 		fix = "ensure hardware virtualization is enabled on this host"
 	}
