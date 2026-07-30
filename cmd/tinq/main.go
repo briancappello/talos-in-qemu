@@ -268,11 +268,18 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	cpu := specCPU(spec)
 	mem := toMB(str(spec["memory"], "2Gi"))
 	diskPath := filepath.Join(dir, "system.qcow2")
-	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
-		size := strings.TrimSuffix(str(spec["disk"], "16Gi"), "i")
-		out, err := exec.Command("qemu-img", "create", "-f", "qcow2", diskPath, size).CombinedOutput()
-		if err != nil {
-			return 0, fmt.Errorf("qemu-img: %v: %s", err, out)
+	if err := ensureQcow2(diskPath, str(spec["disk"], "16Gi")); err != nil {
+		return 0, err
+	}
+	// The OPTIONAL second disk, for PVCs. It is created here beside the system
+	// disk but WIRED IN BELOW as an append, never woven into the arg literal:
+	// a machine with no dataDisk has to emit precisely the argv it emitted
+	// before this field existed.
+	dataPath := ""
+	if size := specDataDisk(spec); size != "" {
+		dataPath = filepath.Join(dir, "data.qcow2")
+		if err := ensureQcow2(dataPath, size); err != nil {
+			return 0, err
 		}
 	}
 
@@ -338,10 +345,19 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		// Explicit `-device` for BOTH (rather than the `if=virtio` shorthand) is
 		// required to carry bootindex, and it also pins guest enumeration: the
 		// system disk is vda and the ISO is vdb. Do not depend on that order for
-		// the install target anyway — select by size (see README); qemu arg order
-		// deciding a device name is not a contract worth resting on.
+		// the install target anyway — select by SERIAL; qemu arg order deciding
+		// a device name is not a contract worth resting on.
+		//
+		// THE SERIAL IS AN IDENTITY, AND THAT IS THE WHOLE POINT. `serial=`
+		// surfaces in the guest as /sys/block/<dev>/serial, which is what
+		// Talos's InstallDiskSelector.Serial reads. The alternative — matching
+		// on size, which the README hands out as `size: '> 10GB'` — only
+		// works while exactly one disk is large. Add a data disk and it
+		// becomes a coin flip between the OS install target and the user's
+		// data: the same failure the /dev/vdX warning above is about, arriving
+		// through a different door.
 		"-drive", "if=none,id=sys,format=qcow2,file=" + diskPath,
-		"-device", "virtio-blk-pci,drive=sys,bootindex=0",
+		"-device", "virtio-blk-pci,drive=sys,serial=" + DiskSerialSystem + ",bootindex=0",
 		"-drive", "if=none,id=cd,media=cdrom,file=" + image,
 		"-device", "virtio-blk-pci,drive=cd,bootindex=1",
 		"-netdev", netdev,
@@ -350,6 +366,19 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		"-serial", "file:" + filepath.Join(dir, "serial.log"),
 		"-pidfile", filepath.Join(dir, "qemu.pid"),
 		"-daemonize",
+	}
+
+	// APPENDED, not spliced into the literal above, so the no-dataDisk argv is
+	// unchanged down to the position of every element.
+	//
+	// NO bootindex, deliberately. Firmware tries every bootindex it is handed,
+	// and this disk must never be a boot candidate: while the system disk is
+	// still blank the only thing that may follow it is the install ISO. A
+	// bootindex here would insert the PVC disk into that sequence.
+	if dataPath != "" {
+		args = append(args,
+			"-drive", "if=none,id=data,format=qcow2,file="+dataPath,
+			"-device", "virtio-blk-pci,drive=data,serial="+DiskSerialData)
 	}
 
 	cmd := exec.Command(p.QEMUBinary, args...)
@@ -366,6 +395,30 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	// reader work that out; we already resolved it, so say it.
 	log.Printf("for the install config patch on this host: extraKernelArgs: [%s]", p.ConsoleArg)
 	return strconv.Atoi(strings.TrimSpace(string(b)))
+}
+
+// ensureQcow2 creates a sparse qcow2 at path, and does NOTHING if one is
+// already there.
+//
+// Never recreated, never resized: system.qcow2 holds the installed OS and
+// data.qcow2 holds the user's PVCs. create() runs on EVERY reconcile tick where
+// Observe reports absent, so a version of this that rewrote the file would wipe
+// a machine the moment its qemu process died and the controller tried to bring
+// it back — the exact case where the data matters most.
+//
+// The suffix trim is not cosmetic. Kubernetes quantities are Gi/Mi; qemu-img
+// accepts only G/M and rejects the "i" outright with "Invalid image size
+// specified!". Both spellings mean the same power-of-two bytes, so dropping the
+// "i" is exact, not a rounding.
+func ensureQcow2(path, size string) error {
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		return nil
+	}
+	out, err := exec.Command("qemu-img", "create", "-f", "qcow2", path, strings.TrimSuffix(size, "i")).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("qemu-img: %v: %s", err, out)
+	}
+	return nil
 }
 
 // destroy is idempotent — it is called on every delete tick until it succeeds.
@@ -460,6 +513,29 @@ func specCPU(spec map[string]interface{}) int {
 		return v
 	}
 	return 2
+}
+
+// Disk serials are the machine's DISK NAMING CONTRACT, not decoration. QEMU
+// passes `serial=` through to the guest as /sys/block/<dev>/serial, and Talos
+// reads it back through InstallDiskSelector.Serial — so these two strings are
+// what a generated machine config selects on. Changing one renames a disk out
+// from under an already-installed node.
+const (
+	DiskSerialSystem = "talos-system"
+	DiskSerialData   = "talos-data"
+)
+
+// specDataDisk resolves spec.dataDisk, the OPTIONAL second disk for PVCs.
+//
+// "" means no second disk, and that is the default on purpose: a machine
+// without it must be the machine this tool built before the field existed —
+// same qemu args, same devices, same guest.
+//
+// Same YAML-through-JSON caveat as specCPU, which is why it reads through str
+// rather than asserting .(string) at the call site: a non-string value is "not
+// set", never a panic.
+func specDataDisk(spec map[string]interface{}) string {
+	return str(spec["dataDisk"], "")
 }
 
 func toInt(v interface{}) int {
