@@ -69,6 +69,58 @@ const armDesc = `{"description":"aa64","interface-types":["uefi"],
 "targets":[{"architecture":"aarch64","machines":["virt-*"]}],
 "features":[]}`
 
+// Distros ship a 32-bit OVMF (Debian's 60-edk2-ia32.json) that targets the
+// SAME pc-q35-* machines as the 64-bit one and differs only in architecture.
+// armDesc cannot exercise the architecture check on its own, because its
+// virt-* glob already fails the machine match; this one matches the machine
+// exactly, so architecture is the only thing that can reject it.
+const ia32Desc = `{"description":"ia32","interface-types":["uefi"],
+"mapping":{"device":"flash","executable":{"filename":"/fw/OVMF32_CODE.fd"},
+"nvram-template":{"filename":"/fw/OVMF32_VARS.fd"}},
+"targets":[{"architecture":"i386","machines":["pc-i440fx-*","pc-q35-*"]}],
+"features":[]}`
+
+// Suitable in every respect EXCEPT that it carries no nvram-template. This is
+// the real shape of a stateless/read-only build, and the one that would break
+// the -pflash PAIR we emit: we would hand QEMU a code image with no vars
+// template to copy, so the nvram check is what keeps that unrepresentable.
+const noNVRAMDesc = `{"description":"stateless","interface-types":["uefi"],
+"mapping":{"device":"flash","executable":{"filename":"/fw/NONV_CODE.fd"}},
+"targets":[{"architecture":"x86_64","machines":["pc-q35-*"]}],
+"features":[]}`
+
+// Suitable EXCEPT that it names no executable: an nvram template with nothing
+// to pair it with. Isolates the executable check from the nvram one.
+const noCodeDesc = `{"description":"varsonly","interface-types":["uefi"],
+"mapping":{"device":"flash","nvram-template":{"filename":"/fw/NOCODE_VARS.fd"}},
+"targets":[{"architecture":"x86_64","machines":["pc-q35-*"]}],
+"features":[]}`
+
+// A complete, well-formed FLASH descriptor that is simply not UEFI. Legacy
+// BIOS blobs live in the same registry, so interface-types is the only thing
+// separating them from firmware we can drive with -pflash.
+const biosDesc = `{"description":"seabios","interface-types":["bios"],
+"mapping":{"device":"flash","executable":{"filename":"/fw/BIOS_CODE.fd"},
+"nvram-template":{"filename":"/fw/BIOS_VARS.fd"}},
+"targets":[{"architecture":"x86_64","machines":["pc-q35-*"]}],
+"features":[]}`
+
+// secureDesc declares requires-smm AND secure-boot, so it cannot tell the two
+// rejections apart: delete either check and the other still rejects it. These
+// two split them, and both shapes are real — SMM-only builds exist without
+// secure boot, and vice versa.
+const smmOnlyDesc = `{"description":"smm","interface-types":["uefi"],
+"mapping":{"device":"flash","executable":{"filename":"/fw/SMM_CODE.fd"},
+"nvram-template":{"filename":"/fw/SMM_VARS.fd"}},
+"targets":[{"architecture":"x86_64","machines":["pc-q35-*"]}],
+"features":["requires-smm"]}`
+
+const secureBootOnlyDesc = `{"description":"sb","interface-types":["uefi"],
+"mapping":{"device":"flash","executable":{"filename":"/fw/SB_CODE.fd"},
+"nvram-template":{"filename":"/fw/SB_VARS.fd"}},
+"targets":[{"architecture":"x86_64","machines":["pc-q35-*"]}],
+"features":["secure-boot"]}`
+
 // The secure descriptor sorts FIRST by priority. Taking the first match picks
 // firmware that needs -machine q35,smm=on and fails without it.
 func TestScanRegistrySkipsSecureBootTrap(t *testing.T) {
@@ -93,6 +145,29 @@ func TestScanRegistrySkipsNonFlash(t *testing.T) {
 	}
 }
 
+// Each fixture here is a COMPLETE, well-formed x86_64/q35 flash descriptor
+// that fails exactly one of suitable()'s remaining rejections. That isolation
+// is the point: with the whole set present, deleting any single rejection
+// clause from suitable() makes one of these cases start matching, so each
+// clause has a test that dies with it.
+func TestScanRegistryRejectsUnusableDescriptors(t *testing.T) {
+	for _, tc := range []struct{ name, why, body string }{
+		{"no-nvram-template", "a code image with no vars template cannot form a -pflash pair", noNVRAMDesc},
+		{"no-executable", "a vars template with no code image is not bootable", noCodeDesc},
+		{"non-uefi", "a legacy BIOS blob is not UEFI firmware", biosDesc},
+		{"requires-smm", "we invoke -machine q35 without smm=on", smmOnlyDesc},
+		{"secure-boot", "we enroll no secure-boot keys", secureBootOnlyDesc},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeDesc(t, dir, "60-edk2.json", tc.body)
+			if code, vars, ok := scanRegistry([]string{dir}, "x86_64", "q35"); ok {
+				t.Errorf("%s: %s; got code=%q vars=%q", tc.name, tc.why, code, vars)
+			}
+		})
+	}
+}
+
 func TestScanRegistryArchIsolation(t *testing.T) {
 	dir := t.TempDir()
 	writeDesc(t, dir, "60-arm.json", armDesc)
@@ -102,6 +177,20 @@ func TestScanRegistryArchIsolation(t *testing.T) {
 	code, _, ok := scanRegistry([]string{dir}, "aarch64", "virt")
 	if !ok || code != "/fw/QEMU_EFI.fd" {
 		t.Errorf("aarch64/virt should match: ok=%v code=%q", ok, code)
+	}
+	// Right architecture, wrong machine family: the arch check alone would let
+	// this through, so only the machine glob can reject it.
+	if _, _, ok := scanRegistry([]string{dir}, "aarch64", "raspi3b"); ok {
+		t.Error("a virt-only descriptor must not match -machine raspi3b")
+	}
+
+	// The mirror image: right machine, wrong architecture. Booting the 32-bit
+	// OVMF on an x86_64 guest is the failure this prevents, and the machine
+	// glob cannot catch it because ia32 advertises the very same pc-q35-*.
+	ia32 := t.TempDir()
+	writeDesc(t, ia32, "60-edk2-ia32.json", ia32Desc)
+	if code, _, ok := scanRegistry([]string{ia32}, "x86_64", "q35"); ok {
+		t.Errorf("the i386 OVMF must not match an x86_64 guest; got code=%q", code)
 	}
 }
 
@@ -157,6 +246,27 @@ func TestScanRegistrySkipsMalformed(t *testing.T) {
 	code, _, ok := scanRegistry([]string{dir}, "x86_64", "q35")
 	if !ok || code != "/fw/OVMF_CODE.4m.fd" {
 		t.Errorf("a malformed descriptor must be skipped, not fatal: ok=%v code=%q", ok, code)
+	}
+}
+
+// Registry directories hold more than descriptors: package docs, and — the
+// case that actually bites — editor/packaging backups such as
+// 50-edk2.json.bak, which a distro upgrade leaves behind. Those must be
+// invisible, not merely unparseable: the backup here is VALID JSON for a
+// suitable descriptor, and sorts ahead of the real one, so if the extension
+// filter goes away it wins the scan and we boot a stale, deselected firmware.
+func TestScanRegistryIgnoresNonJSONFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeDesc(t, dir, "README", "descriptors live here\n")
+	writeDesc(t, dir, "50-edk2.json.bak", altPlainDesc)
+	writeDesc(t, dir, "60-edk2-plain.json", plainDesc)
+
+	code, vars, ok := scanRegistry([]string{dir}, "x86_64", "q35")
+	if !ok {
+		t.Fatal("stray non-.json files must not break discovery")
+	}
+	if code != "/fw/OVMF_CODE.4m.fd" || vars != "/fw/OVMF_VARS.4m.fd" {
+		t.Errorf("only .json files are descriptors: code=%q vars=%q", code, vars)
 	}
 }
 
