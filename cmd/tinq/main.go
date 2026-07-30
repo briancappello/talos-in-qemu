@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/coglative/talos-in-qemu/driverkit"
+	"github.com/coglative/talos-in-qemu/platform"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -202,6 +203,14 @@ func readPid(dir string) int {
 
 func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	spec, _, _ := unstructured.NestedMap(m.Object, "spec")
+
+	// Resolve host facts BEFORE creating any state. Failing here costs nothing;
+	// failing after the disk exists leaves residue behind.
+	p, err := platform.Detect()
+	if err != nil {
+		return 0, err
+	}
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return 0, err
 	}
@@ -220,6 +229,16 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	}
 	if _, err := os.Stat(image); err != nil {
 		return 0, fmt.Errorf("resolve profile %q under %s: %w", spec["image"], h.imageRoot, err)
+	}
+	// A wrong-arch image boots to UEFI, finds no bootable media, and sits there
+	// with no console output and no API — indistinguishable from a hang unless
+	// we say so. Warn only; detection returning "" must never block a valid
+	// image we simply cannot classify.
+	if got := platform.InspectImageArch(image); got != "" && got != p.ImageArch {
+		log.Printf("warning: image is %s but host is %s\n"+
+			"  the VM will start, reach UEFI, find no bootable media, and sit\n"+
+			"  there with no console output and no API.\n"+
+			"  this is not a hang — it is the wrong image: %s", got, p.ImageArch, image)
 	}
 
 	cpu := int64(2)
@@ -240,7 +259,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	// end up fighting over boot state.
 	varsPath := filepath.Join(dir, "efivars.fd")
 	if _, err := os.Stat(varsPath); os.IsNotExist(err) {
-		if err := makeEFIVars(varsPath); err != nil {
+		if err := makeEFIVars(varsPath, p.FirmwareVars); err != nil {
 			return 0, err
 		}
 	}
@@ -277,10 +296,10 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	}
 
 	args := []string{
-		"-machine", "virt,accel=hvf", "-cpu", "host",
+		"-machine", p.Machine + ",accel=" + p.Accel, "-cpu", p.CPU,
 		"-smp", strconv.FormatInt(cpu, 10),
 		"-m", strconv.Itoa(mem),
-		"-drive", "if=pflash,format=raw,readonly=on,file=" + edk2Code(),
+		"-drive", "if=pflash,format=raw,readonly=on,file=" + p.FirmwareCode,
 		"-drive", "if=pflash,format=raw,file=" + varsPath,
 		// BOOT ORDER IS THE WHOLE INSTALL LIFECYCLE, and it has to be explicit.
 		//
@@ -316,7 +335,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		"-daemonize",
 	}
 
-	cmd := exec.Command("qemu-system-aarch64", args...)
+	cmd := exec.Command(p.QEMUBinary, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return 0, fmt.Errorf("qemu: %v: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -353,28 +372,22 @@ func destroy(dir string) error {
 
 func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
-func edk2Code() string {
-	for _, p := range []string{
-		"/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
-		"/usr/local/share/qemu/edk2-aarch64-code.fd",
-	} {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
-}
-
-// EDK2 expects a 64MiB flash volume; the shipped vars template is smaller.
-func makeEFIVars(path string) error {
-	src := strings.Replace(edk2Code(), "code.fd", "vars.fd", 1)
-	b, err := os.ReadFile(src)
+// makeEFIVars copies the firmware's own nvram template VERBATIM.
+//
+// The previous version padded to 64 MiB, which was correct on aarch64 only by
+// coincidence — edk2's aarch64 vars template genuinely is 67108864 bytes. The
+// x86_64 template is 540672 bytes, and padding it makes QEMU refuse to start:
+//
+//	combined size of system firmware exceeds 8388608 bytes
+//
+// Copying the template is correct on both arches for the SAME reason instead of
+// being right on one by accident.
+func makeEFIVars(path, template string) error {
+	b, err := os.ReadFile(template)
 	if err != nil {
-		b = []byte{}
+		return fmt.Errorf("read nvram template %s: %w", template, err)
 	}
-	buf := make([]byte, 64*1024*1024)
-	copy(buf, b)
-	return os.WriteFile(path, buf, 0o644)
+	return os.WriteFile(path, b, 0o644)
 }
 
 // ── tiny helpers ────────────────────────────────────────────────────────────
