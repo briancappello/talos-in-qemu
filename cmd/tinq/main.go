@@ -241,8 +241,12 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 			"  this is not a hang — it is the wrong image: %s", got, p.ImageArch, image)
 	}
 
-	cpu := int64(2)
-	if v, ok := spec["cpu"].(int64); ok {
+	// sigs.k8s.io/yaml routes through JSON, so a bootstrap file yields float64
+	// here and NEVER int64 — a bare .(int64) assertion silently dropped every
+	// user-specified cpu count back to the default. toInt takes both, which is
+	// also what the API server (int64) path needs.
+	cpu := 2
+	if v := toInt(spec["cpu"]); v > 0 {
 		cpu = v
 	}
 	mem := toMB(str(spec["memory"], "2Gi"))
@@ -297,7 +301,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 
 	args := []string{
 		"-machine", p.Machine + ",accel=" + p.Accel, "-cpu", p.CPU,
-		"-smp", strconv.FormatInt(cpu, 10),
+		"-smp", strconv.Itoa(cpu),
 		"-m", strconv.Itoa(mem),
 		"-drive", "if=pflash,format=raw,readonly=on,file=" + p.FirmwareCode,
 		"-drive", "if=pflash,format=raw,file=" + varsPath,
