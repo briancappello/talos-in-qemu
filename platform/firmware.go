@@ -88,10 +88,21 @@ func (d *descriptor) suitable(fwArch, machine string) bool {
 	return false
 }
 
-// scanRegistry walks the descriptor directories in decreasing priority.
+// scanRegistry walks the descriptor directories in decreasing priority and
+// returns EVERY suitable {code, nvram-template} pair, most-preferred first.
+//
+// All of them, not just the best one. A descriptor outlives the package that
+// installed the files it names — Debian's ovmf descriptors survive the package
+// being removed — so the winner can point at nothing. Returning only the first
+// suitable candidate meant one rotted descriptor dropped us straight to the
+// static path table, which is precisely the thing querying the registry exists
+// to avoid. The caller filters on existence and takes the first pair that is
+// really installed, so a dead descriptor costs us the NEXT descriptor, not the
+// whole registry.
+//
 // Within the combined set, files sort by BASENAME (lower numeric prefix wins),
 // and a file in an earlier directory masks the same basename in a later one.
-func scanRegistry(dirs []string, fwArch, machine string) (string, string, bool) {
+func scanRegistry(dirs []string, fwArch, machine string) [][2]string {
 	seen := map[string]string{} // basename -> full path of the winning file
 	var names []string
 	for _, dir := range dirs {
@@ -112,6 +123,7 @@ func scanRegistry(dirs []string, fwArch, machine string) (string, string, bool) 
 		}
 	}
 	slices.Sort(names)
+	var out [][2]string
 	for _, n := range names {
 		b, err := os.ReadFile(seen[n])
 		if err != nil {
@@ -122,10 +134,10 @@ func scanRegistry(dirs []string, fwArch, machine string) (string, string, bool) 
 			continue // a malformed descriptor must not break discovery
 		}
 		if d.suitable(fwArch, machine) {
-			return d.Mapping.Executable.Filename, d.Mapping.NVRAMTemplate.Filename, true
+			out = append(out, [2]string{d.Mapping.Executable.Filename, d.Mapping.NVRAMTemplate.Filename})
 		}
 	}
-	return "", "", false
+	return out
 }
 
 // registryDirs is the descriptor search path in decreasing priority, per the
@@ -163,15 +175,17 @@ var fallbackTable = map[string][][2]string{
 // parameter rather than reading the package var so tests supply their own
 // without mutating package state.
 //
-// Every candidate is checked for existence, the registry's answer included: a
-// descriptor outlives the package that installed the files it names.
+// Every candidate is checked for existence, the registry's answers included: a
+// descriptor outlives the package that installed the files it names. Both
+// sources are lists of candidate pairs filtered the same way, so a rotted
+// descriptor costs us the next descriptor rather than the whole registry.
 func resolveFirmware(dirs []string, table map[string][][2]string, goos, fwArch, machine string) (string, string, error) {
 	var tried []string
-	if code, vars, ok := scanRegistry(dirs, fwArch, machine); ok {
-		if fileExists(code) && fileExists(vars) {
-			return code, vars, nil
+	for _, pair := range scanRegistry(dirs, fwArch, machine) {
+		if fileExists(pair[0]) && fileExists(pair[1]) {
+			return pair[0], pair[1], nil
 		}
-		tried = append(tried, fmt.Sprintf("%s (nvram %s) - named by a firmware descriptor", code, vars))
+		tried = append(tried, fmt.Sprintf("%s (nvram %s) - named by a firmware descriptor", pair[0], pair[1]))
 	}
 	for _, pair := range table[fwArch] {
 		if fileExists(pair[0]) && fileExists(pair[1]) {

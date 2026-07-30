@@ -30,6 +30,19 @@ func TestMachineMatches(t *testing.T) {
 	}
 }
 
+// firstSuitable asks scanRegistry the "which descriptor wins" question most of
+// these tests are about. scanRegistry itself returns EVERY suitable candidate
+// in priority order — that list is what lets resolveFirmware step past a
+// descriptor whose files are gone — but selection order is orthogonal to that,
+// and fixtures naming paths like /fw/OVMF_CODE.4m.fd are what make the
+// suitable() rejections readable.
+func firstSuitable(dirs []string, fwArch, machine string) (string, string, bool) {
+	if c := scanRegistry(dirs, fwArch, machine); len(c) > 0 {
+		return c[0][0], c[0][1], true
+	}
+	return "", "", false
+}
+
 func writeDesc(t *testing.T, dir, name, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
@@ -131,7 +144,7 @@ func TestScanRegistrySkipsSecureBootTrap(t *testing.T) {
 	writeDesc(t, dir, "50-edk2-secure.json", secureDesc)
 	writeDesc(t, dir, "60-edk2-plain.json", plainDesc)
 
-	code, vars, ok := scanRegistry([]string{dir}, "x86_64", "q35")
+	code, vars, ok := firstSuitable([]string{dir}, "x86_64", "q35")
 	if !ok {
 		t.Fatal("expected a match")
 	}
@@ -143,7 +156,7 @@ func TestScanRegistrySkipsSecureBootTrap(t *testing.T) {
 func TestScanRegistrySkipsNonFlash(t *testing.T) {
 	dir := t.TempDir()
 	writeDesc(t, dir, "60-microvm.json", microvmDesc)
-	if _, _, ok := scanRegistry([]string{dir}, "x86_64", "microvm"); ok {
+	if _, _, ok := firstSuitable([]string{dir}, "x86_64", "microvm"); ok {
 		t.Error("device:memory entries are not usable as pflash")
 	}
 }
@@ -164,7 +177,7 @@ func TestScanRegistryRejectsUnusableDescriptors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			writeDesc(t, dir, "60-edk2.json", tc.body)
-			if code, vars, ok := scanRegistry([]string{dir}, "x86_64", "q35"); ok {
+			if code, vars, ok := firstSuitable([]string{dir}, "x86_64", "q35"); ok {
 				t.Errorf("%s: %s; got code=%q vars=%q", tc.name, tc.why, code, vars)
 			}
 		})
@@ -174,16 +187,16 @@ func TestScanRegistryRejectsUnusableDescriptors(t *testing.T) {
 func TestScanRegistryArchIsolation(t *testing.T) {
 	dir := t.TempDir()
 	writeDesc(t, dir, "60-arm.json", armDesc)
-	if _, _, ok := scanRegistry([]string{dir}, "x86_64", "q35"); ok {
+	if _, _, ok := firstSuitable([]string{dir}, "x86_64", "q35"); ok {
 		t.Error("aarch64 descriptor must not match an x86_64 host")
 	}
-	code, _, ok := scanRegistry([]string{dir}, "aarch64", "virt")
+	code, _, ok := firstSuitable([]string{dir}, "aarch64", "virt")
 	if !ok || code != "/fw/QEMU_EFI.fd" {
 		t.Errorf("aarch64/virt should match: ok=%v code=%q", ok, code)
 	}
 	// Right architecture, wrong machine family: the arch check alone would let
 	// this through, so only the machine glob can reject it.
-	if _, _, ok := scanRegistry([]string{dir}, "aarch64", "raspi3b"); ok {
+	if _, _, ok := firstSuitable([]string{dir}, "aarch64", "raspi3b"); ok {
 		t.Error("a virt-only descriptor must not match -machine raspi3b")
 	}
 
@@ -192,7 +205,7 @@ func TestScanRegistryArchIsolation(t *testing.T) {
 	// glob cannot catch it because ia32 advertises the very same pc-q35-*.
 	ia32 := t.TempDir()
 	writeDesc(t, ia32, "60-edk2-ia32.json", ia32Desc)
-	if code, _, ok := scanRegistry([]string{ia32}, "x86_64", "q35"); ok {
+	if code, _, ok := firstSuitable([]string{ia32}, "x86_64", "q35"); ok {
 		t.Errorf("the i386 OVMF must not match an x86_64 guest; got code=%q", code)
 	}
 }
@@ -202,7 +215,7 @@ func TestScanRegistryDirectoryPrecedence(t *testing.T) {
 	etc, usr := t.TempDir(), t.TempDir()
 	writeDesc(t, usr, "60-edk2.json", plainDesc)
 	writeDesc(t, etc, "60-edk2.json", armDesc)
-	code, _, ok := scanRegistry([]string{etc, usr}, "aarch64", "virt")
+	code, _, ok := firstSuitable([]string{etc, usr}, "aarch64", "virt")
 	if !ok || code != "/fw/QEMU_EFI.fd" {
 		t.Errorf("/etc must mask /usr/share for the same basename: ok=%v code=%q", ok, code)
 	}
@@ -217,7 +230,7 @@ func TestScanRegistryEarlierDirectoryMasksWithUnsuitableFile(t *testing.T) {
 	etc, usr := t.TempDir(), t.TempDir()
 	writeDesc(t, etc, "60-edk2.json", armDesc)   // unsuitable for x86_64
 	writeDesc(t, usr, "60-edk2.json", plainDesc) // suitable for x86_64
-	if code, _, ok := scanRegistry([]string{etc, usr}, "x86_64", "q35"); ok {
+	if code, _, ok := firstSuitable([]string{etc, usr}, "x86_64", "q35"); ok {
 		t.Errorf("/etc must mask /usr/share even when unsuitable; got code=%q", code)
 	}
 }
@@ -230,7 +243,7 @@ func TestScanRegistryBasenameBeatsDirectoryOrder(t *testing.T) {
 	first, second := t.TempDir(), t.TempDir()
 	writeDesc(t, first, "60-plain.json", plainDesc)
 	writeDesc(t, second, "30-other.json", altPlainDesc)
-	code, vars, ok := scanRegistry([]string{first, second}, "x86_64", "q35")
+	code, vars, ok := firstSuitable([]string{first, second}, "x86_64", "q35")
 	if !ok {
 		t.Fatal("expected a match")
 	}
@@ -246,7 +259,7 @@ func TestScanRegistrySkipsMalformed(t *testing.T) {
 	writeDesc(t, dir, "50-broken.json", "{not json")
 	writeDesc(t, dir, "60-edk2-plain.json", plainDesc)
 
-	code, _, ok := scanRegistry([]string{dir}, "x86_64", "q35")
+	code, _, ok := firstSuitable([]string{dir}, "x86_64", "q35")
 	if !ok || code != "/fw/OVMF_CODE.4m.fd" {
 		t.Errorf("a malformed descriptor must be skipped, not fatal: ok=%v code=%q", ok, code)
 	}
@@ -264,7 +277,7 @@ func TestScanRegistryIgnoresNonJSONFiles(t *testing.T) {
 	writeDesc(t, dir, "50-edk2.json.bak", altPlainDesc)
 	writeDesc(t, dir, "60-edk2-plain.json", plainDesc)
 
-	code, vars, ok := scanRegistry([]string{dir}, "x86_64", "q35")
+	code, vars, ok := firstSuitable([]string{dir}, "x86_64", "q35")
 	if !ok {
 		t.Fatal("stray non-.json files must not break discovery")
 	}
@@ -274,7 +287,7 @@ func TestScanRegistryIgnoresNonJSONFiles(t *testing.T) {
 }
 
 func TestScanRegistryEmpty(t *testing.T) {
-	if _, _, ok := scanRegistry([]string{t.TempDir()}, "x86_64", "q35"); ok {
+	if _, _, ok := firstSuitable([]string{t.TempDir()}, "x86_64", "q35"); ok {
 		t.Error("empty registry must report not-found so the fallback runs")
 	}
 }
@@ -290,7 +303,7 @@ func TestScanRegistrySkipsUnreadableDirectory(t *testing.T) {
 	writeDesc(t, good, "60-edk2.json", plainDesc)
 	absent := filepath.Join(t.TempDir(), "no-such-dir")
 
-	code, vars, ok := scanRegistry([]string{absent, good}, "x86_64", "q35")
+	code, vars, ok := firstSuitable([]string{absent, good}, "x86_64", "q35")
 	if !ok {
 		t.Fatal("an unreadable directory must not abort the scan")
 	}
@@ -309,7 +322,7 @@ func TestScanRegistrySkipsUnreadableFile(t *testing.T) {
 	}
 	writeDesc(t, dir, "60-edk2.json", plainDesc)
 
-	code, _, ok := scanRegistry([]string{dir}, "x86_64", "q35")
+	code, _, ok := firstSuitable([]string{dir}, "x86_64", "q35")
 	if !ok || code != "/fw/OVMF_CODE.4m.fd" {
 		t.Errorf("an unreadable descriptor must be skipped, not fatal: ok=%v code=%q", ok, code)
 	}
@@ -331,7 +344,7 @@ func TestScanRegistryAgainstHostRegistry(t *testing.T) {
 		t.Skipf("unsupported host arch: %v", err)
 	}
 
-	code, vars, ok := scanRegistry(registryDirs, ai.fwArch, ai.machine)
+	code, vars, ok := firstSuitable(registryDirs, ai.fwArch, ai.machine)
 	if !ok {
 		// NOT a failure. A registry that holds only descriptors for OTHER
 		// architectures is normal — cross-arch qemu is common, so an aarch64
@@ -422,6 +435,34 @@ func TestResolveFirmwareFallsThroughWhenDescriptorPathsAreDead(t *testing.T) {
 	}
 	if gotCode != code || gotVars != vars {
 		t.Errorf("got %q/%q want the table entry %q/%q", gotCode, gotVars, code, vars)
+	}
+}
+
+// A rotted descriptor must cost us the NEXT DESCRIPTOR, not the whole registry.
+// Taking only the first suitable candidate meant one dead entry dropped us
+// straight to the static path table — inverting the branch's own rationale, that
+// querying the registry beats a table that rots. Here 50- is suitable but names
+// files that are not installed, 60- is suitable and real, and the table entry is
+// real too: the second descriptor must win over both.
+func TestResolveFirmwareTriesTheNextDescriptorWhenTheFirstIsDead(t *testing.T) {
+	fw := t.TempDir()
+	liveCode, liveVars := touch(t, fw, "LIVE_CODE.fd"), touch(t, fw, "LIVE_VARS.fd")
+	tblCode, tblVars := touch(t, fw, "TBL_CODE.fd"), touch(t, fw, "TBL_VARS.fd")
+
+	reg := t.TempDir()
+	writeDesc(t, reg, "50-edk2-dead.json", descWithPaths("/gone/DEAD_CODE.fd", "/gone/DEAD_VARS.fd"))
+	writeDesc(t, reg, "60-edk2-live.json", descWithPaths(liveCode, liveVars))
+	table := map[string][][2]string{"x86_64": {{tblCode, tblVars}}}
+
+	code, vars, err := resolveFirmware([]string{reg}, table, "linux", "x86_64", "q35")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code == tblCode {
+		t.Fatalf("fell through to the static table; the second descriptor was installed and usable")
+	}
+	if code != liveCode || vars != liveVars {
+		t.Errorf("got %q/%q, want the second descriptor %q/%q", code, vars, liveCode, liveVars)
 	}
 }
 
