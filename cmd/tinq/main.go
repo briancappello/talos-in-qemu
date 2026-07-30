@@ -435,4 +435,3 @@ func nestedSlice(m *unstructured.Unstructured, f ...string) []interface{} {
 	v, _, _ := unstructured.NestedSlice(m.Object, f...)
 	return v
 }
-
