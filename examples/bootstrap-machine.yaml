@@ -28,7 +28,7 @@ spec:
   site: clvc-local
   role: talos-cp
   # Resolved under -image-root (~/.hvf/images) when not absolute.
-  image: talos-nocloud.img  # v1.9.5 ISO (misnamed .img)
+  image: talos-v1.9.5.iso   # matches the README; resolved under -image-root
   cpu: 4
   memory: 6Gi
   disk: 20Gi
