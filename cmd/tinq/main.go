@@ -230,14 +230,18 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	if _, err := os.Stat(image); err != nil {
 		return 0, fmt.Errorf("resolve profile %q under %s: %w", spec["image"], h.imageRoot, err)
 	}
-	// A wrong-arch image boots to UEFI, finds no bootable media, and sits there
-	// with no console output and no API — indistinguishable from a hang unless
-	// we say so. Warn only; detection returning "" must never block a valid
-	// image we simply cannot classify.
+	// The symptom is NOT "no bootable media": Talos ISOs carry BOTH BOOTX64.EFI
+	// and BOOTAA64.EFI (the very property that defeats ESP-based detection — see
+	// platform.InspectImageArch), so UEFI does find a bootloader and GRUB is
+	// what fails, visibly, on the serial console. Do not "fix" this message back
+	// to the intuitive version; the wording below was observed, not guessed.
+	// Warn only; detection returning "" must never block a valid image we simply
+	// cannot classify.
 	if got := platform.InspectImageArch(image); got != "" && got != p.ImageArch {
 		log.Printf("warning: image is %s but host is %s\n"+
-			"  the VM will start, reach UEFI, find no bootable media, and sit\n"+
-			"  there with no console output and no API.\n"+
+			"  the VM starts and UEFI loads a bootloader (Talos ships stubs for\n"+
+			"  both arches), then GRUB stops at \"Failed to boot both default and\n"+
+			"  fallback entries.\" — no kernel runs, so there is no Talos API.\n"+
 			"  this is not a hang — it is the wrong image: %s", got, p.ImageArch, image)
 	}
 
