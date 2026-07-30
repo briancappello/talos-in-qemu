@@ -40,6 +40,12 @@ type descriptor struct {
 // "q35") is FALSE, so a naive matcher misses for both machine types we use and
 // silently falls through to the static table. Trimming the trailing "-*" and
 // comparing against the alias recovers it without matching unrelated families.
+//
+// Scope: this heuristic only recovers SUFFIX-FORM aliases, where the alias is
+// the tail of the glob's stem ("pc-q35-*"->"q35", "virt-*"->"virt"). It does
+// NOT recover QEMU's "pc" alias for "pc-i440fx-*", whose stem does not end in
+// "-pc". That is fine because we never invoke -machine pc, but a caller that
+// did would need real alias resolution here, not a suffix trim.
 func machineMatches(pattern, machine string) bool {
 	if ok, _ := filepath.Match(pattern, machine); ok {
 		return true
@@ -61,6 +67,10 @@ func (d *descriptor) suitable(fwArch, machine string) bool {
 	// Secure-boot firmware needs -machine q35,smm=on plus more. On Arch the
 	// secure descriptor sorts FIRST, so without this filter a take-the-first
 	// matcher reliably selects firmware that cannot boot as invoked.
+	//
+	// COUPLED to how this project invokes QEMU: we pass `-machine q35` with no
+	// smm=on. If that invocation ever gains smm=on (and the matching pflash
+	// wiring), this rejection becomes wrong and must change with it.
 	if slicesContains(d.Features, "requires-smm") || slicesContains(d.Features, "secure-boot") {
 		return false
 	}
