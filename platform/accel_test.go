@@ -123,7 +123,11 @@ func TestCompiledAccelsTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatalf("compiledAccelsWithin => %v, nil; want a timeout error", got)
 	}
-	if elapsed > 10*time.Second {
+	// Bounded just above the 100ms deadline plus the 1s WaitDelay, not at the
+	// stand-in's 30s sleep: a loose bound only proves the process eventually
+	// died, which the sleep guarantees on its own. This asserts the DEADLINE
+	// fired.
+	if elapsed > 2*time.Second {
 		t.Errorf("took %v: the timeout did not fire", elapsed)
 	}
 	// "signal: killed" is what the raw exec error says, which reads like a

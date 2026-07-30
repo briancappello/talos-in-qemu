@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -441,6 +442,33 @@ func TestResolveFirmwareErrorListsPathsTried(t *testing.T) {
 	} {
 		if !contains(msg, want) {
 			t.Errorf("error must mention %q, got: %v", want, msg)
+		}
+	}
+}
+
+// An architecture with no table entry leaves nothing to list, and the naive
+// format string still printed the "then these paths:" heading over an empty
+// bullet — which reads as though the list was lost rather than empty. The
+// heading must not appear with nothing under it.
+func TestResolveFirmwareErrorHasNoDanglingPathSection(t *testing.T) {
+	table := map[string][][2]string{"x86_64": {{"/nope/CODE.fd", "/nope/VARS.fd"}}}
+
+	_, _, err := resolveFirmware([]string{t.TempDir()}, table, "linux", "riscv64", "virt")
+	if err == nil {
+		t.Fatal("expected an error for an architecture with no firmware")
+	}
+	msg := err.Error()
+	if contains(msg, "then these paths:") {
+		t.Errorf("no paths were tried, so the heading must not appear, got:\n%s", msg)
+	}
+	// The generic shape of the defect: a bullet indent followed by nothing.
+	if contains(msg, "\n  \n") || strings.HasSuffix(msg, "\n  ") {
+		t.Errorf("message has an empty bullet, got:\n%q", msg)
+	}
+	// It must still say which architecture came up empty and stay actionable.
+	for _, want := range []string{"riscv64", "edk2/OVMF"} {
+		if !contains(msg, want) {
+			t.Errorf("error must mention %q, got:\n%s", want, msg)
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
@@ -38,23 +39,35 @@ func TestArchForUnsupported(t *testing.T) {
 // Detect is the only function here that reads the real host, so it is the only
 // one whose wiring no fixture can check: every field could be resolved
 // correctly and still be assigned to the wrong struct member. This runs it for
-// real and cross-checks the result against the pieces it is built from. It
-// skips where the host genuinely cannot run a VM (no QEMU, no accelerator, no
-// firmware) — that is a fact about the machine, not a regression, and Detect's
-// job there is precisely to refuse.
+// real and cross-checks the result against the pieces it is built from.
+//
+// The skip is decided by the ENVIRONMENT, never by Detect's error. Skipping on
+// "Detect returned something" would mean every error-returning bug inside
+// Detect — a swapped argument, a mis-ordered check — reports as SKIP and the
+// suite still says ok. So the preconditions this test is willing to excuse are
+// probed independently first; once they hold, the host IS capable and a Detect
+// failure is a regression, not a fact about the machine.
 func TestDetectOnThisHost(t *testing.T) {
-	p, err := Detect()
-	if err != nil {
-		t.Skipf("this host cannot launch a VM, which Detect reported as:\n%v", err)
-	}
-
 	ai, err := archFor(runtime.GOARCH)
 	if err != nil {
-		t.Fatalf("Detect succeeded on an arch archFor rejects: %v", err)
+		t.Skipf("host architecture is unsupported: %v", err)
 	}
 	accel, err := accelFor(runtime.GOOS)
 	if err != nil {
-		t.Fatalf("Detect succeeded on an OS accelFor rejects: %v", err)
+		t.Skipf("host OS is unsupported: %v", err)
+	}
+	if _, err := exec.LookPath(ai.qemuBinary); err != nil {
+		t.Skipf("%s is not installed: %v", ai.qemuBinary, err)
+	}
+	if runtime.GOOS == "linux" {
+		if diag, kerr := diagnoseKVM("/dev/kvm"); diag != kvmOK {
+			t.Skipf("/dev/kvm is not usable: %v", kerr)
+		}
+	}
+
+	p, err := Detect()
+	if err != nil {
+		t.Fatalf("this host is VM-capable, so Detect must succeed; it failed with:\n%v", err)
 	}
 
 	for _, c := range []struct{ field, got, want string }{

@@ -191,10 +191,17 @@ func resolveFirmware(dirs []string, table map[string][][2]string, goos, fwArch, 
 	// Both paths of every pair are listed. A code image that IS installed
 	// beside a differently-named vars template is a real packaging shape, and
 	// naming only the code image sends the user looking for a file they have.
+	//
+	// tried can be empty — an architecture with no table entry and no
+	// descriptor match reaches here — and a "then these paths:" heading over
+	// nothing reads like the list was lost. Say so instead.
+	paths := "\n\nthen these paths:\n  " + strings.Join(tried, "\n  ")
+	if len(tried) == 0 {
+		paths = fmt.Sprintf("\n\nno fallback firmware paths are known for architecture %q", fwArch)
+	}
 	return "", "", fmt.Errorf(
-		"no UEFI firmware found for %s/%s on %s\n\nsearched descriptor registries:\n  %s\n\nthen these paths:\n  %s\n\ninstall your distribution's edk2/OVMF package",
-		fwArch, machine, goos,
-		strings.Join(dirs, "\n  "), strings.Join(tried, "\n  "))
+		"no UEFI firmware found for %s/%s on %s\n\nsearched descriptor registries:\n  %s%s\n\ninstall your distribution's edk2/OVMF package",
+		fwArch, machine, goos, strings.Join(dirs, "\n  "), paths)
 }
 
 // fileExists rejects directories: -pflash needs a file, and a directory at the
