@@ -116,7 +116,9 @@ metadata:
 spec:
   site: clvc-local          # a path component in the state dir — see "Cleanup"
   role: talos-cp
-  image: talos-v1.9.5.iso   # resolved under -image-root when not absolute
+  # resolved under -image-root when not absolute; on an arm64 host substitute
+  # talos-v1.9.5-arm64.iso — the ISO arch must match the host
+  image: talos-v1.9.5-amd64.iso
   cpu: 4
   memory: 6Gi
   disk: 20Gi
