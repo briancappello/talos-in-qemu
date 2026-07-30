@@ -110,10 +110,7 @@ Expected: FAIL — `undefined: archFor`
 // compiler.
 package platform
 
-import (
-	"fmt"
-	"runtime"
-)
+import "fmt"
 
 // Platform is the set of host facts main.go needs. Fields are resolved once by
 // Detect and then only read.
@@ -148,9 +145,11 @@ func archFor(goarch string) (archInfo, error) {
 	}
 	return archInfo{}, fmt.Errorf("unsupported host architecture %q: TinQ supports amd64 and arm64", goarch)
 }
-
-var _ = runtime.GOARCH // referenced by Detect in a later task
 ```
+
+Do **not** import `runtime` in this task — `Detect` arrives in Task 4 and brings
+it then. A placeholder such as `var _ = runtime.GOARCH` is dead code and will be
+flagged as such.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -659,7 +658,11 @@ git commit -m "feat(platform): discover UEFI firmware via QEMU's interop registr
 
 **Interfaces:**
 - Consumes: `archFor` (Task 1), `accelFor`/`diagnoseKVM`/`compiledAccels`/`accelUnavailable` (Task 2), `scanRegistry` (Task 3).
-- Produces: `func resolveFirmware(dirs []string, goos, fwArch, machine string) (code, vars string, err error)`; `func Detect() (*Platform, error)`.
+- Produces: `func resolveFirmware(dirs []string, table map[string][][2]string, goos, fwArch, machine string) (code, vars string, err error)`; `func Detect() (*Platform, error)`.
+
+The fallback table is a **parameter, not a global read inside the function**, so
+tests supply their own without mutating package state. `fallbackTable` remains a
+package var holding the real data; only `Detect` reads it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -673,11 +676,9 @@ func TestResolveFirmwareFallsBackWhenRegistryEmpty(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	saved := fallbackTable
-	fallbackTable = map[string][][2]string{"aarch64": {{code, vars}}}
-	defer func() { fallbackTable = saved }()
+	table := map[string][][2]string{"aarch64": {{code, vars}}}
 
-	gotCode, gotVars, err := resolveFirmware([]string{t.TempDir()}, "darwin", "aarch64", "virt")
+	gotCode, gotVars, err := resolveFirmware([]string{t.TempDir()}, table, "darwin", "aarch64", "virt")
 	if err != nil {
 		t.Fatalf("fallback should succeed: %v", err)
 	}
@@ -689,11 +690,9 @@ func TestResolveFirmwareFallsBackWhenRegistryEmpty(t *testing.T) {
 // Today's edk2Code() returns a nonexistent path on failure and lets QEMU emit a
 // confusing downstream error. The replacement must name every path it tried.
 func TestResolveFirmwareErrorListsPathsTried(t *testing.T) {
-	saved := fallbackTable
-	fallbackTable = map[string][][2]string{"x86_64": {{"/nope/CODE.fd", "/nope/VARS.fd"}}}
-	defer func() { fallbackTable = saved }()
+	table := map[string][][2]string{"x86_64": {{"/nope/CODE.fd", "/nope/VARS.fd"}}}
 
-	_, _, err := resolveFirmware([]string{t.TempDir()}, "linux", "x86_64", "q35")
+	_, _, err := resolveFirmware([]string{t.TempDir()}, table, "linux", "x86_64", "q35")
 	if err == nil {
 		t.Fatal("expected an error when nothing resolves")
 	}
@@ -740,14 +739,16 @@ var fallbackTable = map[string][][2]string{
 	},
 }
 
-func resolveFirmware(dirs []string, goos, fwArch, machine string) (string, string, error) {
+// resolveFirmware takes the fallback table as a parameter so tests can supply
+// their own without mutating package state.
+func resolveFirmware(dirs []string, table map[string][][2]string, goos, fwArch, machine string) (string, string, error) {
 	if code, vars, ok := scanRegistry(dirs, fwArch, machine); ok {
 		if fileExists(code) && fileExists(vars) {
 			return code, vars, nil
 		}
 	}
 	var tried []string
-	for _, pair := range fallbackTable[fwArch] {
+	for _, pair := range table[fwArch] {
 		tried = append(tried, pair[0])
 		if fileExists(pair[0]) && fileExists(pair[1]) {
 			return pair[0], pair[1], nil
@@ -798,7 +799,7 @@ func Detect() (*Platform, error) {
 		return nil, accelUnavailable(runtime.GOOS, runtime.GOARCH, accel, compiled, diag)
 	}
 
-	code, vars, err := resolveFirmware(registryDirs, runtime.GOOS, ai.fwArch, ai.machine)
+	code, vars, err := resolveFirmware(registryDirs, fallbackTable, runtime.GOOS, ai.fwArch, ai.machine)
 	if err != nil {
 		return nil, err
 	}
@@ -816,7 +817,7 @@ func Detect() (*Platform, error) {
 }
 ```
 
-Replace the `var _ = runtime.GOARCH` line from Task 1 and add `"fmt"` to the imports.
+Add `"fmt"` and `"runtime"` to `platform.go`'s imports (Task 1 left it importing only `fmt`).
 
 - [ ] **Step 4: Run tests**
 
@@ -971,17 +972,22 @@ func TestInspectImageArchRealISOs(t *testing.T) {
 	if err != nil {
 		t.Skip("no home dir")
 	}
-	for name, want := range map[string]string{
-		"talos-v1.9.5-amd64.iso": "amd64",
-		"talos-v1.9.5-arm64.iso": "arm64",
+	// Subtests, not a bare loop: t.Skip terminates the whole test, so skipping
+	// inside a map range would let one missing ISO silently drop the other
+	// assertion — and map order is random, so which one is nondeterministic.
+	for _, tc := range []struct{ name, want string }{
+		{"talos-v1.9.5-amd64.iso", "amd64"},
+		{"talos-v1.9.5-arm64.iso", "arm64"},
 	} {
-		p := filepath.Join(home, ".hvf", "images", name)
-		if _, err := os.Stat(p); err != nil {
-			t.Skipf("%s not present", p)
-		}
-		if got := InspectImageArch(p); got != want {
-			t.Errorf("%s => %q, want %q", name, got, want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(home, ".hvf", "images", tc.name)
+			if _, err := os.Stat(p); err != nil {
+				t.Skipf("%s not present", p)
+			}
+			if got := InspectImageArch(p); got != tc.want {
+				t.Errorf("%s => %q, want %q", tc.name, got, tc.want)
+			}
+		})
 	}
 }
 ```
@@ -1150,7 +1156,9 @@ At the top of `func (h *hvf) create(m *unstructured.Unstructured, dir string) (i
 	}
 ```
 
-Then change `if err := os.MkdirAll(dir, 0o755); err != nil {` to use `=` instead of `:=` for `err` if the compiler reports a shadowing conflict; verify with `go build ./...`.
+The existing `if err := os.MkdirAll(dir, 0o755); err != nil {` below it needs no
+change — its `err` is scoped to the `if`, which is legal alongside the outer
+`err`. Confirm with `go build ./...`.
 
 - [ ] **Step 2: Warn on image/host arch mismatch**
 
@@ -1316,13 +1324,27 @@ Expected: Talos kernel output, not an empty file and not a UEFI shell prompt. An
 
 - [ ] **Step 3: Confirm the arch guard fires on the wrong image**
 
-Change `image:` to `talos-v1.9.5-arm64.iso`, re-apply to a different `site:`, and confirm the mismatch warning appears.
+```bash
+sed -e 's/talos-v1.9.5-amd64.iso/talos-v1.9.5-arm64.iso/' \
+    -e 's/linux-local/linux-wrongarch/' \
+    -e 's/linux-cp0/linux-wrongarch0/' \
+    -e 's/hostPort: 50000/hostPort: 50010/' \
+    -e 's/hostPort: 6443/hostPort: 6453/' \
+    /tmp/tinq-linux-test.yaml > /tmp/tinq-wrongarch-test.yaml
+go run ./cmd/tinq -apply /tmp/tinq-wrongarch-test.yaml
+```
 
-- [ ] **Step 4: Tear down**
+Expected: the `warning: image is arm64 but host is amd64` block appears. Distinct
+ports are required — the first VM still holds 50000/6443, and QEMU would fail to
+bind, masking the warning you are trying to observe.
+
+- [ ] **Step 4: Tear down BOTH VMs**
 
 ```bash
+go run ./cmd/tinq -destroy /tmp/tinq-wrongarch-test.yaml
 go run ./cmd/tinq -destroy /tmp/tinq-linux-test.yaml
-ls ~/.hvf/            # the linux-local site dir must be gone
+ls ~/.hvf/            # linux-local and linux-wrongarch must both be gone
+pgrep -a qemu-system-x86_64 || echo "no stray qemu processes"
 ```
 
 - [ ] **Step 5: Update the README**
