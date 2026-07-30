@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -62,7 +62,7 @@ func (d *descriptor) suitable(fwArch, machine string) bool {
 		d.Mapping.NVRAMTemplate.Filename == "" {
 		return false
 	}
-	if !slicesContains(d.InterfaceTypes, "uefi") {
+	if !slices.Contains(d.InterfaceTypes, "uefi") {
 		return false
 	}
 	// Secure-boot firmware needs -machine q35,smm=on plus more. On Arch the
@@ -72,7 +72,7 @@ func (d *descriptor) suitable(fwArch, machine string) bool {
 	// COUPLED to how this project invokes QEMU: we pass `-machine q35` with no
 	// smm=on. If that invocation ever gains smm=on (and the matching pflash
 	// wiring), this rejection becomes wrong and must change with it.
-	if slicesContains(d.Features, "requires-smm") || slicesContains(d.Features, "secure-boot") {
+	if slices.Contains(d.Features, "requires-smm") || slices.Contains(d.Features, "secure-boot") {
 		return false
 	}
 	for _, t := range d.Targets {
@@ -83,15 +83,6 @@ func (d *descriptor) suitable(fwArch, machine string) bool {
 			if machineMatches(m, machine) {
 				return true
 			}
-		}
-	}
-	return false
-}
-
-func slicesContains(hay []string, needle string) bool {
-	for _, s := range hay {
-		if s == needle {
-			return true
 		}
 	}
 	return false
@@ -120,7 +111,7 @@ func scanRegistry(dirs []string, fwArch, machine string) (string, string, bool) 
 			names = append(names, n)
 		}
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	for _, n := range names {
 		b, err := os.ReadFile(seen[n])
 		if err != nil {

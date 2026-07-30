@@ -31,7 +31,7 @@ func TestArchForUnsupported(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for riscv64, got nil")
 	}
-	if !contains(err.Error(), "riscv64") {
+	if !strings.Contains(err.Error(), "riscv64") {
 		t.Errorf("error must name the detected arch, got: %v", err)
 	}
 }
@@ -94,7 +94,3 @@ func TestDetectOnThisHost(t *testing.T) {
 	}
 	t.Logf("Detect() = %+v", *p)
 }
-
-// contains is a shared test helper used by platform_test.go, accel_test.go and
-// firmware_test.go.
-func contains(s, sub string) bool { return strings.Contains(s, sub) }

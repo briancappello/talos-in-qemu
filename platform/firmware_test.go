@@ -440,7 +440,7 @@ func TestResolveFirmwareErrorListsPathsTried(t *testing.T) {
 		reg,                  // the registry directory searched
 		"x86_64",
 	} {
-		if !contains(msg, want) {
+		if !strings.Contains(msg, want) {
 			t.Errorf("error must mention %q, got: %v", want, msg)
 		}
 	}
@@ -458,16 +458,16 @@ func TestResolveFirmwareErrorHasNoDanglingPathSection(t *testing.T) {
 		t.Fatal("expected an error for an architecture with no firmware")
 	}
 	msg := err.Error()
-	if contains(msg, "then these paths:") {
+	if strings.Contains(msg, "then these paths:") {
 		t.Errorf("no paths were tried, so the heading must not appear, got:\n%s", msg)
 	}
 	// The generic shape of the defect: a bullet indent followed by nothing.
-	if contains(msg, "\n  \n") || strings.HasSuffix(msg, "\n  ") {
+	if strings.Contains(msg, "\n  \n") || strings.HasSuffix(msg, "\n  ") {
 		t.Errorf("message has an empty bullet, got:\n%q", msg)
 	}
 	// It must still say which architecture came up empty and stay actionable.
 	for _, want := range []string{"riscv64", "edk2/OVMF"} {
-		if !contains(msg, want) {
+		if !strings.Contains(msg, want) {
 			t.Errorf("error must mention %q, got:\n%s", want, msg)
 		}
 	}

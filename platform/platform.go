@@ -12,6 +12,7 @@ package platform
 import (
 	"fmt"
 	"runtime"
+	"slices"
 )
 
 // Platform is the set of host facts main.go needs. Fields are resolved once by
@@ -67,7 +68,7 @@ func Detect() (*Platform, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w\n\ninstall QEMU (the package providing %s)", err, ai.qemuBinary)
 	}
-	compiled := slicesContains(accels, accel)
+	compiled := slices.Contains(accels, accel)
 
 	// There is no HVF analogue to probe, so darwin is judged on the compiled-in
 	// answer alone and diag stays kvmOK.

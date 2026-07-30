@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -58,22 +59,22 @@ func TestAccelUnavailableMessagesDiffer(t *testing.T) {
 	// into one branch. "modprobe" appears only in the kvmMissing branch and
 	// cannot leak in from an errno string, so it pins that branch to its own
 	// remedy.
-	if !contains(missing, "modprobe") {
+	if !strings.Contains(missing, "modprobe") {
 		t.Errorf("device-missing failure must give its own remedy, got: %s", missing)
 	}
-	if !contains(noperm, "usermod") {
+	if !strings.Contains(noperm, "usermod") {
 		t.Errorf("permission failure must give the actionable fix, got: %s", noperm)
 	}
 	// kvmNoPerm covers EBUSY too, so the usermod advice must stay a
 	// conditional suggestion rather than regress to a stated diagnosis.
-	if !contains(noperm, "if this is a permission error") {
+	if !strings.Contains(noperm, "if this is a permission error") {
 		t.Errorf("permission advice must stay conditional, got: %s", noperm)
 	}
-	if !contains(notbuilt, "not built") {
+	if !strings.Contains(notbuilt, "not built") {
 		t.Errorf("not-compiled-in failure must say so, got: %s", notbuilt)
 	}
 	for _, m := range []string{missing, noperm, notbuilt} {
-		if !contains(m, "hang") {
+		if !strings.Contains(m, "hang") {
 			t.Errorf("message must explain why TCG is refused, got: %s", m)
 		}
 	}
@@ -85,7 +86,7 @@ func TestAccelUnavailableMessagesDiffer(t *testing.T) {
 func TestAccelUnavailableSurfacesRawError(t *testing.T) {
 	busy := &fs.PathError{Op: "open", Path: "/dev/kvm", Err: syscall.EBUSY}
 	msg := accelUnavailable("linux", "amd64", "kvm", true, kvmNoPerm, busy).Error()
-	if !contains(msg, busy.Error()) {
+	if !strings.Contains(msg, busy.Error()) {
 		t.Errorf("message must quote the underlying error %q, got: %s", busy, msg)
 	}
 }
@@ -99,7 +100,7 @@ func TestCompiledAccelsErrorNamesBinary(t *testing.T) {
 	if err == nil {
 		t.Fatalf("compiledAccels(%q) => %v, nil; want an error", bin, got)
 	}
-	if !contains(err.Error(), bin) {
+	if !strings.Contains(err.Error(), bin) {
 		t.Errorf("error must name the binary it tried, got: %s", err)
 	}
 }
@@ -132,10 +133,10 @@ func TestCompiledAccelsTimesOut(t *testing.T) {
 	}
 	// "signal: killed" is what the raw exec error says, which reads like a
 	// crash. The user needs to know the binary hung and that we gave up.
-	if !contains(err.Error(), "timed out") {
+	if !strings.Contains(err.Error(), "timed out") {
 		t.Errorf("a hang must be reported as a timeout, got: %v", err)
 	}
-	if !contains(err.Error(), bin) {
+	if !strings.Contains(err.Error(), bin) {
 		t.Errorf("error must name the binary, got: %v", err)
 	}
 }
