@@ -1,10 +1,12 @@
 package platform
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // kvmDiag distinguishes the three ways hardware acceleration is unavailable.
@@ -63,12 +65,40 @@ func parseAccels(out string) []string {
 	return accels
 }
 
+// accelHelpTimeout bounds the `-accel help` probe. The query is a few
+// microseconds of work; anything near this is a wedged binary, not a slow one.
+const accelHelpTimeout = 5 * time.Second
+
 // compiledAccels asks the binary what it was BUILT with. That is a different
 // question from whether the accelerator is usable right now, and the two
 // failures deserve different messages.
 func compiledAccels(qemuBinary string) ([]string, error) {
-	out, err := exec.Command(qemuBinary, "-accel", "help").CombinedOutput()
+	return compiledAccelsWithin(qemuBinary, accelHelpTimeout)
+}
+
+// compiledAccelsWithin takes the timeout as a parameter so a test can prove the
+// deadline fires without waiting for the real one.
+//
+// The probe is bounded because an unbounded one turns a wedged qemu into a
+// hanging tinq, and a silent hang is the failure mode this whole package exists
+// to avoid — it is exactly what we refuse TCG to prevent.
+func compiledAccelsWithin(qemuBinary string, timeout time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, qemuBinary, "-accel", "help")
+	// Killing the process is not enough on its own: a grandchild that inherited
+	// the output pipe keeps CombinedOutput blocked, which is the hang we are
+	// trying to bound. WaitDelay gives up on the pipe shortly after the kill.
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
 	if err != nil {
+		// The deadline is only consulted on failure: a command that completed
+		// just as the context expired succeeded, and reporting that as a
+		// timeout would be a lie.
+		if ctx.Err() == context.DeadlineExceeded {
+			// The raw error here is "signal: killed", which reads like a crash.
+			return nil, fmt.Errorf("%s -accel help: timed out after %s (the binary is not responding)", qemuBinary, timeout)
+		}
 		return nil, fmt.Errorf("%s -accel help: %w", qemuBinary, err)
 	}
 	return parseAccels(string(out)), nil

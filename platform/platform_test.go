@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -32,6 +33,53 @@ func TestArchForUnsupported(t *testing.T) {
 	if !contains(err.Error(), "riscv64") {
 		t.Errorf("error must name the detected arch, got: %v", err)
 	}
+}
+
+// Detect is the only function here that reads the real host, so it is the only
+// one whose wiring no fixture can check: every field could be resolved
+// correctly and still be assigned to the wrong struct member. This runs it for
+// real and cross-checks the result against the pieces it is built from. It
+// skips where the host genuinely cannot run a VM (no QEMU, no accelerator, no
+// firmware) — that is a fact about the machine, not a regression, and Detect's
+// job there is precisely to refuse.
+func TestDetectOnThisHost(t *testing.T) {
+	p, err := Detect()
+	if err != nil {
+		t.Skipf("this host cannot launch a VM, which Detect reported as:\n%v", err)
+	}
+
+	ai, err := archFor(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("Detect succeeded on an arch archFor rejects: %v", err)
+	}
+	accel, err := accelFor(runtime.GOOS)
+	if err != nil {
+		t.Fatalf("Detect succeeded on an OS accelFor rejects: %v", err)
+	}
+
+	for _, c := range []struct{ field, got, want string }{
+		{"QEMUBinary", p.QEMUBinary, ai.qemuBinary},
+		{"Machine", p.Machine, ai.machine},
+		{"ConsoleArg", p.ConsoleArg, ai.console},
+		{"ImageArch", p.ImageArch, ai.imageArch},
+		{"Accel", p.Accel, accel},
+		{"CPU", p.CPU, "host"},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %q, want %q", c.field, c.got, c.want)
+		}
+	}
+	// Detect promising firmware that is not on disk is the old edk2Code()
+	// failure mode: QEMU discovers it instead of us, several layers down.
+	for _, f := range []struct{ field, path string }{
+		{"FirmwareCode", p.FirmwareCode},
+		{"FirmwareVars", p.FirmwareVars},
+	} {
+		if !fileExists(f.path) {
+			t.Errorf("%s = %q, which is not a readable file", f.field, f.path)
+		}
+	}
+	t.Logf("Detect() = %+v", *p)
 }
 
 // contains is a shared test helper used by platform_test.go, accel_test.go and

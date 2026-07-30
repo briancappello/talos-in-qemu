@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestAccelFor(t *testing.T) {
@@ -100,6 +101,38 @@ func TestCompiledAccelsErrorNamesBinary(t *testing.T) {
 	}
 	if !contains(err.Error(), bin) {
 		t.Errorf("error must name the binary it tried, got: %s", err)
+	}
+}
+
+// A qemu binary that never returns would otherwise wedge Detect() forever, and
+// a silent hang is the exact failure this whole package exists to prevent — it
+// is indistinguishable from the TCG slowness we refuse to fall back to. The
+// stand-in execs sleep so the process we start is the process that blocks:
+// killing a shell whose child still holds the output pipe would not unblock
+// CombinedOutput.
+func TestCompiledAccelsTimesOut(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "qemu-system-hangs")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	got, err := compiledAccelsWithin(bin, 100*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("compiledAccelsWithin => %v, nil; want a timeout error", got)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("took %v: the timeout did not fire", elapsed)
+	}
+	// "signal: killed" is what the raw exec error says, which reads like a
+	// crash. The user needs to know the binary hung and that we gave up.
+	if !contains(err.Error(), "timed out") {
+		t.Errorf("a hang must be reported as a timeout, got: %v", err)
+	}
+	if !contains(err.Error(), bin) {
+		t.Errorf("error must name the binary, got: %v", err)
 	}
 }
 
