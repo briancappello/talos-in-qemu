@@ -456,11 +456,6 @@ func toMB(s string) int {
 	return v * mult
 }
 
-func nested(m *unstructured.Unstructured, f ...string) int64 {
-	v, _, _ := unstructured.NestedInt64(m.Object, f...)
-	return v
-}
-
 func nestedSlice(m *unstructured.Unstructured, f ...string) []interface{} {
 	v, _, _ := unstructured.NestedSlice(m.Object, f...)
 	return v
