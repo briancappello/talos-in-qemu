@@ -361,6 +361,11 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("pidfile: %w", err)
 	}
+	// The installed system writes its OWN kernel cmdline and does not inherit
+	// the ISO's console, so the config patch has to name it — and the name is
+	// architecture-specific (ttyS0 vs ttyAMA0). The README used to make the
+	// reader work that out; we already resolved it, so say it.
+	log.Printf("for the install config patch on this host: extraKernelArgs: [%s]", p.ConsoleArg)
 	return strconv.Atoi(strings.TrimSpace(string(b)))
 }
 

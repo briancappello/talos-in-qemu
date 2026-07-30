@@ -179,7 +179,9 @@ machine:
     # need to watch it boot.
     # THE CONSOLE NAME IS ARCHITECTURE-SPECIFIC: ttyAMA0 is the arm64 PL011
     # (Apple silicon, arm64 Linux); on x86_64 the serial port is ttyS0. Use the
-    # wrong one and you get a booting-but-mute node.
+    # wrong one and you get a booting-but-mute node. No need to guess — `tinq
+    # -apply` prints the correct value for THIS host right after it creates the
+    # VM; copy that line.
     extraKernelArgs:
       - console=ttyAMA0     # arm64;  x86_64: console=ttyS0
 YAML
