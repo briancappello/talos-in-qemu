@@ -17,7 +17,8 @@ with storage, of which ~20 seconds is boot to the Talos API.
 No `talosctl`, no `kubectl`, no `helm`, no container runtime. `-apply` still
 exists and still stops at a booted VM in maintenance mode, with the Talos API
 forwarded to `127.0.0.1:50000`. Cold boot to "machine is reachable" measured at
-**~10 seconds** on an M5 Max, ~20 seconds on Linux/KVM with a v1.13.7 ISO.
+~20 seconds on Linux/KVM with a v1.13.7 ISO — and at **~10 seconds** on an M5
+Max *before this branch, by hand, and not re-run since*.
 
 Everything below marked *verified* means Linux/amd64 on KVM. **macOS is
 unverified on this branch** — see Status.
@@ -432,14 +433,19 @@ Working and exercised:
 
 - `-apply` / `-destroy`, including re-apply (`Observe` reports present, so it
   will not start a second QEMU against the same state directory)
-- Talos boots on HVF (macOS/arm64) and on KVM (Linux/amd64, `q35` + `-cpu host`
-  + distro OVMF); cold boot to reachable ~10s; Talos API via `hostForwards`
+- Talos boots on KVM (Linux/amd64, `q35` + `-cpu host` + distro OVMF); Talos
+  API via `hostForwards`
+- Talos boots on HVF (macOS/arm64) — *before this branch, by hand, on an M5
+  Max*; cold boot to reachable ~10s. Not re-run since; see the macOS bullet
+  below
 - Controller mode against a cluster with the CRD installed
 - `Destroy` sweeps process + state directory
 
-- **A real cluster, end to end.** Single-node control plane, Kubernetes v1.36.1
-  on Talos v1.9.5, kernel 6.12.18-talos arm64, containerd 2.0.3, node `Ready`,
-  with Crossplane and a real workload serving HTTP on it. ~3 minutes cold.
+- **A real cluster, end to end** — *before this branch, by hand, on
+  macOS/arm64*. Single-node control plane, Kubernetes v1.36.1 on Talos v1.9.5,
+  kernel 6.12.18-talos arm64, containerd 2.0.3, node `Ready`, with Crossplane
+  and a real workload serving HTTP on it. ~3 minutes cold. This predates `-up`
+  and predates the platform abstraction; it is history, not a branch result.
 
 - **`-up`, end to end, on Linux/KVM.** Verified on real hardware with a
   v1.13.7 amd64 ISO and `dataDisk: 40Gi`: node `talos-jzb-cu0` `Ready`,
