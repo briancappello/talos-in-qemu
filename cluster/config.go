@@ -30,8 +30,10 @@ type ConfigInput struct {
 	ClusterName string
 	// Endpoint is the Kubernetes API endpoint, e.g. https://127.0.0.1:6443.
 	Endpoint string
-	// TalosVersion is the version read off the ISO. It may be "" — an image
-	// nobody could classify still has to boot.
+	// TalosVersion is the version read off the ISO. It is REQUIRED:
+	// InspectImageVersion renders an unclassifiable image as "", and
+	// GenerateConfig refuses that rather than substituting its own version,
+	// because this value becomes the installer image tag on the node's disk.
 	TalosVersion string
 	// ConsoleArg is the console kernel argument for this platform, from
 	// platform.Detect().
@@ -70,17 +72,32 @@ const loopback = "127.0.0.1"
 func GenerateConfig(in ConfigInput) (*Generated, error) {
 	version := in.TalosVersion
 
-	checked, err := CheckVersion(version)
-	if err != nil {
-		return nil, err
+	// An unknown version DISABLES the guard (CheckVersion returns false, nil)
+	// but must not be generated through. The two are not in tension: the guard
+	// asks "may we generate at all", and refuses only images it can prove are
+	// too new; the installer tag is a value that gets WRITTEN TO DISK, and
+	// there is no safe value to write for an image nobody identified.
+	// Substituting GeneratorVersion() here would hand-roll the exact default
+	// the pin below exists to override.
+	if version == "" {
+		return nil, fmt.Errorf(`could not determine the Talos version of this image
+
+The installer image is pinned to the IMAGE's own version and cannot be guessed.
+Left to default, Talos substitutes the config generator's version (%s), and a
+fresh install silently becomes a cross-version upgrade: the maintenance system
+already running either rejects the config outright as too new, or accepts it,
+installs, and then hangs at /sbin/init with nothing on the console to say why.
+
+  boot a stock Talos ISO, whose volume id encodes the version (e.g. TALOS_V1_13_7)`,
+			GeneratorVersion())
 	}
 
-	if !checked {
-		// The version is unknown, which by design disables the guard rather
-		// than blocking the image. Generation still needs a version for the
-		// contract and the installer tag, and ours is the only one we have:
-		// it is what machinery would default to anyway, but chosen out loud.
-		version = GeneratorVersion()
+	// checked is deliberately discarded: the only unknown InspectImageVersion
+	// produces is "", already refused above. Any other unparseable string also
+	// leaves the guard unrun, and falls to ParseContractFromVersion below,
+	// which names it in the error.
+	if _, err := CheckVersion(version); err != nil {
+		return nil, err
 	}
 
 	contract, err := config.ParseContractFromVersion(version)

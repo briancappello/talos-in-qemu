@@ -297,18 +297,29 @@ func TestGenerateConfigRefusesAnImageNewerThanTheGenerator(t *testing.T) {
 	}
 }
 
-// An unknown image version disables the version guard by design (Task 2). It
-// must not also break generation — a pre-release ISO still has to boot.
-func TestGenerateConfigFallsBackToTheGeneratorVersionWhenTheImageIsUnknown(t *testing.T) {
+// An unknown image version disables the version GUARD by design (Task 2) — the
+// guard only refuses images it can prove are too new. Generation is stricter,
+// and has to be: the installer tag is written to disk, and defaulting it to
+// ours is the cross-version install the pin above exists to prevent, rebuilt by
+// hand for the one image we could not identify.
+func TestGenerateConfigRefusesAnUnknownImageVersion(t *testing.T) {
 	in := testInput()
 	in.TalosVersion = ""
 
-	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+	// The config is deliberately NOT dumped on failure the way the passing-path
+	// assertions dump theirs: this branch holds a fully generated config, which
+	// is five CA private keys and the machine token, in the test log.
+	_, err := GenerateConfig(in)
+	if err == nil {
+		t.Fatal("generated a config for an image of unknown version\n" +
+			"  reason: the installer tag can only be this binary's version, which either the maintenance system " +
+			"rejects or installs into a node that hangs at /sbin/init")
+	}
 
-	if want := "image: ghcr.io/siderolabs/installer:" + GeneratorVersion(); !strings.Contains(doc, want) {
-		t.Errorf("unknown image version did not fall back to %q\n"+
-			"  reason: an empty tag yields `installer:` — an unresolvable reference that fails at install time, not here\n%s",
-			want, doc)
+	// A refusal with no way out is a dead end. The stock ISO's volume id is
+	// where a usable version comes from, so the message has to name it.
+	if !strings.Contains(err.Error(), "TALOS_V") {
+		t.Errorf("refusal does not say how to obtain an identifiable image: %v", err)
 	}
 }
 
