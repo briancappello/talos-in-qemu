@@ -12,7 +12,9 @@ import (
 
 	"go.yaml.in/yaml/v4"
 
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
+	"github.com/siderolabs/talos/pkg/machinery/compatibility"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 )
@@ -257,6 +259,71 @@ func TestGenerateConfigPinsInstallerToTheImageVersion(t *testing.T) {
 	if strings.Contains(doc, "installer:"+GeneratorVersion()) {
 		t.Errorf("install image is pinned to the generator version %s\n"+
 			"  reason: the installer must follow the ISO, not this binary", GeneratorVersion())
+	}
+}
+
+var kubeletImage = regexp.MustCompile(`image: ghcr\.io/siderolabs/kubelet:v(\S+)`)
+
+// The Kubernetes version is the installer pin's problem one field over. The
+// generator's constants.DefaultKubernetesVersion is a property of the machinery
+// this binary was built against, while CheckVersion deliberately admits any
+// image at or below the generator — so a v1.12 ISO handed the generator's
+// default gets a kubelet outside Talos 1.12's supported window, and finds out
+// on the node.
+func TestGenerateConfigPinsAKubernetesVersionTheImageSupports(t *testing.T) {
+	for _, talosVersion := range []string{"v1.13.7", "v1.12.0", "v1.5.0"} {
+		t.Run(talosVersion, func(t *testing.T) {
+			in := testInput()
+			in.TalosVersion = talosVersion
+
+			doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+			m := kubeletImage.FindStringSubmatch(doc)
+			if m == nil {
+				t.Fatalf("no kubelet image pinned\n"+
+					"  reason: emptyIf() drops the image when the Kubernetes version is empty, so a missing "+
+					"version reads as a config that merely omits a field\n%s", redact(doc))
+			}
+
+			// machinery is the ORACLE here, deliberately. A table of
+			// Talos-to-Kubernetes versions copied into this test is a second
+			// copy of the thing that drifts, and it would agree with a wrong
+			// implementation as happily as with a right one.
+			k8s, err := compatibility.ParseKubernetesVersion(m[1])
+			if err != nil {
+				t.Fatalf("kubelet is pinned to %q, which is not a Kubernetes version: %s", m[1], redactErr(err))
+			}
+
+			target, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: talosVersion})
+			if err != nil {
+				t.Fatalf("parsing Talos version %q: %s", talosVersion, redactErr(err))
+			}
+
+			if err := k8s.SupportedWith(target); err != nil {
+				t.Errorf("a Talos %s image is handed Kubernetes %s: %s\n"+
+					"  reason: the kubelet and every control-plane component are pinned by version in this "+
+					"config; the generator's own default belongs to THIS binary, not to the image",
+					talosVersion, m[1], redactErr(err))
+			}
+		})
+	}
+}
+
+// An image machinery has no compatibility data for cannot be given a
+// Kubernetes version at all, and the generator's default is exactly the wrong
+// answer — the same silent generator-derived pin, one field over.
+func TestGenerateConfigRefusesAnImageWithNoKnownKubernetesVersion(t *testing.T) {
+	in := testInput()
+	in.TalosVersion = "v1.1.0"
+
+	_, err := GenerateConfig(in)
+	if err == nil {
+		t.Fatal("generated a config for an image machinery has no Kubernetes compatibility data for\n" +
+			"  reason: the only version left to pin is this binary's own, which is the bug the installer pin exists to prevent")
+	}
+
+	if !strings.Contains(err.Error(), "v1.1.0") {
+		t.Errorf("refusal does not name the image version: %s", redactErr(err))
 	}
 }
 

@@ -2,12 +2,15 @@ package cluster
 
 import (
 	"fmt"
-	"slices"
+	"strconv"
+	"strings"
 
 	"go.yaml.in/yaml/v4"
 
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/cel"
 	"github.com/siderolabs/talos/pkg/machinery/cel/celenv"
+	"github.com/siderolabs/talos/pkg/machinery/compatibility"
 	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate"
@@ -92,10 +95,22 @@ installs, and then hangs at /sbin/init with nothing on the console to say why.
 			GeneratorVersion())
 	}
 
-	// checked is deliberately discarded: the only unknown InspectImageVersion
-	// produces is "", already refused above. Any other unparseable string also
-	// leaves the guard unrun, and falls to ParseContractFromVersion below,
-	// which names it in the error.
+	// checked is deliberately discarded, and there are TWO ways it comes back
+	// false — the comment has to cover both, because "ignoring this costs
+	// something visible" was the whole reason for the second return value.
+	//
+	// (1) An unparseable IMAGE version. The only one InspectImageVersion
+	// produces is "", refused above; anything else reaches
+	// ParseContractFromVersion below, which names it in the error. Covered.
+	//
+	// (2) An unparseable GENERATOR version (version.go:74-77). Here the image
+	// parses fine, the guard silently never runs, and a config is generated
+	// with nothing downstream to notice — the one case where discarding
+	// `checked` really does lose information. It is unreachable while
+	// GeneratorVersion() is machinery's own compile-time version constant,
+	// which is why it is documented rather than branched on: the day that
+	// becomes a build flag or a runtime lookup, this is the line that has to
+	// grow a branch.
 	if _, err := CheckVersion(version); err != nil {
 		return nil, err
 	}
@@ -105,7 +120,12 @@ installs, and then hangs at /sbin/init with nothing on the console to say why.
 		return nil, fmt.Errorf("parsing Talos version %q: %w", version, err)
 	}
 
-	input, err := generate.NewInput(in.ClusterName, in.Endpoint, constants.DefaultKubernetesVersion,
+	k8sVersion, err := kubernetesVersion(version)
+	if err != nil {
+		return nil, err
+	}
+
+	input, err := generate.NewInput(in.ClusterName, in.Endpoint, k8sVersion,
 		// Without a contract every version-gated default is generated for the
 		// machinery's own version instead of the image's.
 		generate.WithVersionContract(contract),
@@ -168,7 +188,10 @@ installs, and then hangs at /sbin/init with nothing on the console to say why.
 
 		// A UserVolumeConfig is a document of its own, not part of v1alpha1, so
 		// it is appended to the container rather than patched in.
-		cfg, err = container.New(append(slices.Clone(cfg.Documents()), volume)...)
+		// Documents() builds its result with make() on every call
+		// (container.go:693), so appending to it cannot alias the container's
+		// own storage and there is nothing to clone.
+		cfg, err = container.New(append(cfg.Documents(), volume)...)
 		if err != nil {
 			return nil, fmt.Errorf("adding the user volume: %w", err)
 		}
@@ -201,6 +224,73 @@ installs, and then hangs at /sbin/init with nothing on the console to say why.
 		Talosconfig:  talosconfig,
 		Secrets:      secretsBundle,
 	}, nil
+}
+
+// kubernetesVersion is the Kubernetes version to pin into a config generated
+// for the given Talos image.
+//
+// It is NOT constants.DefaultKubernetesVersion. That constant is a property of
+// the machinery this binary was built against, and CheckVersion deliberately
+// admits any image at or BELOW the generator, so writing it into the config is
+// the installer pin's bug one field over: a v1.12 image would be handed
+// kubelet, apiserver, scheduler and controller-manager v1.36, which is outside
+// Talos 1.12's supported window and fails on the node rather than here.
+//
+// machinery has no Talos -> Kubernetes MAPPING to ask for. What it has is a
+// PREDICATE — compatibility.KubernetesVersion.SupportedWith(*TalosVersion),
+// compatibility/kubernetes_version.go — and per-release bounds in
+// compatibility/talos1XX; the switch that picks the right bounds for a version
+// is unexported, so the bounds cannot be read directly without duplicating
+// that table here. The predicate is therefore used as an ORACLE: start at the
+// generator's default and step the MINOR down until machinery says yes. No
+// version number from that table is copied into this repository, and the
+// answer is visible in the generated config as the kubelet image tag.
+func kubernetesVersion(talosVersion string) (string, error) {
+	target, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: talosVersion})
+	if err != nil {
+		return "", fmt.Errorf("parsing Talos version %q: %w", talosVersion, err)
+	}
+
+	major, rest, _ := strings.Cut(constants.DefaultKubernetesVersion, ".")
+
+	minorText, _, _ := strings.Cut(rest, ".")
+
+	minor, err := strconv.Atoi(minorText)
+	if err != nil {
+		return "", fmt.Errorf("parsing the generator's Kubernetes version %q: %w",
+			constants.DefaultKubernetesVersion, err)
+	}
+
+	// The generator's default is tried whole, patch included, so an image on
+	// the generator's own Talos version gets exactly what talosctl would give
+	// it. Only a version we have to step DOWN to loses its patch, and .0 is the
+	// one patch every Kubernetes minor release ships.
+	candidate := constants.DefaultKubernetesVersion
+
+	var unsupported error
+
+	for ; minor > 0; minor-- {
+		k8s, err := compatibility.ParseKubernetesVersion(candidate)
+		if err != nil {
+			return "", fmt.Errorf("parsing Kubernetes version %q: %w", candidate, err)
+		}
+
+		if unsupported = k8s.SupportedWith(target); unsupported == nil {
+			return candidate, nil
+		}
+
+		candidate = fmt.Sprintf("%s.%d.0", major, minor-1)
+	}
+
+	return "", fmt.Errorf(`no Kubernetes version works with a Talos %s image
+
+The kubelet and every control-plane component are pinned BY VERSION in the
+generated config, and this build's default (%s) is the config generator's, not
+the image's. Walking down from it found nothing machinery accepts: %s
+
+  boot an image this build has compatibility data for, or rebuild tinq against
+  a machinery that covers %s`,
+		talosVersion, constants.DefaultKubernetesVersion, unsupported, talosVersion)
 }
 
 // userVolume describes the PVC volume on the data disk.
