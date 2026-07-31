@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -9,10 +10,71 @@ import (
 	"sync"
 	"testing"
 
+	"go.yaml.in/yaml/v4"
+
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 )
+
+// A generated machine config is five certificate authorities, the machine
+// token and the cluster secrets — config.go says as much: "none of them is
+// safe to log". A test that dumps one on a failed assertion puts all of it in
+// a terminal, a CI log, and whatever the reporter pastes into an issue.
+//
+// So the rule in this file is: ANYTHING derived from generated material goes
+// through redact() before it reaches t.Errorf, t.Fatalf or t.Logf — documents,
+// and the errors machinery raises about them, which quote what they choked on.
+//
+// The shapes below are matched instead of the field names because field names
+// drift with the schema: a secret machinery adds in some later version arrives
+// already redacted, whereas a name list would silently let it through.
+// TestRedactHidesEveryGeneratedSecret checks this holds against the real
+// bundle rather than against this comment.
+var secretShapes = []*regexp.Regexp{
+	// Base64 blobs: every CA certificate and key, the service account key,
+	// cluster.id, cluster.secret, secretboxEncryptionSecret. The shortest is
+	// 44 characters. BOTH alphabets are covered — machinery emits standard
+	// base64 (`+/`) for the certificates and URL-safe base64 (`-_`) for
+	// cluster.id, which is how the first draft of this redactor leaked a
+	// 44-character secret past a `[A-Za-z0-9+/]` class.
+	//
+	// `-` and `_` in the class make over-matching possible, and that is the
+	// deliberate direction to err in: over-redaction costs a line of debug
+	// output and is caught by TestRedactKeepsTheValuesTheAssertionsAreAbout,
+	// under-redaction publishes a private key. The longest legitimate run in
+	// these documents is 39 characters, and image references and CEL
+	// expressions are broken up by `.`, `:` and `"` besides.
+	regexp.MustCompile(`[A-Za-z0-9+/_-]{40,}={0,2}`),
+	// machine.token and cluster.token: bootstrap-token shaped, and only 23
+	// characters, which is why no length threshold alone is safe here.
+	regexp.MustCompile(`\b[a-z0-9]{6}\.[a-z0-9]{16}\b`),
+	// Defence in depth. Machinery base64s its PEM today; if it ever stops,
+	// the blob stops being base64-shaped and would otherwise sail through.
+	regexp.MustCompile(`(?s)-----BEGIN[^-]*-----.*?-----END[^-]*-----`),
+}
+
+// redact replaces every secret-shaped run in s with its length, keeping the
+// structure and the operational values the assertions are actually about.
+func redact(s string) string {
+	for _, re := range secretShapes {
+		s = re.ReplaceAllStringFunc(s, func(m string) string {
+			return fmt.Sprintf("<redacted %d chars>", len(m))
+		})
+	}
+
+	return s
+}
+
+// redactErr renders an error with the same protection. Machinery's parse and
+// validation errors quote the input they rejected.
+func redactErr(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+
+	return redact(err.Error())
+}
 
 // testInput is the shape main.go passes: both serials come from the CALLER,
 // because the constants live in package main and this package must not
@@ -34,7 +96,7 @@ func mustGenerate(t *testing.T, in ConfigInput) *Generated {
 
 	g, err := GenerateConfig(in)
 	if err != nil {
-		t.Fatalf("GenerateConfig(%+v): %v", in, err)
+		t.Fatalf("GenerateConfig(%+v): %s", in, redactErr(err))
 	}
 
 	return g
@@ -50,7 +112,7 @@ func mustGenerateDefault(t *testing.T) *Generated {
 
 	g, err := defaultGenerated()
 	if err != nil {
-		t.Fatalf("GenerateConfig(%+v): %v", testInput(), err)
+		t.Fatalf("GenerateConfig(%+v): %s", testInput(), redactErr(err))
 	}
 
 	return g
@@ -77,7 +139,7 @@ func v1alpha1Doc(t *testing.T, cp []byte) string {
 
 	doc := code(splitDocs(cp)[0])
 	if !strings.Contains(doc, "version: v1alpha1") {
-		t.Fatalf("first document is not the v1alpha1 config:\n%s", doc)
+		t.Fatalf("first document is not the v1alpha1 config:\n%s", redact(doc))
 	}
 
 	return doc
@@ -106,7 +168,7 @@ func TestGenerateConfigInstallsToTheSystemDiskBySerial(t *testing.T) {
 	m := installSelector.FindStringSubmatch(doc)
 	if m == nil {
 		t.Fatalf("install has no diskSelector.serial\n"+
-			"  reason: with two large disks a size matcher is a coin flip between the OS target and the data disk\n%s", doc)
+			"  reason: with two large disks a size matcher is a coin flip between the OS target and the data disk\n%s", redact(doc))
 	}
 
 	if m[1] != "talos-system" {
@@ -137,7 +199,7 @@ func TestGenerateConfigUsesTheCallersSerials(t *testing.T) {
 	vol, ok := docOfKind(t, cp, "UserVolumeConfig")
 	if !ok || !strings.Contains(vol, `disk.serial == "data-9000"`) {
 		t.Errorf("user volume does not select data-9000\n"+
-			"  reason: same drift, other half — the volume would match no disk and never appear\n%s", vol)
+			"  reason: same drift, other half — the volume would match no disk and never appear\n%s", redact(vol))
 	}
 }
 
@@ -152,7 +214,7 @@ func TestGenerateConfigPinsInstallerToTheImageVersion(t *testing.T) {
 	if want := "image: ghcr.io/siderolabs/installer:v1.12.0"; !strings.Contains(doc, want) {
 		t.Errorf("install image is not %q\n"+
 			"  reason: unset, Talos defaults the installer to the GENERATOR's version and upgrades the node mid-install\n%s",
-			want, doc)
+			want, redact(doc))
 	}
 
 	if strings.Contains(doc, "installer:"+GeneratorVersion()) {
@@ -167,7 +229,7 @@ func TestGenerateConfigCarriesConsoleArgToTheInstalledSystem(t *testing.T) {
 	if !regexp.MustCompile(`(?m)^ {8}extraKernelArgs:\n {12}- console=ttyS0$`).MatchString(doc) {
 		t.Errorf("install has no extraKernelArgs console=ttyS0\n"+
 			"  reason: the installed system writes its OWN cmdline and does not inherit the ISO's console; "+
-			"serial goes dead at exactly the boot you need to watch\n%s", doc)
+			"serial goes dead at exactly the boot you need to watch\n%s", redact(doc))
 	}
 
 	if regexp.MustCompile(`(?m)^ {8}grubUseUKICmdline: true`).MatchString(doc) {
@@ -186,24 +248,24 @@ func TestGenerateConfigNamesTheClusterAndTheEndpointTheRightWayRound(t *testing.
 	// etcd, and `talosctl bootstrap` has nothing to bootstrap.
 	if !strings.Contains(doc, "type: controlplane") {
 		t.Errorf("machine type is not controlplane\n"+
-			"  reason: a single-node cluster has exactly one node; if it is a worker there is no control plane at all\n%s", doc)
+			"  reason: a single-node cluster has exactly one node; if it is a worker there is no control plane at all\n%s", redact(doc))
 	}
 
 	if !strings.Contains(doc, "clusterName: probe") {
 		t.Errorf("cluster is not named probe\n"+
-			"  reason: cluster name and endpoint are adjacent string arguments; swapped, everything still generates\n%s", doc)
+			"  reason: cluster name and endpoint are adjacent string arguments; swapped, everything still generates\n%s", redact(doc))
 	}
 
 	if !strings.Contains(doc, "endpoint: https://127.0.0.1:6443") {
 		t.Errorf("control plane endpoint is not the Kubernetes API URL\n"+
-			"  reason: the node would join a cluster whose API address is its own name\n%s", doc)
+			"  reason: the node would join a cluster whose API address is its own name\n%s", redact(doc))
 	}
 
 	// emptyIf() silently drops the kubelet image when the Kubernetes version is
 	// empty, so a missing version reads as a config that merely omits a field.
 	if !strings.Contains(doc, "image: ghcr.io/siderolabs/kubelet:v") {
 		t.Errorf("kubelet image is not pinned\n"+
-			"  reason: an empty Kubernetes version leaves the node without a kubelet to run\n%s", doc)
+			"  reason: an empty Kubernetes version leaves the node without a kubelet to run\n%s", redact(doc))
 	}
 }
 
@@ -212,14 +274,14 @@ func TestGenerateConfigSchedulesOnTheControlPlane(t *testing.T) {
 
 	if !strings.Contains(doc, "allowSchedulingOnControlPlanes: true") {
 		t.Errorf("control-plane taint is left in place\n"+
-			"  reason: a single-node cluster schedules NOTHING while the taint stands; this is a topology correction\n%s", doc)
+			"  reason: a single-node cluster schedules NOTHING while the taint stands; this is a topology correction\n%s", redact(doc))
 	}
 }
 
 func TestGenerateConfigAddsLoopbackToMachineCertSANs(t *testing.T) {
 	cfg, err := configloader.NewFromBytes(mustGenerateDefault(t).ControlPlane)
 	if err != nil {
-		t.Fatalf("generated config does not parse: %v", err)
+		t.Fatalf("generated config does not parse: %s", redactErr(err))
 	}
 
 	// Asserted through the typed API on purpose: `- 127.0.0.1` also appears
@@ -237,37 +299,37 @@ func TestGenerateConfigCreatesUserVolumeOnTheDataDisk(t *testing.T) {
 	vol, ok := docOfKind(t, cp, "UserVolumeConfig")
 	if !ok {
 		t.Fatalf("no UserVolumeConfig document\n"+
-			"  reason: PVCs would land on EPHEMERAL beside etcd, where a runaway PVC wedges the only control-plane node\n%s", cp)
+			"  reason: PVCs would land on EPHEMERAL beside etcd, where a runaway PVC wedges the only control-plane node\n%s", redact(string(cp)))
 	}
 
 	if !strings.Contains(vol, "name: local-path-provisioner") {
 		t.Errorf("user volume is not named local-path-provisioner\n"+
-			"  reason: the name fixes the mount path /var/mnt/<name>, which the provisioner manifest hardcodes\n%s", vol)
+			"  reason: the name fixes the mount path /var/mnt/<name>, which the provisioner manifest hardcodes\n%s", redact(vol))
 	}
 
 	if !strings.Contains(vol, `disk.serial == "talos-data"`) {
 		t.Errorf("user volume does not select the data disk by serial\n"+
-			"  reason: any other matcher can pick the system disk or the boot ISO, both of which are also virtio-blk\n%s", vol)
+			"  reason: any other matcher can pick the system disk or the boot ISO, both of which are also virtio-blk\n%s", redact(vol))
 	}
 
 	if !strings.Contains(vol, "volumeType: partition") {
 		t.Errorf("user volume has no explicit volumeType\n"+
-			"  reason: the shape of the volume is then a runtime default this config does not state\n%s", vol)
+			"  reason: the shape of the volume is then a runtime default this config does not state\n%s", redact(vol))
 	}
 
 	if !strings.Contains(vol, "grow: true") {
 		t.Errorf("user volume does not grow to the disk\n"+
-			"  reason: it would sit at its minimum size and a 40Gi data disk would silently provide 1Gi of PVCs\n%s", vol)
+			"  reason: it would sit at its minimum size and a 40Gi data disk would silently provide 1Gi of PVCs\n%s", redact(vol))
 	}
 
 	if !strings.Contains(vol, "type: xfs") {
 		t.Errorf("user volume has no filesystem\n"+
-			"  reason: an unformatted volume validates fine and then holds nothing\n%s", vol)
+			"  reason: an unformatted volume validates fine and then holds nothing\n%s", redact(vol))
 	}
 
 	if strings.Contains(vol, "talos-system") {
 		t.Errorf("user volume mentions the system disk serial\n"+
-			"  reason: provisioning a user volume on the install target destroys it\n%s", vol)
+			"  reason: provisioning a user volume on the install target destroys it\n%s", redact(vol))
 	}
 }
 
@@ -279,7 +341,7 @@ func TestGenerateConfigOmitsUserVolumeWithoutDataDisk(t *testing.T) {
 
 	if _, ok := docOfKind(t, cp, "UserVolumeConfig"); ok {
 		t.Errorf("user volume emitted with no data disk\n"+
-			"  reason: the volume would wait forever for a disk that was never attached, and the node never reaches ready\n%s", cp)
+			"  reason: the volume would wait forever for a disk that was never attached, and the node never reaches ready\n%s", redact(string(cp)))
 	}
 
 	if strings.Contains(string(cp), "talos-data") {
@@ -306,9 +368,6 @@ func TestGenerateConfigRefusesAnUnknownImageVersion(t *testing.T) {
 	in := testInput()
 	in.TalosVersion = ""
 
-	// The config is deliberately NOT dumped on failure the way the passing-path
-	// assertions dump theirs: this branch holds a fully generated config, which
-	// is five CA private keys and the machine token, in the test log.
 	_, err := GenerateConfig(in)
 	if err == nil {
 		t.Fatal("generated a config for an image of unknown version\n" +
@@ -353,16 +412,18 @@ func TestGenerateConfigTargetsTheRequestedContract(t *testing.T) {
 func TestGenerateConfigProducesAConfigMachineryAcceptsBack(t *testing.T) {
 	cfg, err := configloader.NewFromBytes(mustGenerateDefault(t).ControlPlane)
 	if err != nil {
-		t.Fatalf("generated config does not parse: %v\n"+
-			"  reason: an unparseable config is discovered by the NODE, minutes into a boot", err)
+		t.Fatalf("generated config does not parse: %s\n"+
+			"  reason: an unparseable config is discovered by the NODE, minutes into a boot", redactErr(err))
 	}
 
 	warnings, err := cfg.Validate(metalMode{})
 	if err != nil {
-		t.Fatalf("generated config does not validate: %v", err)
+		t.Fatalf("generated config does not validate: %s", redactErr(err))
 	}
 
-	t.Logf("validation warnings: %v", warnings)
+	// Logged on the PASSING path too, so this is the one line in the package
+	// that prints on every run — the last place a raw secret should reach.
+	t.Logf("validation warnings: %s", redact(fmt.Sprint(warnings)))
 }
 
 func TestGenerateConfigProducesATalosconfigPointingAtTheHostForward(t *testing.T) {
@@ -370,7 +431,7 @@ func TestGenerateConfigProducesATalosconfigPointingAtTheHostForward(t *testing.T
 
 	c, err := clientconfig.FromBytes(g.Talosconfig)
 	if err != nil {
-		t.Fatalf("talosconfig does not parse: %v", err)
+		t.Fatalf("talosconfig does not parse: %s", redactErr(err))
 	}
 
 	ctx, ok := c.Contexts[c.Context]
@@ -402,12 +463,117 @@ func TestGenerateConfigProducesReloadableSecrets(t *testing.T) {
 
 	bundle, err := secrets.LoadBundle(path)
 	if err != nil {
-		t.Fatalf("machinery cannot load the secrets we wrote: %v", err)
+		t.Fatalf("machinery cannot load the secrets we wrote: %s", redactErr(err))
 	}
 
 	if err := bundle.Validate(); err != nil {
-		t.Errorf("reloaded secrets bundle is incomplete: %v\n"+
-			"  reason: a bundle that loads but is missing a CA regenerates a cluster the old certs cannot talk to", err)
+		t.Errorf("reloaded secrets bundle is incomplete: %s\n"+
+			"  reason: a bundle that loads but is missing a CA regenerates a cluster the old certs cannot talk to", redactErr(err))
+	}
+}
+
+// leafStrings collects every scalar string in a decoded YAML tree.
+func leafStrings(node any, into *[]string) {
+	switch v := node.(type) {
+	case map[string]any:
+		for _, child := range v {
+			leafStrings(child, into)
+		}
+	case []any:
+		for _, child := range v {
+			leafStrings(child, into)
+		}
+	case string:
+		*into = append(*into, v)
+	}
+}
+
+// The guard that keeps redact() honest. It does not check redact() against a
+// list of field names — that list is exactly what drifts. It takes the secrets
+// bundle as GROUND TRUTH: every string machinery put in it is by definition a
+// secret, and none of them may survive redact() of any artifact. A secret
+// added by a future machinery therefore fails HERE, in one place, instead of
+// appearing in someone's CI log.
+func TestRedactHidesEveryGeneratedSecret(t *testing.T) {
+	g := mustGenerateDefault(t)
+
+	var bundle map[string]any
+	if err := yaml.Unmarshal(g.Secrets, &bundle); err != nil {
+		t.Fatalf("secrets bundle does not decode: %s", redactErr(err))
+	}
+
+	var values []string
+
+	leafStrings(bundle, &values)
+
+	// Short strings are labels, not secrets: the bundle carries a few
+	// ("v1alpha1"), and the shortest real secret in it is the 23-character
+	// bootstrap token.
+	const shortestSecret = 20
+
+	var secretValues []string
+
+	for _, v := range values {
+		if len(v) >= shortestSecret {
+			secretValues = append(secretValues, v)
+		}
+	}
+
+	if len(secretValues) < 10 {
+		t.Fatalf("only %d secret values found in the bundle; the guard is not looking at anything",
+			len(secretValues))
+	}
+
+	for _, artifact := range []struct {
+		name  string
+		bytes []byte
+	}{
+		{"ControlPlane", g.ControlPlane},
+		{"Talosconfig", g.Talosconfig},
+		{"Secrets", g.Secrets},
+	} {
+		redacted := redact(string(artifact.bytes))
+
+		for _, secret := range secretValues {
+			if strings.Contains(redacted, secret) {
+				// The secret itself is NOT printed, for the reason this whole
+				// test exists.
+				t.Errorf("redact() left a %d-character secret in %s\n"+
+					"  reason: every dump in this file goes through redact(); a shape it does not "+
+					"cover reaches terminals, CI logs and pasted bug reports", len(secret), artifact.name)
+			}
+		}
+
+		if strings.Contains(redacted, "-----BEGIN") {
+			t.Errorf("redact() left a PEM block in %s", artifact.name)
+		}
+	}
+}
+
+// A redactor with no test that it PRESERVES anything can be `return ""` and
+// still pass the test above. These are the values the dumps exist to show.
+func TestRedactKeepsTheValuesTheAssertionsAreAbout(t *testing.T) {
+	redacted := redact(string(mustGenerateDefault(t).ControlPlane))
+
+	for _, want := range []string{
+		"serial: talos-system",
+		"image: ghcr.io/siderolabs/installer:v1.13.7",
+		"- console=ttyS0",
+		"type: controlplane",
+		"clusterName: probe",
+		"endpoint: https://127.0.0.1:6443",
+		"allowSchedulingOnControlPlanes: true",
+		"name: local-path-provisioner",
+		`disk.serial == "talos-data"`,
+		"volumeType: partition",
+		"grow: true",
+		"type: xfs",
+	} {
+		if !strings.Contains(redacted, want) {
+			t.Errorf("redact() removed %q\n"+
+				"  reason: over-broad redaction leaves a failing assertion with nothing to diagnose from, "+
+				"which is the only reason the dumps were kept at all", want)
+		}
 	}
 }
 
