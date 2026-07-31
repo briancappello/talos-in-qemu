@@ -2,9 +2,9 @@
 #   https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.31/deploy/local-path-storage.yaml
 #   sha256 bed8d03e3e07e03d3dd3e4e2150ea6eb03f8753bd317bfeb1bfa49e9b432f78d
 # and then patched. `diff` this file against that URL and you should see
-# EXACTLY the two hunks marked `tinq:` below, and nothing else.
+# EXACTLY the three hunks marked `tinq:` below, and nothing else.
 #
-# The THIRD Talos patch — upstream's root path, which is on Talos's read-only
+# The FOURTH Talos patch — upstream's root path, which is on Talos's read-only
 # root filesystem — is deliberately NOT in this file. It is applied by
 # storage.go's render(), from the same constants cluster/config.go builds the
 # Talos user volume out of, so the manifest and the volume cannot name
@@ -179,5 +179,12 @@ data:
           effect: NoSchedule
       containers:
       - name: helper-pod
-        image: busybox
+        # tinq: upstream writes `image: busybox`, with no tag at all, which
+        # Kubernetes resolves to busybox:latest. This is the pod that `mkdir`s
+        # and `rm -rf`s every PVC directory, so it is the last image in this
+        # file that should float — and it greps clean against ":latest"
+        # precisely because the tag is absent. 1.38.0 is what `latest`
+        # resolved to when this was pinned, so the pin changes nothing today
+        # and stops changing under us tomorrow.
+        image: busybox:1.38.0
         imagePullPolicy: IfNotPresent

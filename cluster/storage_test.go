@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -242,13 +243,54 @@ func TestManifestRunsTheVersionTheConstantNames(t *testing.T) {
 	}
 }
 
-// The Deployment must not run whatever `latest` resolves to on the day the node
-// pulls: a floating tag makes the version constant unfalsifiable.
+// imageLine matches every `image:` value in the MANIFEST TEXT, which is what
+// makes the helper pod visible: it lives as a YAML string inside a ConfigMap,
+// so walking the decoded object graph never reaches it as a container spec.
+var imageLine = regexp.MustCompile(`(?m)^\s*image:\s*(\S+)\s*$`)
+
+// No image may run whatever `latest` resolves to on the day the node pulls: a
+// floating tag makes the version constant unfalsifiable.
+//
+// The absence of a tag is the SAME failure, and it is the one that hid here.
+// Kubernetes resolves a bare `busybox` to `busybox:latest`, so a test that
+// greps for the literal ":latest" reports clean on precisely the image nobody
+// pinned — and that image is the helper pod, which `mkdir`s and `rm -rf`s
+// every PVC directory. So the tag is PARSED and required to exist, not
+// searched for.
 func TestManifestPinsEveryImageByTag(t *testing.T) {
-	for _, o := range manifestObjectsOrFail(t) {
-		b, _ := json.Marshal(o.Object)
-		if strings.Contains(string(b), ":latest") {
-			t.Errorf("%s/%s uses a floating :latest tag", o.GetKind(), o.GetName())
+	rendered, err := render(localPathManifest)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	found := imageLine.FindAllStringSubmatch(string(rendered), -1)
+
+	// The provisioner Deployment and the helper pod. Without this the whole
+	// test passes by matching nothing the day the pattern or the manifest
+	// shape changes.
+	if len(found) < 2 {
+		t.Fatalf("matched %d `image:` lines, want at least 2 (the provisioner and its helper pod)\n"+
+			"  reason: an assertion that matches nothing passes forever", len(found))
+	}
+
+	for _, m := range found {
+		image := m[1]
+
+		// The last colon is only a tag separator if it comes AFTER the last
+		// slash: a registry host may carry a port (registry:5000/busybox),
+		// and reading that as a tag would call an untagged image pinned.
+		tag := ""
+		if i := strings.LastIndex(image, ":"); i > strings.LastIndex(image, "/") {
+			tag = image[i+1:]
+		}
+
+		switch tag {
+		case "":
+			t.Errorf("%q carries no tag\n"+
+				"  reason: Kubernetes resolves an untagged image to :latest, so this floats — and it "+
+				"floats invisibly, because the string \":latest\" never appears", image)
+		case "latest":
+			t.Errorf("%q uses a floating :latest tag", image)
 		}
 	}
 }
