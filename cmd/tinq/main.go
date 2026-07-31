@@ -317,8 +317,30 @@ func (h *hvf) Observe(ctx context.Context, m *unstructured.Unstructured) (bool, 
 }
 
 func (h *hvf) Create(ctx context.Context, m *unstructured.Unstructured) error {
-	_, err := h.create(m, h.dir(m))
-	return err
+	if _, err := h.create(m, h.dir(m)); err != nil {
+		return err
+	}
+
+	// The installed system writes its OWN kernel cmdline and does not inherit
+	// the ISO's console, so the config patch has to name it — and the name is
+	// architecture-specific (ttyS0 vs ttyAMA0). The README used to make the
+	// reader work that out; we already resolved it, so say it.
+	//
+	// SCOPED TO Create, not create(). -up calls create() directly, and this
+	// line went to stderr between steps 3 and 4 of a transcript that IS the
+	// feature — where step 6 already says the same thing, better and in the
+	// right place. -apply and the controller stop at a booted VM in
+	// maintenance mode and leave the operator to write that patch by hand, so
+	// they are the only callers that still need the hint.
+	//
+	// detect is memoized (sync.OnceValues), so create() has already paid for
+	// this and it cannot fail here after succeeding there — the guard exists
+	// so a future create() that stops probing does not nil-deref.
+	if p, err := h.detect(); err == nil {
+		log.Printf("for the install config patch on this host: extraKernelArgs: [%s]", p.ConsoleArg)
+	}
+
+	return nil
 }
 
 // Destroy takes the WHOLE SCC: the process (which sweeps everything inside the
@@ -520,11 +542,6 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("pidfile: %w", err)
 	}
-	// The installed system writes its OWN kernel cmdline and does not inherit
-	// the ISO's console, so the config patch has to name it — and the name is
-	// architecture-specific (ttyS0 vs ttyAMA0). The README used to make the
-	// reader work that out; we already resolved it, so say it.
-	log.Printf("for the install config patch on this host: extraKernelArgs: [%s]", p.ConsoleArg)
 	return strconv.Atoi(strings.TrimSpace(string(b)))
 }
 

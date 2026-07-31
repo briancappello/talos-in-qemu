@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -494,6 +495,84 @@ func TestHostForwardEndpoints(t *testing.T) {
 			}
 		})
 	}
+}
+
+// THE TRANSCRIPT IS THE FEATURE, and stderr does not respect it: anything
+// logged while -up is running interleaves into the ten steps. The
+// extraKernelArgs hint used to be logged by create(), which -up's Boot closure
+// calls directly — so every bring-up printed it between steps 3 and 4, where
+// step 6 says the same thing better and in the right place.
+//
+// -apply and the controller stop at a booted VM and still need it, so it moved
+// up one level rather than away.
+func TestOnlyCreateTheVerbLogsTheKernelArgHint(t *testing.T) {
+	requireQEMUImg(t)
+
+	logged := func(t *testing.T, call func(*hvf, *unstructured.Unstructured, string) error) string {
+		t.Helper()
+
+		fw := t.TempDir()
+		code := filepath.Join(fw, "OVMF_CODE.fd")
+		vars := filepath.Join(fw, "OVMF_VARS.fd")
+		writeSized(t, code, 1024, 'C')
+		writeSized(t, vars, x86VarsSize, 'T')
+		imageRoot := t.TempDir()
+		writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
+		bin, _ := fakeQEMU(t, fw)
+
+		h := &hvf{
+			stateRoot: t.TempDir(), imageRoot: imageRoot,
+			detect: func() (*platform.Platform, error) {
+				return &platform.Platform{
+					QEMUBinary: bin, Machine: "q35", Accel: "kvm", CPU: "host",
+					FirmwareCode: code, FirmwareVars: vars,
+					ConsoleArg: "console=ttyS0", ImageArch: "amd64",
+				}, nil
+			},
+		}
+
+		var obj map[string]interface{}
+		if err := yaml.Unmarshal([]byte(machineDoc), &obj); err != nil {
+			t.Fatal(err)
+		}
+		m := &unstructured.Unstructured{Object: obj}
+		m.SetUID("bootstrap-default-cp0")
+
+		var buf strings.Builder
+
+		log.SetOutput(&buf)
+		t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+		if err := call(h, m, h.dir(m)); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		return buf.String()
+	}
+
+	t.Run("Create-logs-it", func(t *testing.T) {
+		out := logged(t, func(h *hvf, m *unstructured.Unstructured, _ string) error {
+			return h.Create(context.Background(), m)
+		})
+		if !strings.Contains(out, "extraKernelArgs: [console=ttyS0]") {
+			t.Errorf("-apply no longer prints the console hint: %q\n"+
+				"  reason: -apply stops at a booted VM and leaves the operator to write that patch by hand",
+				out)
+		}
+	})
+
+	t.Run("create-does-not", func(t *testing.T) {
+		out := logged(t, func(h *hvf, m *unstructured.Unstructured, dir string) error {
+			_, err := h.create(m, dir)
+
+			return err
+		})
+		if out != "" {
+			t.Errorf("create() logged %q\n"+
+				"  reason: -up's Boot calls create() directly, and anything on stderr interleaves "+
+				"into the ten-step transcript that is the whole feature", out)
+		}
+	})
 }
 
 // status.apiEndpoint and the endpoint -up hands cluster.Up are two answers to
