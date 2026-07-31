@@ -305,15 +305,14 @@ func (h *hvf) Observe(ctx context.Context, m *unstructured.Unstructured) (bool, 
 	if pid <= 0 || !processAlive(pid) {
 		return false, nil, nil
 	}
-	api := ""
-	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
-		hh, _ := hf.(map[string]interface{})
-		if toInt(hh["guestPort"]) == 50000 {
-			api = fmt.Sprintf("127.0.0.1:%d", toInt(hh["hostPort"]))
-		}
-	}
+	// talosEndpoint, not a second hand-rolled scan of hostForwards: status's
+	// apiEndpoint and the endpoint -up hands cluster.Up are two answers to one
+	// question, and nothing but this shared call keeps them equal. The
+	// hand-rolled loop also reported "127.0.0.1:0" for an entry with a
+	// guestPort and no hostPort — an address, printed as status, that cannot
+	// answer.
 	return true, map[string]interface{}{
-		"pid": int64(pid), "stateDir": dir, "apiEndpoint": api,
+		"pid": int64(pid), "stateDir": dir, "apiEndpoint": talosEndpoint(m),
 	}, nil
 }
 

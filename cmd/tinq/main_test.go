@@ -496,6 +496,78 @@ func TestHostForwardEndpoints(t *testing.T) {
 	}
 }
 
+// status.apiEndpoint and the endpoint -up hands cluster.Up are two answers to
+// ONE question, and until this test nothing held them together: Observe scanned
+// spec.hostForwards itself, with its own literal 50000 and its own
+// "127.0.0.1:%d". Two copies of one rule drift, and the copy was already wrong
+// — a forward with the right guestPort and no hostPort came back as
+// "127.0.0.1:0", an address published as status that can never answer.
+func TestObserveReportsTheSameEndpointUpUses(t *testing.T) {
+	for _, tc := range []struct {
+		name, forwards, want string
+	}{
+		{"default", "    - hostPort: 50000\n      guestPort: 50000\n", "127.0.0.1:50000"},
+		// The host port need not equal the guest port.
+		{"remapped", "    - hostPort: 51000\n      guestPort: 50000\n", "127.0.0.1:51000"},
+		{"unrelated-forward-only", "    - hostPort: 8080\n      guestPort: 80\n", ""},
+		// Port 0 is not an endpoint. An entry naming the guest port with no
+		// hostPort forwards nothing at all.
+		{"guest-port-with-no-host-port", "    - guestPort: 50000\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			imageRoot := t.TempDir()
+			writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
+			h := &hvf{
+				stateRoot: t.TempDir(), imageRoot: imageRoot,
+				detect: func() (*platform.Platform, error) { return &platform.Platform{}, nil },
+			}
+
+			doc := strings.Split(machineDoc, "  hostForwards:")[0] + "  hostForwards:\n" + tc.forwards
+
+			var obj map[string]interface{}
+			if err := yaml.Unmarshal([]byte(doc), &obj); err != nil {
+				t.Fatal(err)
+			}
+			m := &unstructured.Unstructured{Object: obj}
+			m.SetUID("bootstrap-default-cp0")
+
+			// A live pid, or Observe reports absent and asserts nothing. This
+			// process is the most reliable live pid a test has.
+			dir := h.dir(m)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "qemu.pid"),
+				[]byte(fmt.Sprint(os.Getpid())), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			exists, status, err := h.Observe(context.Background(), m)
+			if err != nil || !exists {
+				t.Fatalf("Observe = (%v, %v), want a live machine", exists, err)
+			}
+
+			if got := status["apiEndpoint"]; got != tc.want {
+				t.Errorf("Observe apiEndpoint = %q, want %q", got, tc.want)
+			}
+
+			// The pin. Both being independently right is not enough: they must
+			// be the SAME answer, or `tinq -apply` prints an address `tinq -up`
+			// does not use.
+			opts, err := upOptions(h, m, true, status)
+			if err != nil {
+				t.Fatalf("upOptions: %v", err)
+			}
+			if status["apiEndpoint"] != opts.TalosEndpoint {
+				t.Errorf("status.apiEndpoint = %q but -up talks to %q\n"+
+					"  reason: one question, two answers — whichever is wrong, the operator is "+
+					"debugging against an address nothing is listening on",
+					status["apiEndpoint"], opts.TalosEndpoint)
+			}
+		})
+	}
+}
+
 // The serial is what the generated config selects the PVC volume on, and it
 // must be emitted ONLY when the disk exists — a config asking for a volume on a
 // disk that was never attached waits for it forever and the node never reaches
