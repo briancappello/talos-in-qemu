@@ -20,8 +20,10 @@ forwarded to `127.0.0.1:50000`. Cold boot to "machine is reachable" measured at
 ~20 seconds on Linux/KVM with a v1.13.7 ISO — and at **~10 seconds** on an M5
 Max *before this branch, by hand, and not re-run since*.
 
-Everything below marked *verified* means Linux/amd64 on KVM. **macOS is
-unverified on this branch** — see Status.
+Everything below marked *verified* has been run on **both** supported hosts:
+Linux/amd64 on KVM, and macOS/arm64 on Hypervisor.framework. The two differ in
+one behaviour — kexec, see Status — and where a claim holds on only one of them,
+the claim says which.
 
 ## Why this exists
 
@@ -557,12 +559,13 @@ Not done yet — stated plainly rather than implied:
   links, so no multi-node cluster and no simulated switch fabric. The QEMU
   backends needed (`socket`/`hubport`) are unprivileged, so this is a modeling
   gap in the resource, not a platform limit.
-- **macOS is UNVERIFIED on this branch.** Everything above that says "verified"
-  means Linux/amd64 on KVM, on real hardware. The runtime platform resolution
-  replaced the hardcoded Apple-silicon path, and nothing on this branch —
-  neither `-apply` nor `-up` — has been run on an actual Mac since. The
-  macOS/HVF paths are covered by unit tests only. Treat them as
-  expected-to-work, not proven.
+- **The two hosts differ in one behaviour, and it is guest-side.** Talos reboots
+  through kexec after installing; under QEMU on macOS/arm64 that path dies in
+  the guest, so `-up` sets `kernel.kexec_load_disabled` there and only there.
+  Linux/KVM reboots through kexec normally. Both are verified end to end —
+  see Status — but a hand-rolled machine config on macOS/arm64 that omits the
+  sysctl will wedge roughly six times in ten; see
+  [docs/kexec-on-arm64-macos.md](docs/kexec-on-arm64-macos.md).
 - **PVC data is disposable.** It lives on `data.qcow2` in the machine's state
   directory and `-destroy` takes the whole directory. There is no snapshot, no
   export and no backup.
