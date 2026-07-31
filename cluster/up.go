@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"time"
 
 	"github.com/coglative/talos-in-qemu/platform"
@@ -175,7 +174,10 @@ func Up(ctx context.Context, opts UpOptions) error {
 		return err
 	}
 
-	p.step("platform", "%s/%s, %s, %s", runtime.GOOS, host.ImageArch, host.Accel, host.QEMUBinary)
+	// host.OS, not runtime.GOOS: every other value on this line comes from the
+	// injected platform, and one that does not cannot be tested against any
+	// host but the test binary's own.
+	p.step("platform", "%s/%s, %s, %s", host.OS, host.ImageArch, host.Accel, host.QEMUBinary)
 
 	// ── 2/10 image ──────────────────────────────────────────────────────────
 	// InspectImageVersion never errors: an image it cannot classify reads as

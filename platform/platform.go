@@ -18,6 +18,13 @@ import (
 // Platform is the set of host facts main.go needs. Fields are resolved once by
 // Detect and then only read.
 type Platform struct {
+	// OS is the host's GOOS. It is carried here rather than left to callers'
+	// own runtime.GOOS so that EVERY host fact a caller reports comes from one
+	// injectable struct. A caller reaching for runtime.GOOS directly cannot be
+	// tested against a host other than the one the test binary runs on, which
+	// is how a transcript line ended up asserting "linux/amd64" and failing on
+	// a Mac while the code above it was correct.
+	OS           string // linux | darwin
 	QEMUBinary   string // qemu-system-x86_64 | qemu-system-aarch64
 	Machine      string // q35 | virt
 	Accel        string // kvm | hvf
@@ -87,6 +94,7 @@ func Detect() (*Platform, error) {
 	}
 
 	return &Platform{
+		OS:           runtime.GOOS,
 		QEMUBinary:   ai.qemuBinary,
 		Machine:      ai.machine,
 		Accel:        accel,

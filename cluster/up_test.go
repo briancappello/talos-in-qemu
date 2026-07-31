@@ -158,11 +158,17 @@ func (r *recorder) hooks() *upHooks {
 	}
 }
 
-// fakePlatform is the host facts Detect would return, with a console arg that
-// is NOT the default for this test binary's arch — a hardcoded "console=ttyS0"
-// in up.go would otherwise pass on an amd64 runner and fail nowhere.
+// fakePlatform is the host facts Detect would return. NONE of these values may
+// be the ones the test binary's own host would produce: a console arg of
+// "console=ttyS0" or an OS read from runtime.GOOS would let a hardcoded host
+// fact in up.go pass on the developer's machine and fail nowhere.
+//
+// OS is pinned to "linux" for exactly that reason, and it is the field that
+// caught the leak — up.go printed runtime.GOOS, so the transcript said
+// "darwin/amd64" on a Mac while every other value on the line was injected.
 func fakePlatform() *platform.Platform {
 	return &platform.Platform{
+		OS:         "linux",
 		QEMUBinary: "qemu-system-fake",
 		Machine:    "q35",
 		Accel:      "kvm",
