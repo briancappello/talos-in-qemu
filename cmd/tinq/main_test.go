@@ -451,6 +451,288 @@ func TestCreateQEMUArgs(t *testing.T) {
 	}
 }
 
+// ── -up wiring ──────────────────────────────────────────────────────────────
+//
+// Everything below tests the TRANSLATION from a CR to cluster.UpOptions. The
+// bring-up itself needs a VM and belongs to cluster's own suite; what is
+// main.go's alone is the disk serials, the qemu forwards and the profile
+// resolution — each of which is a value that would compile just as happily
+// wrong.
+
+// Both endpoints are the HOST side of a qemu user-mode forward. A machine that
+// forwards neither is not slow to bring up, it is impossible: nothing on the
+// host can reach the guest without a bridge.
+func TestHostForwardEndpoints(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		doc              string
+		talos, kubernets string
+	}{
+		{"both", machineDoc + "    - hostPort: 6443\n      guestPort: 6443\n",
+			"127.0.0.1:50000", "https://127.0.0.1:6443"},
+		// The host port need not equal the guest port, and reading the wrong
+		// side of the pair is invisible until a wait times out.
+		{"remapped", "spec:\n  hostForwards:\n    - hostPort: 51000\n      guestPort: 50000\n" +
+			"    - hostPort: 7443\n      guestPort: 6443\n",
+			"127.0.0.1:51000", "https://127.0.0.1:7443"},
+		{"talos-only", machineDoc, "127.0.0.1:50000", ""},
+		{"none", "spec:\n  site: testsite\n", "", ""},
+		// A forward to some other service must not be mistaken for either.
+		{"unrelated", "spec:\n  hostForwards:\n    - hostPort: 8080\n      guestPort: 80\n", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var obj map[string]interface{}
+			if err := yaml.Unmarshal([]byte(tc.doc), &obj); err != nil {
+				t.Fatal(err)
+			}
+			m := &unstructured.Unstructured{Object: obj}
+			if got := talosEndpoint(m); got != tc.talos {
+				t.Errorf("talosEndpoint = %q, want %q", got, tc.talos)
+			}
+			if got := kubeEndpoint(m); got != tc.kubernets {
+				t.Errorf("kubeEndpoint = %q, want %q", got, tc.kubernets)
+			}
+		})
+	}
+}
+
+// The serial is what the generated config selects the PVC volume on, and it
+// must be emitted ONLY when the disk exists — a config asking for a volume on a
+// disk that was never attached waits for it forever and the node never reaches
+// Ready.
+func TestDataDiskSerial(t *testing.T) {
+	for _, tc := range []struct {
+		name, doc, want string
+	}{
+		{"set", "spec:\n  dataDisk: 40Gi\n", DiskSerialData},
+		{"absent", "spec:\n  disk: 20Gi\n", ""},
+		// The typo that costs an hour: no unit, so this is a float64 and reads
+		// as "not set" — in create() AND here, which is the agreement that
+		// keeps the two halves of storage consistent.
+		{"unquoted-number-is-not-a-size", "spec:\n  dataDisk: 40\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dataDiskSerial(specFromYAML(t, tc.doc)); got != tc.want {
+				t.Errorf("dataDiskSerial = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Every field cluster.Up is handed, asserted without a hypervisor. Each is a
+// value that compiles just as happily wrong and is only visibly wrong minutes
+// into a bring-up.
+func TestUpOptions(t *testing.T) {
+	imageRoot := t.TempDir()
+	writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
+	root := t.TempDir()
+	d := &hvf{
+		stateRoot: root, imageRoot: imageRoot,
+		detect: func() (*platform.Platform, error) { return &platform.Platform{}, nil },
+	}
+
+	var obj map[string]interface{}
+	if err := yaml.Unmarshal([]byte(machineDoc+
+		"    - hostPort: 6443\n      guestPort: 6443\n  dataDisk: 40Gi\n"), &obj); err != nil {
+		t.Fatal(err)
+	}
+	m := &unstructured.Unstructured{Object: obj}
+	m.SetUID("bootstrap-default-cp0")
+
+	opts, err := upOptions(d, m, false, nil)
+	if err != nil {
+		t.Fatalf("upOptions: %v", err)
+	}
+
+	// The state dir is the MACHINE's, not the root: the artifacts have to
+	// carry the identity they belong to or -destroy cannot sweep them, and a
+	// talosconfig that outlives its cluster is residue with a private key in it.
+	if want := filepath.Join(root, "testsite", "bootstrap-default-cp0"); opts.StateDir != want {
+		t.Errorf("StateDir = %q, want %q", opts.StateDir, want)
+	}
+	if want := filepath.Join(imageRoot, "talos.iso"); opts.ImagePath != want {
+		t.Errorf("ImagePath = %q, want %q", opts.ImagePath, want)
+	}
+	if opts.TalosEndpoint != "127.0.0.1:50000" {
+		t.Errorf("TalosEndpoint = %q, want 127.0.0.1:50000", opts.TalosEndpoint)
+	}
+	if opts.KubeEndpoint != "https://127.0.0.1:6443" {
+		t.Errorf("KubeEndpoint = %q, want https://127.0.0.1:6443", opts.KubeEndpoint)
+	}
+	if opts.SystemDiskSerial != DiskSerialSystem || opts.DataDiskSerial != DiskSerialData {
+		t.Errorf("serials = %q/%q, want %q/%q\n"+
+			"  reason: swapped, the install target and the PVC volume trade places and the OS lands on the data disk",
+			opts.SystemDiskSerial, opts.DataDiskSerial, DiskSerialSystem, DiskSerialData)
+	}
+	if opts.ClusterName != "cp0" {
+		t.Errorf("ClusterName = %q, want the machine's name cp0", opts.ClusterName)
+	}
+	if opts.Detect == nil || opts.Boot == nil {
+		t.Fatal("Detect and Boot must both be supplied; cluster.Up has no fallback for either")
+	}
+}
+
+// A VM already running is ADOPTED, not duplicated — the same already-exists
+// rule -apply applies, and what makes `-apply` then `-up` a working sequence.
+// Starting a second qemu against one state dir corrupts the disk they share.
+func TestUpOptionsAdoptsAnAlreadyRunningVM(t *testing.T) {
+	imageRoot := t.TempDir()
+	writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
+	d := &hvf{
+		stateRoot: t.TempDir(),
+		imageRoot: imageRoot,
+		detect: func() (*platform.Platform, error) {
+			t.Error("adopting a running VM must not probe the host or start qemu")
+			return nil, fmt.Errorf("no accelerator on this host")
+		},
+	}
+
+	var obj map[string]interface{}
+	if err := yaml.Unmarshal([]byte(machineDoc), &obj); err != nil {
+		t.Fatal(err)
+	}
+	m := &unstructured.Unstructured{Object: obj}
+	m.SetUID("bootstrap-default-cp0")
+
+	opts, err := upOptions(d, m, true, map[string]interface{}{"pid": int64(4242)})
+	if err != nil {
+		t.Fatalf("upOptions: %v", err)
+	}
+
+	// Observe hands back an int64; a bare .(int) assertion would give 0 and
+	// the transcript would report a VM with no process.
+	pid, err := opts.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	if pid != 4242 {
+		t.Errorf("Boot returned pid %d, want the running VM's 4242", pid)
+	}
+}
+
+// spec.image is required, and an empty one must not resolve to the image ROOT:
+// Stat succeeds on a directory, so without this guard -apply hands qemu a
+// directory as its boot medium and -up reads a version out of one.
+func TestResolveImageRequiresAProfile(t *testing.T) {
+	d := &hvf{imageRoot: t.TempDir()}
+	if _, err := d.resolveImage(map[string]interface{}{}); err == nil {
+		t.Fatal("an absent spec.image must be an error")
+	}
+	if _, err := d.resolveImage(map[string]interface{}{"image": ""}); err == nil {
+		t.Fatal("an empty spec.image must be an error")
+	}
+}
+
+// upFixture writes a CR to disk and returns a driver whose Detect FAILS.
+//
+// That is the assertion, not the setup: every refusal below has to happen
+// before any host probing, because a machine that cannot be reached is a
+// machine that should never have been created.
+func upFixture(t *testing.T, doc string) (*hvf, string) {
+	t.Helper()
+	imageRoot := t.TempDir()
+	writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
+	path := filepath.Join(t.TempDir(), "machine.yaml")
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return &hvf{
+		stateRoot: t.TempDir(),
+		imageRoot: imageRoot,
+		detect: func() (*platform.Platform, error) {
+			t.Error("-up must refuse a machine it cannot reach before probing the host")
+			return nil, fmt.Errorf("no accelerator on this host")
+		},
+	}, path
+}
+
+// A missing forward is refused UP FRONT, with the guest port named. Discovering
+// it later costs a five- or ten-minute wait against an address that was never
+// going to answer, and the transcript would blame the node.
+func TestUpRefusesAMachineWithNoForwardedEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name, doc, want string
+	}{
+		// machineDoc forwards 50000 and nothing else: a cluster whose
+		// kubeconfig cannot be used from this host.
+		{"no-kubernetes-forward", machineDoc, "6443"},
+		{"no-forwards-at-all", strings.Split(machineDoc, "  hostForwards:")[0], "50000"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, path := upFixture(t, tc.doc)
+			err := standalone(context.Background(), d, path, "up")
+			if err == nil {
+				t.Fatal("-up ran against a machine with no forwarded endpoint")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the refusal does not name guest port %s: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// -up needs the SAME image create() boots: its volume id is what pins the
+// installer. An unresolvable profile has to fail here, not after a VM exists.
+func TestUpRefusesAnUnresolvableImage(t *testing.T) {
+	doc := strings.Replace(machineDoc, "image: talos.iso", "image: absent.iso", 1)
+	d, path := upFixture(t, doc)
+	err := standalone(context.Background(), d, path, "up")
+	if err == nil {
+		t.Fatal("-up ran with an image profile that resolves to nothing")
+	}
+	if !strings.Contains(err.Error(), "absent.iso") {
+		t.Errorf("the refusal does not name the profile: %v", err)
+	}
+}
+
+// -destroy is teardown, and teardown must NEVER require a healthy cluster, a
+// reachable node or a working hypervisor. Adding -up beside it is exactly the
+// change that could quietly make it need one.
+func TestDestroyNeedsNoAcceleratorAndNoNode(t *testing.T) {
+	d, path := upFixture(t, machineDoc)
+
+	// A LIVE process standing in for qemu, so this is the real teardown path
+	// and not the trivially-absent one. It is killed by Destroy; the sleep is
+	// only long enough that it cannot exit on its own first.
+	vm := exec.Command("sleep", "60")
+	if err := vm.Start(); err != nil {
+		t.Skipf("cannot start a stand-in process: %v", err)
+	}
+	// Reaped in the background: qemu is daemonized and is nobody's child, but
+	// this stand-in IS ours, and an unreaped zombie still answers kill(pid, 0)
+	// — which would make destroy's liveness loop spend its whole five seconds
+	// waiting for a process that already died.
+	reaped := make(chan struct{})
+	go func() { _, _ = vm.Process.Wait(); close(reaped) }()
+	t.Cleanup(func() { _ = vm.Process.Kill(); <-reaped })
+
+	dir := filepath.Join(d.stateRoot, "testsite", "bootstrap-default-cp0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The bring-up artifacts. They live in the state dir precisely so teardown
+	// sweeps them and the cluster's secrets do not outlive the cluster.
+	for _, name := range []string{"qemu.pid", "talosconfig", "kubeconfig", "secrets.yaml", "controlplane.yaml"} {
+		body := "secret"
+		if name == "qemu.pid" {
+			body = fmt.Sprint(vm.Process.Pid)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := standalone(context.Background(), d, path, "destroy"); err != nil {
+		t.Fatalf("-destroy must work with no accelerator and no reachable node: %v", err)
+	}
+
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("the state dir survived -destroy (%v)\n"+
+			"  reason: the generated talosconfig, kubeconfig and secrets bundle live in it, and "+
+			"secrets that outlive their cluster are residue with a private key in it", err)
+	}
+}
+
 // Detect resolves FirmwareVars by statting it, so this is unreachable in
 // practice — but it is the difference between a named error and a silent
 // nil-deref if that ever stops holding.

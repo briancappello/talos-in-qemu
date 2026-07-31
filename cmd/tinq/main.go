@@ -39,6 +39,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coglative/talos-in-qemu/cluster"
 	"github.com/coglative/talos-in-qemu/driverkit"
 	"github.com/coglative/talos-in-qemu/platform"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -70,6 +71,7 @@ func main() {
 	interval := flag.Duration("interval", 5*time.Second, "reconcile interval")
 	apply := flag.String("apply", "", "BOOTSTRAP: reconcile ONE TalosMachine read from this YAML file, with no control plane, then exit")
 	destroyF := flag.String("destroy", "", "BOOTSTRAP: destroy the TalosMachine described by this YAML file, then exit")
+	up := flag.String("up", "", "BOOTSTRAP: -apply, then bring the machine up to a single-node Kubernetes cluster, then exit")
 	flag.Parse()
 
 	if err := os.MkdirAll(*stateRoot, 0o755); err != nil {
@@ -95,10 +97,18 @@ func main() {
 	// Once the first node is up and bootstrapped it becomes the management
 	// cluster, and this same binary runs against it in controller mode for
 	// every machine after.
-	if *apply != "" || *destroyF != "" {
+	//
+	// -up is -apply plus the cluster. It is the SAME create() and the same
+	// state layout — the VM half is byte-for-byte what -apply builds — with
+	// cluster.Up driving the Talos side afterwards. -apply stays VM-only, and
+	// -destroy stays working with no hypervisor and no reachable node.
+	if *apply != "" || *destroyF != "" || *up != "" {
 		path, verb := *apply, "apply"
-		if *destroyF != "" {
+		switch {
+		case *destroyF != "":
 			path, verb = *destroyF, "destroy"
+		case *up != "":
+			path, verb = *up, "up"
 		}
 		if err := standalone(context.Background(), d, path, verb); err != nil {
 			log.Fatalf("%s %s: %v", verb, path, err)
@@ -153,6 +163,8 @@ func standalone(ctx context.Context, d *hvf, path, verb string) error {
 			return nil
 		}
 		return d.Destroy(ctx, m)
+	case "up":
+		return bringUp(ctx, d, m, exists, status)
 	default:
 		if exists {
 			log.Printf("already running: %v", status)
@@ -168,6 +180,111 @@ func standalone(ctx context.Context, d *hvf, path, verb string) error {
 		log.Printf("created: %v", status)
 		return nil
 	}
+}
+
+// The two guest ports a bring-up talks to. They are Talos's, not ours: apid
+// serves on 50000 and kube-apiserver on 6443, so these are the guest sides that
+// spec.hostForwards has to map onto the host.
+const (
+	talosAPIGuestPort = 50000
+	kubeAPIGuestPort  = 6443
+)
+
+// hostForward reports the HOST port forwarded to guestPort, or 0 when the
+// machine forwards nothing there.
+//
+// Everything reachable from the host goes through a qemu user-mode forward, so
+// a missing entry is not a slow path — it is an address that will never answer.
+// cluster.Up refuses an empty endpoint up front rather than spending a wait's
+// whole budget discovering that.
+func hostForward(m *unstructured.Unstructured, guestPort int) int {
+	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
+		h, _ := hf.(map[string]interface{})
+		if toInt(h["guestPort"]) == guestPort {
+			return toInt(h["hostPort"])
+		}
+	}
+	return 0
+}
+
+// talosEndpoint is the host side of the Talos API forward, host:port, or "".
+func talosEndpoint(m *unstructured.Unstructured) string {
+	if p := hostForward(m, talosAPIGuestPort); p > 0 {
+		return fmt.Sprintf("127.0.0.1:%d", p)
+	}
+	return ""
+}
+
+// kubeEndpoint is the host side of the Kubernetes API forward, as a URL, or "".
+//
+// It is written into the generated config as the control-plane endpoint AND
+// into the kubeconfig, so it has to be the address the HOST can reach — the
+// guest's own is unroutable from here without a bridge.
+func kubeEndpoint(m *unstructured.Unstructured) string {
+	if p := hostForward(m, kubeAPIGuestPort); p > 0 {
+		return fmt.Sprintf("https://127.0.0.1:%d", p)
+	}
+	return ""
+}
+
+// bringUp is the -up verb: create (or adopt) the VM, then hand everything after
+// that to cluster.Up, which owns all ten steps and every line of output.
+func bringUp(ctx context.Context, d *hvf, m *unstructured.Unstructured, exists bool,
+	status map[string]interface{}) error {
+	opts, err := upOptions(d, m, exists, status)
+	if err != nil {
+		return err
+	}
+	return cluster.Up(ctx, opts)
+}
+
+// upOptions translates a TalosMachine into what cluster.Up needs.
+//
+// It is separate from bringUp so it can be ASSERTED without a hypervisor. Every
+// field below is a value that would compile just as happily wrong — the state
+// dir, the two endpoints, the two disk serials, the resolved image — and each
+// one is only visibly wrong minutes into a bring-up, on a node that is by then
+// half installed.
+//
+// The VM half is create(), unchanged and unbranched: -up must not become a
+// second way to build a machine. What is HERE is only the translation, and
+// package main is the only place that can do it — the serials, the qemu
+// forwards and the profile resolution are all its.
+func upOptions(d *hvf, m *unstructured.Unstructured, exists bool,
+	status map[string]interface{}) (cluster.UpOptions, error) {
+	spec, _, _ := unstructured.NestedMap(m.Object, "spec")
+
+	image, err := d.resolveImage(spec)
+	if err != nil {
+		return cluster.UpOptions{}, err
+	}
+
+	// The MACHINE's state dir, never the state root: the artifacts carry the
+	// identity they belong to, which is the property that makes -destroy sweep
+	// them. Written one level up they would outlive the cluster whose keys
+	// they are, and the residue check would not find them.
+	dir := d.dir(m)
+
+	return cluster.UpOptions{
+		ClusterName:      m.GetName(),
+		ImagePath:        image,
+		StateDir:         dir,
+		TalosEndpoint:    talosEndpoint(m),
+		KubeEndpoint:     kubeEndpoint(m),
+		SystemDiskSerial: DiskSerialSystem,
+		DataDiskSerial:   dataDiskSerial(spec),
+		Detect:           d.detect,
+		Boot: func() (int, error) {
+			// The same already-exists rule -apply applies, and it is what
+			// makes `-apply` then `-up` work: a VM already sitting in
+			// maintenance mode is ADOPTED, not duplicated. Starting a second
+			// qemu against one state dir would corrupt the disk it shares.
+			if exists {
+				return toInt(status["pid"]), nil
+			}
+			return d.create(m, dir)
+		},
+	}, nil
 }
 
 // dir keys state by SITE then UID. The site is IN THE PATH on purpose: artifacts
@@ -221,6 +338,31 @@ func readPid(dir string) int {
 	return pid
 }
 
+// resolveImage turns spec.image into a path to a local artifact.
+//
+// The claim carries a NEUTRAL PROFILE NAME (talos-nocloud.img), not a path.
+// Resolving it to a local artifact is substrate-local configuration and belongs
+// to the provider — same argument as GCP's project. An absolute path in the
+// claim would be a leak: it cannot travel to GCP or AWS, where the same profile
+// resolves to an image URI or an AMI.
+//
+// It is a function of its own because -up needs the SAME answer create() uses:
+// the ISO it boots is the ISO whose volume id pins the installer, and two
+// resolutions of one profile name are two answers waiting to disagree.
+func (h *hvf) resolveImage(spec map[string]interface{}) (string, error) {
+	image, _ := spec["image"].(string)
+	if image == "" {
+		return "", fmt.Errorf("spec.image is required")
+	}
+	if !filepath.IsAbs(image) {
+		image = filepath.Join(h.imageRoot, image)
+	}
+	if _, err := os.Stat(image); err != nil {
+		return "", fmt.Errorf("resolve profile %q under %s: %w", spec["image"], h.imageRoot, err)
+	}
+	return image, nil
+}
+
 func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	spec, _, _ := unstructured.NestedMap(m.Object, "spec")
 
@@ -235,20 +377,9 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		return 0, err
 	}
 
-	image, _ := spec["image"].(string)
-	if image == "" {
-		return 0, fmt.Errorf("spec.image is required")
-	}
-	// The claim carries a NEUTRAL PROFILE NAME (talos-nocloud.img), not a path.
-	// Resolving it to a local artifact is substrate-local configuration and
-	// belongs to the provider — same argument as GCP's project. An absolute path
-	// in the claim would be a leak: it cannot travel to GCP or AWS, where the
-	// same profile resolves to an image URI or an AMI.
-	if !filepath.IsAbs(image) {
-		image = filepath.Join(h.imageRoot, image)
-	}
-	if _, err := os.Stat(image); err != nil {
-		return 0, fmt.Errorf("resolve profile %q under %s: %w", spec["image"], h.imageRoot, err)
+	image, err := h.resolveImage(spec)
+	if err != nil {
+		return 0, err
 	}
 	// The symptom is NOT "no bootable media": Talos ISOs carry BOTH BOOTX64.EFI
 	// and BOOTAA64.EFI (the very property that defeats ESP-based detection — see
@@ -541,6 +672,23 @@ const (
 // set", never a panic.
 func specDataDisk(spec map[string]interface{}) string {
 	return str(spec["dataDisk"], "")
+}
+
+// dataDiskSerial is the serial cluster.Up selects the PVC volume on, or "" when
+// this machine has no data disk.
+//
+// ONE field decides BOTH halves of storage — the UserVolumeConfig in the
+// generated machine config and the StorageClass installed into the cluster — so
+// they cannot disagree. It reads through specDataDisk, the same resolution
+// create() uses to decide whether to make the disk at all: a `dataDisk: 40`
+// with the unit left off is "not set" in both places, which is what makes the
+// announced skip in step 10 the first visible sign of the typo rather than a
+// Pending PVC an hour later.
+func dataDiskSerial(spec map[string]interface{}) string {
+	if specDataDisk(spec) == "" {
+		return ""
+	}
+	return DiskSerialData
 }
 
 func toInt(v interface{}) int {
