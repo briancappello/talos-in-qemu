@@ -285,13 +285,20 @@ sandbox. Three defaults differ from `kind` and each is decided deliberately:
 
 ## Risks and unverified assumptions
 
-- **`disk.serial` in a CEL volume selector is unconfirmed.** The disk spec
-  carries `serial` and `talosctl get disks` displays it, and
-  `disk.transport`/`disk.rotational`/`disk.size` are documented CEL variables —
-  but no doc example uses `disk.serial`. **Implementation must verify this
-  empirically** with `talosctl get disks` against a two-disk VM before relying
-  on it. Fallback: `!system_disk && !disk.cdrom`. The *install* selector is not
-  affected; it uses the v1alpha1 `serial` field, which is confirmed.
+- **`disk.serial` in a CEL volume selector: RESOLVED — confirmed usable, and
+  required.** Measured against a real two-disk VM in Task 5 by querying the
+  `Disks` resource through `client.Client`'s COSI state. Serials arrive
+  verbatim: `vda` → `talos-system`, `vdc` → `talos-data`. Machinery's own
+  `blockhelpers.MatchDisks` evaluated the generated selector against live state
+  to exactly `[vdc]`.
+
+  **The fallback this spec originally proposed was wrong and must not be used.**
+  `!system_disk && !disk.cdrom` matched `[loop0 vdb vdc]` — three candidates —
+  because the boot ISO presents as a read-only virtio-blk disk with
+  `CDROM: false`. That is a one-in-three chance of provisioning the storage
+  volume onto the wrong device. The `cdrom` field does not mean what its name
+  suggests for a virtio-attached ISO, which is precisely why an identity
+  (serial) beats a predicate here.
 - **macOS remains unverified**, inherited from branch 1.
 - **Talos v1.13.7 verified to boot on Linux/KVM** (API reachable, TLS handshake
   returned `CN=maintenance-service.talos.dev`). The README's "newer ISOs may not
