@@ -67,6 +67,29 @@ const userVolumeName = "local-path-provisioner"
 // rather than of ConfigInput.Endpoint.
 const loopback = "127.0.0.1"
 
+// errUnknownTalosVersion is the refusal for an image whose Talos version could
+// not be determined.
+//
+// It is ONE function because TWO callers refuse the same condition, and they
+// must not drift into two different explanations of it. GenerateConfig refuses
+// unconditionally — that is the refusal nothing can bypass. Up refuses at step
+// 3, from the ISO alone, BEFORE it boots anything: the outcome is already
+// provable there, and reaching this failure through GenerateConfig instead
+// costs a booted VM, a state dir and a five-minute maintenance wait for a
+// verdict the ISO's volume id gave for free.
+func errUnknownTalosVersion() error {
+	return fmt.Errorf(`could not determine the Talos version of this image
+
+The installer image is pinned to the IMAGE's own version and cannot be guessed.
+Left to default, Talos substitutes the config generator's version (%s), and a
+fresh install silently becomes a cross-version upgrade: the maintenance system
+already running either rejects the config outright as too new, or accepts it,
+installs, and then hangs at /sbin/init with nothing on the console to say why.
+
+  boot a stock Talos ISO, whose volume id encodes the version (e.g. TALOS_V1_13_7)`,
+		GeneratorVersion())
+}
+
 // GenerateConfig produces the machine config, client config and secrets bundle
 // for a single-node cluster.
 //
@@ -83,16 +106,7 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 	// Substituting GeneratorVersion() here would hand-roll the exact default
 	// the pin below exists to override.
 	if version == "" {
-		return nil, fmt.Errorf(`could not determine the Talos version of this image
-
-The installer image is pinned to the IMAGE's own version and cannot be guessed.
-Left to default, Talos substitutes the config generator's version (%s), and a
-fresh install silently becomes a cross-version upgrade: the maintenance system
-already running either rejects the config outright as too new, or accepts it,
-installs, and then hangs at /sbin/init with nothing on the console to say why.
-
-  boot a stock Talos ISO, whose volume id encodes the version (e.g. TALOS_V1_13_7)`,
-			GeneratorVersion())
+		return nil, errUnknownTalosVersion()
 	}
 
 	// checked is deliberately discarded, and there are TWO ways it comes back

@@ -210,12 +210,29 @@ func Up(ctx context.Context, opts UpOptions) error {
 	case checked:
 		p.step("version guard", "machinery %s >= image %s  ok", GeneratorVersion(), imageVersion)
 	default:
-		p.step("version guard", "DID NOT RUN: this image's Talos version could not be determined")
-		p.detail("!! the guard did not run. Nothing compared this image against machinery %s.", GeneratorVersion())
+		// REFUSED, not a note, and refused HERE rather than four steps later.
+		// GenerateConfig rejects an unidentified image unconditionally —
+		// there is no branch of it that accepts an empty version, because the
+		// installer tag is written to the node's disk and there is no safe
+		// value to write. So this arm is already fatal; continuing merely
+		// spends a booted VM, a state dir and the five-minute maintenance
+		// budget before saying so. Same rule the refusal arm above obeys:
+		// failing here costs nothing, failing after the disk exists leaves
+		// residue.
+		//
+		// The lines still explain WHY the version is unknown, because that is
+		// the part the shared refusal cannot know: a pre-release volume id
+		// such as TALOS_V1_14_0_ALPHA reads as "" from InspectImageVersion,
+		// and it is exactly the image an operator is most likely to be
+		// holding when this fires.
+		p.step("version guard", "REFUSED: this image's Talos version could not be determined")
+		p.detail("!! nothing compared this image against machinery %s, and nothing can:", GeneratorVersion())
 		p.detail("!! Talos config generation is BACKWARDS compatible only, and exceeding it does")
 		p.detail("!! not fail loudly — it emits a plausible config for a Talos that does not exist.")
 		p.detail("!! A pre-release volume id (TALOS_V1_14_0_ALPHA) reads as unknown, which is")
 		p.detail("!! precisely the image most likely to break generation.")
+
+		return errUnknownTalosVersion()
 	}
 
 	// ── 4/10 boot ───────────────────────────────────────────────────────────
@@ -270,11 +287,11 @@ func Up(ctx context.Context, opts UpOptions) error {
 	p.detail("diskSelector: serial %s", opts.SystemDiskSerial)
 	p.detail("  a size matcher is a coin flip once there are two large disks, and losing")
 	p.detail("  it installs the OS over your PVCs")
-	// `shown`, not imageVersion: unreachable today because GenerateConfig
-	// refuses an unidentified image outright, and a line reading
-	// "installer:ghcr.io/siderolabs/installer: (pinned to YOUR image)" would
-	// be a claim about a tag that is not there.
-	p.detail("installer: ghcr.io/siderolabs/installer:%s (pinned to YOUR image)", shown)
+	// imageVersion is non-empty by construction: step 3 refuses an
+	// unidentified image and returns, so this line cannot print
+	// "installer: ghcr.io/siderolabs/installer: (pinned to YOUR image)" —
+	// a claim about a tag that is not there.
+	p.detail("installer: ghcr.io/siderolabs/installer:%s (pinned to YOUR image)", imageVersion)
 	p.detail("  left unset Talos substitutes THIS binary's version, and a fresh install")
 	p.detail("  silently becomes a cross-version upgrade")
 	p.detail("extraKernelArgs: %s (this host's serial)", host.ConsoleArg)

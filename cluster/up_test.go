@@ -105,6 +105,17 @@ func (r *recorder) hooks() *upHooks {
 		generateConfig: func(in ConfigInput) (*Generated, error) {
 			r.input = in
 
+			// The fake must not accept input the REAL GenerateConfig rejects.
+			// A fake more permissive than the thing it stands in for is how
+			// "-up boots a VM for an image it has already proven it cannot
+			// configure" survived this suite: the whole ten-step transcript
+			// ran to success with TalosVersion "", a value GenerateConfig has
+			// no branch that accepts. The precondition is the real error
+			// function, so the two cannot drift.
+			if in.TalosVersion == "" {
+				return nil, errUnknownTalosVersion()
+			}
+
 			if err := r.call("generateConfig"); err != nil {
 				return nil, err
 			}
@@ -298,19 +309,42 @@ func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
 // the ONLY signal that the guard never ran: a pre-release volume id such as
 // TALOS_V1_14_0_ALPHA reads as "" from InspectImageVersion, CheckVersion
 // returns (false, nil), and a caller writing `_, err :=` re-disables the guard
-// for exactly the images most likely to break config generation. The note below
-// is what makes that visible, and this test is what keeps the note.
-func TestUpAnnouncesThatTheVersionGuardDidNotRun(t *testing.T) {
+// for exactly the images most likely to break config generation.
+//
+// The verdict is a REFUSAL, and it lands before Boot. GenerateConfig has no
+// branch that accepts an empty version, so announcing this and continuing
+// spends a VM, a state dir and the five-minute maintenance wait to arrive at a
+// failure the ISO's volume id already proved.
+func TestUpRefusesAnImageItCouldNotIdentifyBeforeBooting(t *testing.T) {
 	f := newFixture(t)
 	f.rec.imageVersion = ""
 
-	transcript := f.mustRun(t)
+	err := f.run(t)
+	if err == nil {
+		t.Fatal("Up continued past an image whose Talos version could not be determined\n" +
+			"  reason: GenerateConfig refuses an empty version unconditionally, so this arm is already fatal")
+	}
 
+	if f.booted != 0 {
+		t.Errorf("the VM was booted %d times for an image the guard could not identify\n"+
+			"  reason: failing here costs nothing; failing after the disk exists leaves residue", f.booted)
+	}
+
+	if f.rec.did("waitMaintenance") {
+		t.Error("Up spent the maintenance budget on an image it had already proven it cannot configure")
+	}
+
+	transcript := f.out.String()
+
+	// The operator must still learn WHY, and get the remedy — which lives in
+	// the shared refusal, not in the transcript.
 	wants(t, transcript,
 		"[ 3/10] version guard",
+		"REFUSED",
 		"could not be determined",
-		"the guard did not run",
+		"TALOS_V1_14_0_ALPHA",
 	)
+	wants(t, err.Error(), "could not determine the Talos version", "TALOS_V1_13_7")
 
 	// An unknown version must not read as a passing guard.
 	if regexp.MustCompile(`(?m)^\[ 3/10\] version guard .*\bok\b`).MatchString(transcript) {
@@ -323,12 +357,12 @@ func TestUpAnnouncesThatTheVersionGuardDidNotRun(t *testing.T) {
 	wants(t, transcript, "-> UNKNOWN")
 }
 
-// The other side of it: an image that WAS identified must not print the note,
-// or the note becomes noise and stops being read.
+// The other side of it: an image that WAS identified must not print the
+// refusal, or the warning becomes noise and stops being read.
 func TestUpDoesNotAnnounceASkippedGuardForAKnownImage(t *testing.T) {
 	transcript := newFixture(t).mustRun(t)
 
-	for _, unwanted := range []string{"could not be determined", "the guard did not run"} {
+	for _, unwanted := range []string{"could not be determined", "REFUSED"} {
 		if strings.Contains(transcript, unwanted) {
 			t.Errorf("a fully identified image printed %q\n"+
 				"  reason: a warning that fires on every run is a warning nobody reads", unwanted)
@@ -712,7 +746,13 @@ func TestUpRefusesWithoutTheForwardedEndpoints(t *testing.T) {
 // Both defaults in Up are invisible to every test above, because every test
 // above supplies both — and their absence is not a wrong answer, it is a nil
 // dereference in production only. This drives a bring-up with NEITHER supplied
-// and stops it at Boot, which is the last point before anything needs a node.
+// and stops it at step 3, which is now the last point before anything needs a
+// node: the image does not exist, the REAL detectVersion reads it as unknown,
+// and the version guard refuses.
+//
+// Reaching that refusal is what proves both defaults: hooks nil resolved to
+// realHooks (or hooks.detectVersion would have panicked) and Out nil resolved
+// to os.Stdout (or p.step would have).
 func TestUpDefaultsToStdoutAndTheRealOperations(t *testing.T) {
 	err := Up(context.Background(), UpOptions{
 		ClusterName:      "probe",
@@ -722,13 +762,13 @@ func TestUpDefaultsToStdoutAndTheRealOperations(t *testing.T) {
 		KubeEndpoint:     "https://127.0.0.1:6443",
 		SystemDiskSerial: "talos-system",
 		Detect:           func() (*platform.Platform, error) { return fakePlatform(), nil },
-		// Fails on purpose: reaching it proves steps 1 to 3 ran through the
-		// real hooks and the real writer without a nil in either.
-		Boot: func() (int, error) { return 0, errors.New("far enough") },
+		// Must never run: step 3 refuses an unidentifiable image before
+		// anything is created.
+		Boot: func() (int, error) { return 0, errors.New("Boot was reached for an image the guard refused") },
 		// Out and hooks are deliberately left nil.
 	})
-	if err == nil || !strings.Contains(err.Error(), "far enough") {
-		t.Fatalf("Up did not reach Boot with its own defaults: %s", redactErr(err))
+	if err == nil || !strings.Contains(err.Error(), "could not determine the Talos version") {
+		t.Fatalf("Up did not refuse the unidentifiable image with its own defaults: %s", redactErr(err))
 	}
 }
 
