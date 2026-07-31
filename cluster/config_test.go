@@ -134,6 +134,43 @@ var comments = regexp.MustCompile(`(?m)^[ \t]*#.*$|[ \t]+#.*$`)
 
 func code(doc string) string { return comments.ReplaceAllString(doc, "") }
 
+// code() is load-bearing for four of this suite's mutants, and load-bearing
+// with nothing under it: neuter it to `return doc` and every test above still
+// passes, because every assertion it protects is then matched against the
+// encoder's commented-out example instead of the config. Apply the
+// allowSchedulingOnControlPlanes(false) mutant on top of that and the suite is
+// STILL green. redact() has a keeps-what-matters test for the same reason;
+// this is code()'s.
+func TestCodeReadsTheConfigAndNotTheEncodersManual(t *testing.T) {
+	// The encoder writes a commented-out example of most fields it did not
+	// set, at the indentation the field would have had.
+	for _, comment := range []string{
+		"# allowSchedulingOnControlPlanes: true",
+		"        # allowSchedulingOnControlPlanes: true",
+		"\t# grubUseUKICmdline: true",
+	} {
+		if got := code(comment); strings.TrimSpace(got) != "" {
+			t.Errorf("code(%q) = %q, want nothing\n"+
+				"  reason: an assertion that can read a commented-out example passes on a config that "+
+				"sets the opposite, and the mutant survives", comment, got)
+		}
+	}
+
+	// A trailing comment goes without taking the setting with it.
+	if got := code("    allowSchedulingOnControlPlanes: true # sets the thing"); !strings.Contains(got, "allowSchedulingOnControlPlanes: true") {
+		t.Errorf("code() dropped the setting along with its trailing comment: %q", got)
+	}
+
+	// And a live line survives untouched — a code() that returns "" hides
+	// every commented example AND every assertion, and the suite goes green by
+	// vacuum instead of by evidence.
+	if want := "    clusterName: probe"; code(want) != want {
+		t.Errorf("code(%q) = %q, want it unchanged\n"+
+			"  reason: a redactor of comments that eats the config makes every Contains() below "+
+			"assert against an empty string", want, code(want))
+	}
+}
+
 func v1alpha1Doc(t *testing.T, cp []byte) string {
 	t.Helper()
 
