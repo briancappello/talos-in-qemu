@@ -24,8 +24,8 @@ func accelFor(goos string) (string, error) {
 	case "linux":
 		return "kvm", nil
 	case "darwin":
-		// TODO(macos-verify): HVF is assumed present on any Mac able to run a
-		// Homebrew qemu-system binary. Unverified from Linux.
+		// Verified on darwin/arm64 (macOS 26.6, Homebrew qemu 11.0.2): `-accel
+		// help` lists hvf, and -machine virt,accel=hvf -cpu host boots.
 		return "hvf", nil
 	}
 	return "", fmt.Errorf("unsupported host OS %q: TinQ supports linux (KVM) and darwin (HVF)", goos)
@@ -123,10 +123,10 @@ func accelUnavailable(goos, goarch, accel string, compiled bool, diag kvmDiag, d
 			"       (then log out and back in); if another hypervisor holds\n" +
 			"       /dev/kvm, stop it first"
 	default:
-		// TODO(macos-verify): this is the HVF failure path, and its advice is
-		// unverified from Linux. There is no HVF analogue of diagnoseKVM --
-		// HVF exposes no device node to probe -- so this branch cannot say
-		// which of the HVF failure modes the user is in.
+		// The HVF path. Deliberately vague: there is no HVF analogue of
+		// diagnoseKVM -- HVF exposes no device node to probe -- so this branch
+		// cannot say which of the HVF failure modes the user is in, and
+		// guessing one would send them after the wrong fix.
 		reason = accel + " is not available"
 		fix = "ensure hardware virtualization is enabled on this host"
 	}

@@ -332,12 +332,22 @@ func TestScanRegistrySkipsUnreadableFile(t *testing.T) {
 // all agree with each other about descriptor shape and none of them would
 // notice if the real schema drifted. This one reads the host's actual registry
 // through the actual registryDirs and insists the files it names are really
-// there. It skips cleanly where the registry is absent (macOS/Homebrew, which
-// is not known to ship descriptors) — that is the fallback table's case.
+// there.
+//
+// The precondition is EVERY directory in registryDirs, not one hardcoded path.
+// It used to stat only /usr/share/qemu/firmware, so on macOS it reported SKIP —
+// and that skip is precisely what hid the missing Homebrew descriptor directory
+// until the branch was run on a Mac. A test whose reach is narrower than the
+// code it covers announces success for the case it cannot see.
 func TestScanRegistryAgainstHostRegistry(t *testing.T) {
-	const dir = "/usr/share/qemu/firmware"
-	if _, err := os.Stat(dir); err != nil {
-		t.Skipf("no firmware registry on this host: %v", err)
+	var present []string
+	for _, d := range registryDirs {
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			present = append(present, d)
+		}
+	}
+	if len(present) == 0 {
+		t.Skipf("no firmware registry on this host; searched: %v", registryDirs)
 	}
 	ai, err := archFor(runtime.GOARCH)
 	if err != nil {
@@ -353,7 +363,7 @@ func TestScanRegistryAgainstHostRegistry(t *testing.T) {
 		// Detect() still succeeds there. Only a descriptor that matched and
 		// then named files that are absent is a real defect, and that is the
 		// t.Errorf below.
-		t.Skipf("registry %s holds no descriptor for this host's %s/%s", dir, ai.fwArch, ai.machine)
+		t.Skipf("registries %v hold no descriptor for this host's %s/%s", present, ai.fwArch, ai.machine)
 	}
 	for _, p := range []string{code, vars} {
 		if !fileExists(p) {
@@ -534,5 +544,54 @@ func TestResolveFirmwareRejectsDirectories(t *testing.T) {
 
 	if c, v, err := resolveFirmware([]string{t.TempDir()}, table, "linux", "x86_64", "q35"); err == nil {
 		t.Errorf("a directory is not firmware; got %q/%q", c, v)
+	}
+}
+
+// The bug this pins: fallbackTable named edk2-aarch64-vars.fd, which QEMU has
+// never shipped. resolveFirmware requires BOTH halves of a pair, so the missing
+// vars template discarded the code image beside it and every aarch64 entry for
+// Homebrew went dead — Detect() failed outright on macOS.
+//
+// A code image that IS installed next to a vars template that is NOT is the
+// exact signature, and it is checkable on any host without knowing which
+// packages are present: entries for a prefix that does not exist are simply
+// absent on both halves and say nothing either way.
+func TestFallbackTablePairsAreInstalledTogether(t *testing.T) {
+	for arch, pairs := range fallbackTable {
+		for _, p := range pairs {
+			if fileExists(p[0]) && !fileExists(p[1]) {
+				t.Errorf("%s: code %q is installed but its nvram template %q is not,\n"+
+					"so resolveFirmware discards the pair and this entry is dead",
+					arch, p[0], p[1])
+			}
+		}
+	}
+}
+
+// The host check above only speaks where the files are installed, so on a Linux
+// CI box every Homebrew entry is silent and a reintroduced edk2-aarch64-vars.fd
+// would sail through. Pin the naming convention itself: edk2 vars templates are
+// shared across an architecture FAMILY, so the aarch64 code image pairs with the
+// arm vars template and the x86_64 code image pairs with the i386 one. Both are
+// confirmed by QEMU's own descriptors.
+func TestFallbackVarsTemplatesUseFamilySharedNames(t *testing.T) {
+	for _, tc := range []struct{ arch, code, vars string }{
+		{"aarch64", "edk2-aarch64-code.fd", "edk2-arm-vars.fd"},
+		{"x86_64", "edk2-x86_64-code.fd", "edk2-i386-vars.fd"},
+	} {
+		var found int
+		for _, p := range fallbackTable[tc.arch] {
+			if filepath.Base(p[0]) != tc.code {
+				continue
+			}
+			found++
+			if got := filepath.Base(p[1]); got != tc.vars {
+				t.Errorf("%s: %s must pair with %s, got %s (QEMU ships no per-sub-arch vars template)",
+					tc.arch, tc.code, tc.vars, got)
+			}
+		}
+		if found == 0 {
+			t.Errorf("%s: no fallback entry names %s at all", tc.arch, tc.code)
+		}
 	}
 }

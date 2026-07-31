@@ -151,22 +151,38 @@ func scanRegistry(dirs []string, fwArch, machine string) [][2]string {
 }
 
 // registryDirs is the descriptor search path in decreasing priority, per the
-// QEMU interop spec. /etc is the admin override.
-var registryDirs = []string{"/etc/qemu/firmware", "/usr/share/qemu/firmware"}
+// QEMU interop spec: /etc is the admin override, then $prefix/share/qemu/firmware
+// for each prefix QEMU might be installed under.
+//
+// The Homebrew prefixes are NOT decoration. Homebrew's qemu does ship
+// descriptors — 8 of them, /opt/homebrew/share/qemu/firmware/60-edk2-aarch64.json
+// included — and omitting that directory is what sent macOS to the fallback
+// table, where a wrong filename then failed the whole lookup. They cost nothing
+// on Linux: os.ReadDir on a missing directory is skipped like any other.
+var registryDirs = []string{
+	"/etc/qemu/firmware",
+	"/usr/share/qemu/firmware",
+	"/opt/homebrew/share/qemu/firmware",
+	"/usr/local/share/qemu/firmware",
+}
 
-// fallbackTable is used only when the registry yields nothing — the expected
-// case on Homebrew, which is not known to ship descriptors. Entries are
+// fallbackTable is used only when the registry yields nothing. Entries are
 // {code, nvram-template} pairs tried in order.
 //
-// TODO(macos-verify): the /opt/homebrew and /usr/local paths below are the ones
-// the pre-refactor edk2Code() used. Unverified from Linux; the file names in
-// particular (edk2-x86_64-code.fd paired with edk2-i386-vars.fd) are the ones
-// Homebrew's qemu formula is believed to install, and nothing here has been run
-// on a Mac.
+// THE VARS TEMPLATE IS SHARED WITHIN AN ARCHITECTURE FAMILY, and getting that
+// wrong is how this table breaks a whole platform. QEMU ships no
+// edk2-aarch64-vars.fd and never has: the aarch64 code image pairs with
+// edk2-arm-vars.fd, exactly as the x86_64 code image pairs with
+// edk2-i386-vars.fd. Both pairings are confirmed by QEMU's own descriptors
+// (60-edk2-aarch64.json, 60-edk2-x86_64.json).
+//
+// Naming a nonexistent vars file does not merely lose the vars file — resolve
+// requires BOTH halves to exist, so it discards the code image beside it and
+// the entry contributes nothing.
 var fallbackTable = map[string][][2]string{
 	"aarch64": {
-		{"/opt/homebrew/share/qemu/edk2-aarch64-code.fd", "/opt/homebrew/share/qemu/edk2-aarch64-vars.fd"},
-		{"/usr/local/share/qemu/edk2-aarch64-code.fd", "/usr/local/share/qemu/edk2-aarch64-vars.fd"},
+		{"/opt/homebrew/share/qemu/edk2-aarch64-code.fd", "/opt/homebrew/share/qemu/edk2-arm-vars.fd"},
+		{"/usr/local/share/qemu/edk2-aarch64-code.fd", "/usr/local/share/qemu/edk2-arm-vars.fd"},
 		{"/usr/share/AAVMF/AAVMF_CODE.fd", "/usr/share/AAVMF/AAVMF_VARS.fd"},
 		{"/usr/share/edk2/aarch64/QEMU_EFI.fd", "/usr/share/edk2/aarch64/QEMU_VARS.fd"},
 	},
