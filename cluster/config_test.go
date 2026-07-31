@@ -378,7 +378,7 @@ func TestGenerateConfigRefusesAnUnknownImageVersion(t *testing.T) {
 	// A refusal with no way out is a dead end. The stock ISO's volume id is
 	// where a usable version comes from, so the message has to name it.
 	if !strings.Contains(err.Error(), "TALOS_V") {
-		t.Errorf("refusal does not say how to obtain an identifiable image: %v", err)
+		t.Errorf("refusal does not say how to obtain an identifiable image: %s", redactErr(err))
 	}
 }
 
@@ -488,6 +488,61 @@ func leafStrings(node any, into *[]string) {
 	}
 }
 
+// maxSurvivingRun is the longest fragment of a secret that may remain in a
+// redacted artifact.
+//
+// Whole-value containment is not a verdict. A redactor that clips ONE
+// character off a 44-character private key leaves 43 of them in the output and
+// scores as safe, so the assertion is on the longest surviving RUN instead.
+// Sixteen characters of base64 is 96 bits; nothing structural in these
+// documents — indentation, keys, image references, `<redacted N chars>` —
+// collides with that by accident.
+const maxSurvivingRun = 16
+
+// survivingRun returns a fragment of secret that is still present in text, or
+// "" if none is. The window is capped at the secret's own length so that
+// lowering shortestSecret cannot silently disable the guard.
+func survivingRun(text, secret string) string {
+	n := min(maxSurvivingRun, len(secret))
+
+	for i := 0; i+n <= len(secret); i++ {
+		if run := secret[i : i+n]; strings.Contains(text, run) {
+			return run
+		}
+	}
+
+	return ""
+}
+
+// twinnable is the length above which a secret is also checked as the value
+// machinery could equally have drawn — see twinAlphabet.
+//
+// Only long values qualify. Below 40 characters the shape in this bundle is a
+// bootstrap token, `abc123.0123456789abcdef`, and a `-` in the middle of one
+// is not a value machinery can produce; twinning it would fail the guard
+// against a redactor that is correct.
+const twinnable = 40
+
+// twinAlphabet forces one alphabet-distinguishing character into the middle of
+// v.
+//
+// A bundle is ONE random draw, which makes a guard that only sees that draw a
+// coin flip. Whether a 44-character base64url secret happens to contain `-` or
+// `_` is chance — about a quarter of the time it contains neither — so a
+// redactor covering only the standard `+/` alphabet passes against roughly one
+// bundle in four. That is not a hypothetical: reverting the base64 class to
+// `[A-Za-z0-9+/]{40,}`, the exact leak this shape exists to close, failed 6 of
+// 8 runs and passed 2.
+//
+// Twinning removes the draw from the verdict. Whatever machinery produced, the
+// redactor is also handed the same value carrying `+`, `/`, `-` and `_` in
+// turn, so a class that covers only one alphabet fails every time.
+func twinAlphabet(v string, c byte) string {
+	mid := len(v) / 2
+
+	return v[:mid] + string(c) + v[mid+1:]
+}
+
 // The guard that keeps redact() honest. It does not check redact() against a
 // list of field names — that list is exactly what drifts. It takes the secrets
 // bundle as GROUND TRUTH: every string machinery put in it is by definition a
@@ -511,17 +566,29 @@ func TestRedactHidesEveryGeneratedSecret(t *testing.T) {
 	// bootstrap token.
 	const shortestSecret = 20
 
+	// A bundle with no twinnable value would leave the alphabet half of this
+	// guard asserting nothing at all.
+	twins := 0
+
 	var secretValues []string
 
 	for _, v := range values {
 		if len(v) >= shortestSecret {
 			secretValues = append(secretValues, v)
 		}
+
+		if len(v) >= twinnable {
+			twins++
+		}
 	}
 
 	if len(secretValues) < 10 {
 		t.Fatalf("only %d secret values found in the bundle; the guard is not looking at anything",
 			len(secretValues))
+	}
+
+	if twins == 0 {
+		t.Fatal("no secret long enough to twin; the alphabet half of this guard is asserting nothing")
 	}
 
 	for _, artifact := range []struct {
@@ -532,19 +599,48 @@ func TestRedactHidesEveryGeneratedSecret(t *testing.T) {
 		{"Talosconfig", g.Talosconfig},
 		{"Secrets", g.Secrets},
 	} {
-		redacted := redact(string(artifact.bytes))
+		asIs := redact(string(artifact.bytes))
 
 		for _, secret := range secretValues {
-			if strings.Contains(redacted, secret) {
-				// The secret itself is NOT printed, for the reason this whole
-				// test exists.
-				t.Errorf("redact() left a %d-character secret in %s\n"+
+			// The secret itself is NOT printed, for the reason this whole test
+			// exists — only its length and how much of it got through.
+			if run := survivingRun(asIs, secret); run != "" {
+				t.Errorf("redact() left %d of the %d characters of a secret in %s\n"+
 					"  reason: every dump in this file goes through redact(); a shape it does not "+
-					"cover reaches terminals, CI logs and pasted bug reports", len(secret), artifact.name)
+					"cover reaches terminals, CI logs and pasted bug reports", len(run), len(secret), artifact.name)
 			}
 		}
 
-		if strings.Contains(redacted, "-----BEGIN") {
+		// Same artifact, same structure, but with every long secret rewritten
+		// into a value the same generator could have produced instead. One
+		// pass per alphabet character rather than one per secret: the verdict
+		// is the same and the artifact is only redacted four more times.
+		for _, c := range []byte{'+', '/', '-', '_'} {
+			text := string(artifact.bytes)
+			twinned := make([]string, 0, twins)
+
+			for _, secret := range secretValues {
+				if len(secret) < twinnable {
+					continue
+				}
+
+				twin := twinAlphabet(secret, c)
+				text = strings.ReplaceAll(text, secret, twin)
+				twinned = append(twinned, twin)
+			}
+
+			redacted := redact(text)
+
+			for _, twin := range twinned {
+				if run := survivingRun(redacted, twin); run != "" {
+					t.Errorf("redact() left %d of the %d characters of a %q-alphabet secret in %s\n"+
+						"  reason: which alphabet a generated secret lands in is chance; a redactor that "+
+						"covers only one of them leaks whenever the draw goes the other way", len(run), len(twin), string(c), artifact.name)
+				}
+			}
+		}
+
+		if strings.Contains(asIs, "-----BEGIN") {
 			t.Errorf("redact() left a PEM block in %s", artifact.name)
 		}
 	}
