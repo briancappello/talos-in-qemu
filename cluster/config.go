@@ -46,6 +46,16 @@ type ConfigInput struct {
 	// DataDiskSerial is the serial of the PVC disk. Empty means there is no
 	// data disk, and then no user volume is emitted at all.
 	DataDiskSerial string
+	// DisableKexec asks the node not to kexec when it reboots, via
+	// kernel.kexec_load_disabled. It exists for ONE host platform — QEMU on
+	// macOS, where the kexec path dies in the guest on arm64 — and the caller
+	// decides, because whether the host is affected is a fact about the host
+	// and this package does not know one from another.
+	//
+	// It is a bool rather than a GOOS because the config layer has no business
+	// mapping operating systems to workarounds; up.go holds the platform and
+	// makes that call.
+	DisableKexec bool
 }
 
 // Generated holds the three artifacts bring-up needs. All three contain
@@ -186,6 +196,26 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 		// cannot parse.
 		if c.MachineConfig.MachineInstall.InstallGrubUseUKICmdline != nil {
 			c.MachineConfig.MachineInstall.InstallGrubUseUKICmdline = new(false)
+		}
+
+		// KEXEC IS DISABLED THROUGH A SYSCTL, and the sysctl is what makes this
+		// work at all. Talos applies machine-config sysctls IN MAINTENANCE MODE,
+		// so this lands on the ISO's running kernel before the install and
+		// therefore before the reboot it needs to change. machined then reports
+		// kexec support disabled via sysctl and reboots through firmware.
+		//
+		// Nothing else reaches that kernel: extraKernelArgs configures the
+		// INSTALLED system, which in a failed kexec never boots, and the ISO's
+		// own cmdline comes from its GRUB config. This is also exactly what
+		// upstream's `talosctl cluster create` does.
+		//
+		// The value is the string "1" because sysctls is map[string]string.
+		if in.DisableKexec {
+			if c.MachineConfig.MachineSysctls == nil {
+				c.MachineConfig.MachineSysctls = map[string]string{}
+			}
+
+			c.MachineConfig.MachineSysctls["kernel.kexec_load_disabled"] = "1"
 		}
 
 		return nil

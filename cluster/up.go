@@ -263,6 +263,23 @@ func Up(ctx context.Context, opts UpOptions) error {
 	p.step("maintenance", "reachable after %s", took(started))
 
 	// ── 6/10 config ─────────────────────────────────────────────────────────
+	//
+	// KEXEC IS DISABLED ON macOS/arm64 ONLY. Talos kexecs straight into the
+	// kernel it just installed, skipping a firmware boot. Under QEMU on macOS
+	// that path dies in the guest on arm64 and the node never boots what it
+	// installed; elsewhere it works, and it is FASTER, so disabling it more
+	// widely would be a tax paid for another platform's bug.
+	//
+	// BOTH halves are load-bearing. The bug is arm64's — upstream gates its own
+	// workaround on the target ARCHITECTURE (`TargetArch == "arm64"` in
+	// talosctl, `GOARCH == "arm64"` in machined) — so an Intel Mac has nothing
+	// to work around and should keep the firmware boot it saves.
+	//
+	// host.OS and host.ImageArch rather than runtime.GOOS/GOARCH: the platform
+	// is already resolved and injected, and this is the decision that most
+	// needs to be provable on a host other than the one running the tests.
+	disableKexec := host.OS == "darwin" && host.ImageArch == "arm64"
+
 	generated, err := hooks.generateConfig(ConfigInput{
 		ClusterName:      opts.ClusterName,
 		Endpoint:         opts.KubeEndpoint,
@@ -270,6 +287,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 		ConsoleArg:       host.ConsoleArg,
 		SystemDiskSerial: opts.SystemDiskSerial,
 		DataDiskSerial:   opts.DataDiskSerial,
+		DisableKexec:     disableKexec,
 	})
 	if err != nil {
 		return fail(err)
@@ -299,6 +317,14 @@ func Up(ctx context.Context, opts UpOptions) error {
 	p.detail("extraKernelArgs: %s (this host's serial)", host.ConsoleArg)
 	p.detail("  the installed system writes its own cmdline and inherits nothing from the")
 	p.detail("  ISO, so serial goes dead at exactly the boot you need to watch")
+
+	if disableKexec {
+		p.detail("sysctls: kernel.kexec_load_disabled=1 (%s/%s host)", host.OS, host.ImageArch)
+		p.detail("  Talos kexecs into the kernel it just installed instead of rebooting through")
+		p.detail("  firmware. Under QEMU on macOS that path dies in the guest on arm64 and the")
+		p.detail("  node never boots what it installed. Applied in MAINTENANCE mode, so it")
+		p.detail("  reaches the ISO's running kernel before the reboot it has to change.")
+	}
 
 	if opts.DataDiskSerial != "" {
 		p.detail("userVolume: %s on serial %s", userVolumeName, opts.DataDiskSerial)

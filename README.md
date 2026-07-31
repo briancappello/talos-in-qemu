@@ -334,6 +334,22 @@ even on a perfectly healthy node. Silent serial is not a dead VM — check the
 Talos API, not the log. (This is exactly what the `extraKernelArgs` patch fixes
 for the *installed* system, which is a different boot.)
 
+And one on **macOS/arm64**, which `-up` handles and a hand-rolled config does
+not: add
+
+```yaml
+machine:
+  sysctls:
+    kernel.kexec_load_disabled: "1"
+```
+
+Talos otherwise kexecs into the kernel it just installed instead of rebooting
+through firmware, and under QEMU on macOS that path dies in the guest — the node
+installs itself and then never boots what it installed, about six times in ten.
+Applied in maintenance mode the sysctl reaches the ISO's running kernel before
+the reboot it has to change. Same thing upstream's `talosctl cluster create`
+does; see [docs/kexec-on-arm64-macos.md](docs/kexec-on-arm64-macos.md).
+
 ### If you plan to run workloads
 
 Talos is not kind, and three defaults differ. `-up` decides all three

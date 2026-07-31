@@ -784,3 +784,50 @@ type metalMode struct{}
 func (metalMode) String() string        { return "metal" }
 func (metalMode) RequiresInstall() bool { return true }
 func (metalMode) InContainer() bool     { return false }
+
+// ── the arm64 kexec workaround ──────────────────────────────────────────────
+//
+// Talos kexecs into the installed kernel instead of rebooting through firmware.
+// Under QEMU on macOS that path dies in the guest, so `-up` asks the node to
+// skip it. The sysctl is what upstream's own `talosctl cluster create` sets, and
+// it lands on the ISO's RUNNING kernel because Talos applies machine-config
+// sysctls in maintenance mode — before the install, and therefore before the
+// reboot it has to change. See docs/kexec-on-arm64-macos.md.
+
+// kexecSysctl matches the sysctl inside the machine's sysctls map. The pairing
+// matters: `kernel.kexec_load_disabled` under some other key proves nothing.
+var kexecSysctl = regexp.MustCompile(`(?m)^ {4}sysctls:\n(?: {8}\S+: .*\n)* {8}kernel\.kexec_load_disabled: (\S+)`)
+
+func TestGenerateConfigDisablesKexecWhenAsked(t *testing.T) {
+	in := testInput()
+	in.DisableKexec = true
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	m := kexecSysctl.FindStringSubmatch(doc)
+	if m == nil {
+		t.Fatalf("no kernel.kexec_load_disabled sysctl\n"+
+			"  reason: without it Talos kexecs on reboot, and under QEMU on macOS the guest dies\n"+
+			"  there — the node never boots what it just installed\n%s", redact(doc))
+	}
+
+	// Talos wants the STRING "1"; a bare 1 is an int in YAML and the sysctls
+	// map is map[string]string, so an unquoted value does not decode.
+	if m[1] != `"1"` {
+		t.Errorf("kernel.kexec_load_disabled = %s, want %q\n"+
+			"  reason: sysctls is map[string]string — an unquoted 1 is an int and fails to decode", m[1], `"1"`)
+	}
+}
+
+// Kexec is a FEATURE where it works: it skips a whole firmware boot. Linux/KVM
+// is unaffected by the bug, so disabling it there would be a permanent tax paid
+// for someone else's platform.
+func TestGenerateConfigLeavesKexecAloneByDefault(t *testing.T) {
+	doc := v1alpha1Doc(t, mustGenerateDefault(t).ControlPlane)
+
+	if strings.Contains(doc, "kexec_load_disabled") {
+		t.Errorf("kexec was disabled without being asked\n"+
+			"  reason: kexec works on Linux/KVM and saves a firmware boot; the workaround is\n"+
+			"  for the hosts that need it, not for everyone\n%s", redact(doc))
+	}
+}

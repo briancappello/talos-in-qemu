@@ -977,3 +977,79 @@ func TestUpKeepsTheVersionGuardsExplanation(t *testing.T) {
 
 	wants(t, err.Error(), "v1.99.0", GeneratorVersion())
 }
+
+// ── the kexec workaround is macOS/arm64-ONLY ────────────────────────────────
+//
+// Two host facts gate it, and each one is asserted on a platform the test binary
+// is not running on. That is the whole reason OS and ImageArch are resolved onto
+// Platform instead of read from runtime: a workaround for someone else's host
+// has to be provable from this one.
+
+// hostPlatform returns the fixture platform with OS and guest arch overridden,
+// so each case below states the host it is about instead of inheriting it.
+func hostPlatform(os, arch string) func() (*platform.Platform, error) {
+	return func() (*platform.Platform, error) {
+		p := fakePlatform()
+		p.OS = os
+		p.ImageArch = arch
+
+		return p, nil
+	}
+}
+
+// The fixture's platform says linux, so this asserts the Linux behaviour while
+// running on a Mac — which is the only way this assertion means anything.
+func TestUpLeavesKexecAloneOnLinux(t *testing.T) {
+	f := newFixture(t)
+	f.opts.Detect = hostPlatform("linux", "arm64")
+
+	transcript := f.mustRun(t)
+
+	if f.rec.input.DisableKexec {
+		t.Error("kexec was disabled on a linux host\n" +
+			"  reason: kexec works under KVM and skips a firmware boot; disabling it there is a\n" +
+			"  tax paid for a macOS bug")
+	}
+
+	if strings.Contains(transcript, "kexec_load_disabled") {
+		t.Errorf("transcript announces the workaround on linux\n%s", redact(transcript))
+	}
+}
+
+// An INTEL Mac has nothing to work around: the guest bug is arm64's, and
+// upstream gates its own workaround on the architecture too. Disabling kexec
+// here would cost a firmware boot for a bug that is not present.
+func TestUpLeavesKexecAloneOnAnIntelMac(t *testing.T) {
+	f := newFixture(t)
+	f.opts.Detect = hostPlatform("darwin", "amd64")
+
+	transcript := f.mustRun(t)
+
+	if f.rec.input.DisableKexec {
+		t.Error("kexec was disabled on darwin/amd64\n" +
+			"  reason: the kexec bug is arm64's — upstream gates on TargetArch == arm64. An\n" +
+			"  Intel Mac pays a firmware boot for nothing")
+	}
+
+	if strings.Contains(transcript, "kexec_load_disabled") {
+		t.Errorf("transcript announces the workaround on darwin/amd64\n%s", redact(transcript))
+	}
+}
+
+// On macOS/arm64 the sysctl must be requested, and the transcript must say so: a
+// bring-up that silently changed the node's reboot behaviour is one nobody can
+// account for later.
+func TestUpDisablesKexecOnAppleSilicon(t *testing.T) {
+	f := newFixture(t)
+	f.opts.Detect = hostPlatform("darwin", "arm64")
+
+	transcript := f.mustRun(t)
+
+	if !f.rec.input.DisableKexec {
+		t.Error("kexec was left enabled on darwin/arm64\n" +
+			"  reason: Talos kexecs into the installed kernel, and under QEMU on macOS that\n" +
+			"  path dies in the guest — the node never boots what it just installed")
+	}
+
+	wants(t, transcript, "kexec_load_disabled=1", "darwin/arm64 host", "MAINTENANCE")
+}
