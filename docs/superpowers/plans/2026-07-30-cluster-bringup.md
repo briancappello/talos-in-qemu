@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Go 1.26. Module `github.com/coglative/talos-in-qemu`.
-- **Exactly one new dependency:** `github.com/siderolabs/talos/pkg/machinery v1.13.7`. Nothing else. (`go.sum` 45 → 84 modules is expected and accepted.)
+- **One new dependency by intent:** `github.com/siderolabs/talos/pkg/machinery v1.13.7`. It landed as **four** new direct requires — machinery, `k8s.io/api`, `go.yaml.in/yaml/v4` (promoted by `go mod tidy`), and `github.com/cosi-project/runtime`, which is direct ONLY because `cluster/client_test.go` imports `pkg/safe` and is a transitive machinery dependency regardless. Measured: `go.sum` **45 → 123** distinct modules, **154** in the build list — about three times the 84 first estimated here.
 - **No build tags.** Must vet clean for `darwin/arm64` and `linux/amd64` (use `go vet`, not `go build` — `go build` skips tests).
 - `driverkit/` must NOT be modified.
 - **`-apply` and `-destroy` behaviour must not change.** Omitting `spec.dataDisk` must produce byte-identical QEMU args to today, except the system disk gaining a serial.

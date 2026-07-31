@@ -80,7 +80,9 @@ Measured, not assumed:
 
 | | Link `pkg/machinery` | Shell out to `talosctl` |
 |---|---|---|
-| `go.sum` modules | **45 → 84** | unchanged |
+| `go.sum` modules | **45 → 123** | unchanged |
+| Build list (`go list -m all`) | **154** | unchanged |
+| New direct requires | **4** | none |
 | External install | none | user must install, and can change it underneath us |
 | Version location | pinned in `go.mod` | ambient on `PATH` |
 
@@ -96,6 +98,16 @@ against a compile-time constant instead of a subprocess parse against a moving
 target.
 
 Pin machinery to **v1.13.7**, matching the ISO verified to boot.
+
+The 45 → 123 figure was measured after the fact and corrects an earlier
+estimate of 84 in this document; the real cost is roughly three times what was
+first written down, and "Measured, not assumed" is only worth anything if the
+measurement is the one that shipped. The four new direct requires are
+`siderolabs/talos/pkg/machinery`, `k8s.io/api`, `go.yaml.in/yaml/v4` (promoted
+by `go mod tidy`) and `cosi-project/runtime` — the last is a direct require
+ONLY because `cluster/client_test.go` imports `pkg/safe`; it is a transitive
+dependency of machinery either way, so removing that test import would move it
+back to indirect and change nothing else.
 
 ## The version guard (mandatory, and the reason is a silent failure)
 
@@ -306,8 +318,11 @@ sandbox. Three defaults differ from `kind` and each is decided deliberately:
   should be corrected when docs are next touched.
 - **PVC data does not survive `-destroy`.** Correct for a laptop cluster, and
   stated at bring-up rather than discovered.
-- **`+36 modules` in `go.sum`.** Real cost, accepted for the version-guard
-  benefit. Worth flagging in the upstream PR description.
+- **`+78 modules` in `go.sum`** (45 → 123 distinct modules; 154 in the build
+  list; 4 new direct requires, one of which — `cosi-project/runtime` — is
+  direct only via a test import). Real cost, accepted for the version-guard
+  benefit, and roughly three times the `+36` this document originally
+  estimated. Worth flagging in the upstream PR description.
 - **Bring-up is not resumable mid-flight in v1.** A failure part-way leaves a
   VM and a state dir; recovery is `-destroy` and retry. Resumability is
   deliberately deferred until the step boundaries have proven stable.
