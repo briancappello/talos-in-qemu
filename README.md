@@ -11,8 +11,8 @@ tinq -up examples/bootstrap-machine.yaml
 Boots a [Talos Linux](https://www.talos.dev) control-plane VM on the host's
 native hypervisor via QEMU — KVM on Linux, Hypervisor.framework on macOS — and
 drives it all the way to a single-node Kubernetes cluster with a working
-StorageClass. Measured on Linux/KVM: **~3.5 minutes** cold to a `Ready` node
-with storage, of which ~20 seconds is boot to the Talos API.
+StorageClass. Measured on Linux/KVM over two runs: **3.5–4 minutes** cold to a
+`Ready` node with storage, of which ~20 seconds is boot to the Talos API.
 
 No `talosctl`, no `kubectl`, no `helm`, no container runtime. `-apply` still
 exists and still stops at a booted VM in maintenance mode, with the Talos API
@@ -209,7 +209,7 @@ knowing more about Talos than when you started — not that you trust a spinner:
 [ 1/10] platform      linux/amd64, kvm, qemu-system-x86_64
 [ 2/10] image         talos-v1.13.7-amd64.iso -> v1.13.7 (ISO volume id)
 [ 3/10] version guard machinery v1.13.7 >= image v1.13.7  ok
-[ 4/10] boot          pid 959587, api 127.0.0.1:50000
+[ 4/10] boot          pid 1003824, api 127.0.0.1:50000
 [ 5/10] maintenance   reachable after 18s
 [ 6/10] config        wrote controlplane.yaml, talosconfig, secrets.yaml
                         diskSelector: serial talos-system
@@ -223,20 +223,26 @@ knowing more about Talos than when you started — not that you trust a spinner:
                           ISO, so serial goes dead at exactly the boot you need to watch
                         userVolume: local-path-provisioner on serial talos-data
                           PVCs get their own disk, so a runaway one cannot wedge etcd on EPHEMERAL
-[ 7/10] apply-config  installing... rebooting... api back after 38s
+[ 7/10] apply-config  installing... rebooting... api back after 46s
 [ 8/10] bootstrap     etcd bootstrapped
                         fired while the node is 'booting', NOT 'running' — waiting for 'running'
                         deadlocks: a control-plane node cannot reach running until etcd exists,
                         and bootstrap is the call that creates etcd
-[ 9/10] kubeconfig    wrote kubeconfig, node Ready after 2m24s
+[ 9/10] kubeconfig    wrote kubeconfig, node Ready after 2m40s
+I0731 00:10:30.890359 1003799 warnings.go:107] "Warning: would violate PodSecurity \"restricted:latest\": allowPrivilegeEscalation != false (container \"local-path-provisioner\" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container \"local-path-provisioner\" must set securityContext.capabilities.drop=[\"ALL\"]), runAsNonRoot != true (pod or container \"local-path-provisioner\" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container \"local-path-provisioner\" must set securityContext.seccompProfile.type to \"RuntimeDefault\" or \"Localhost\")"
+                        ^ client-go relaying the API server's PodSecurity warning. It reads
+                          like a failure and is not — see Status. Left in: this is the real,
+                          unedited output.
 [10/10] storage       local-path-provisioner v0.0.31, default StorageClass
                         root /var/mnt/local-path-provisioner
                           Talos's root filesystem is read-only, so upstream's /opt path cannot work
                         namespace local-path-storage labelled privileged
 ```
 
-Measured on Linux/KVM (4 vCPU, 6 GiB, v1.13.7): **~3.5 minutes** cold to a
-`Ready` node with a bound PVC. Measured earlier on an M5 Max, by hand:
+Measured on Linux/KVM (4 vCPU, 6 GiB, v1.13.7) over two runs: **3.5–4 minutes**
+cold to a `Ready` node with a bound PVC — the announced waits above sum to
+3m44s, and an earlier run of the same machine came in at 3m20s (38s install,
+2m24s to `Ready`). Measured earlier on an M5 Max, by hand:
 maintenance ~5s, install ~25s, Talos API ~20s after reboot, node registered
 ~70s, `Ready` ~30s later — roughly 3 minutes.
 
@@ -456,20 +462,26 @@ Working and exercised:
   `/dev/vdc1 … xfs … /data`. Talos confirms the OS installed to the disk with
   serial `talos-system` and the user volume `u-local-path-provisioner` on
   `talos-data`. `-destroy` left `~/.hvf/` holding only `images`, no
-  `qemu-system` process and both ports free. ~3.5 minutes cold.
+  `qemu-system` process and both ports free. 3.5–4 minutes cold over two runs.
+  The second run is the transcript shown above, verbatim; it also bound a PVC
+  through the pinned `busybox:1.38.0` helper pod, which wrote and read a file
+  on it.
 
 Not done yet — stated plainly rather than implied:
 
 - **`-up` is bootstrap only, and not resumable.** It creates a cluster; it
   never upgrades, scales or reconciles one, and a failure part way through is
   recovered with `-destroy` and a retry rather than by re-running `-up`.
-- **Two stderr lines interleave with the transcript.** The `extraKernelArgs`
-  hint `create()` logs lands between steps 3 and 4, where step 6 says the same
-  thing better; and client-go relays the API server's `restricted:latest`
-  PodSecurity *warning* during step 10, which reads like a failure and is not —
-  the namespace is labelled `privileged` and the object is admitted. The
-  transcript above is the ten steps, with those two lines omitted. Cosmetic, and
-  worth fixing precisely because the transcript is the feature.
+- **One stderr line still interleaves with the transcript.** client-go relays
+  the API server's `restricted:latest` PodSecurity *warning* during step 10,
+  which reads like a failure and is not — the namespace is labelled
+  `privileged` and the object is admitted. **The transcript above is a real,
+  unedited `-up` run**: that line is shown where it actually appears, with a
+  two-line annotation under it and nothing removed. (The `extraKernelArgs` hint
+  used to interleave too; it now belongs to `-apply`, which is the only caller
+  that needs it, so it no longer prints during a bring-up.) Suppressing the
+  client-go warning means installing a custom `WarningHandler`, which would
+  also swallow warnings worth seeing; left visible for now.
 - **TCP-only host forwards.** `hostForwards` emits `hostfwd=tcp:` only, so a
   UDP service (QUIC, WebTransport, DNS) has no path from the host. Multi-protocol
   forwards are a small change and not yet made.
