@@ -3,7 +3,7 @@
 # It is an ordinary TalosMachine — the same kind the controller reconciles, the
 # same schema, the same driver. The only difference is HOW it is delivered:
 #
-#   provider-hvf -apply bootstrap-machine.yaml
+#   tinq -up bootstrap-machine.yaml
 #
 # reads it from disk instead of from an API server, because at this point there
 # is no API server. Once this node is bootstrapped it BECOMES the control plane,
@@ -29,26 +29,24 @@ spec:
   role: talos-cp
   # Resolved under -image-root (~/.hvf/images) when not absolute. The name must
   # match what the README's curl wrote. THE ARCH MUST MATCH THE HOST — TinQ does
-  # not emulate a foreign one; on an arm64 host substitute talos-v1.9.5-arm64.iso.
-  image: talos-v1.9.5-amd64.iso
+  # not emulate a foreign one; on an arm64 host substitute talos-v1.13.7-arm64.iso.
+  image: talos-v1.13.7-amd64.iso
   cpu: 4
   memory: 6Gi
+  # The OS disk. -up installs onto it by SERIAL (talos-system), never by size:
+  # with the data disk below present, `size: '> 10GB'` matches both, and losing
+  # that coin flip installs the OS over your PVCs.
   disk: 20Gi
-  # A SECOND disk for PVCs, deliberately left commented out here.
+  # A SECOND disk for PVCs, serial talos-data.
   #
-  # Uncomment it and the VM gains a second virtio disk with serial talos-data,
-  # which is what a StorageClass is provisioned onto. It is NOT set by default
-  # because the manual sequence in the README still selects the install target
-  # with `size: '> 10GB'`, and two large disks turn that into a coin flip
-  # between the OS target and your PVCs. Select by serial and the ambiguity is
-  # gone:
+  # It is what `-up` puts a Talos user volume on and provisions a StorageClass
+  # into — one field decides both halves, so they cannot disagree. Remove it and
+  # `-up` announces the skip: no user volume, no StorageClass, and a PVC with no
+  # storageClassName stays Pending.
   #
-  #   # in your Talos machine config (not here):
-  #   install:
-  #     diskSelector:
-  #       serial: talos-system
-  #
-  # dataDisk: 40Gi
+  # MIND THE UNIT. `dataDisk: 40` is not a size, decodes as a number and reads
+  # as unset. `dataDisk: 40Gi` is.
+  dataDisk: 40Gi
   hostForwards:
     - hostPort: 50000
       guestPort: 50000

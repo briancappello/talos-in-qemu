@@ -481,12 +481,13 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		//
 		// THE SERIAL IS AN IDENTITY, AND THAT IS THE WHOLE POINT. `serial=`
 		// surfaces in the guest as /sys/block/<dev>/serial, which is what
-		// Talos's InstallDiskSelector.Serial reads. The alternative — matching
-		// on size, which the README hands out as `size: '> 10GB'` — only
-		// works while exactly one disk is large. Add a data disk and it
-		// becomes a coin flip between the OS install target and the user's
-		// data: the same failure the /dev/vdX warning above is about, arriving
-		// through a different door.
+		// Talos's InstallDiskSelector.Serial reads, and it is what the README
+		// now hands out. The alternative it used to hand out — matching on
+		// size, `size: '> 10GB'` — only works while exactly one disk is large.
+		// Add a data disk and it becomes a coin flip between the OS install
+		// target and the user's data: measured on a live node, that selector
+		// matches BOTH this disk and the dataDisk below. Same failure the
+		// /dev/vdX warning above is about, arriving through a different door.
 		"-drive", "if=none,id=sys,format=qcow2,file=" + diskPath,
 		"-device", "virtio-blk-pci,drive=sys,serial=" + DiskSerialSystem + ",bootindex=0",
 		"-drive", "if=none,id=cd,media=cdrom,file=" + image,
