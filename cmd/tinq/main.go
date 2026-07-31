@@ -515,6 +515,21 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		"-device", "virtio-blk-pci,drive=cd,bootindex=1",
 		"-netdev", netdev,
 		"-device", "virtio-net-pci,netdev=n0",
+		// ENTROPY, and it decides whether the bring-up works at all. Talos's
+		// /sbin/init blocks until the kernel CRNG is seeded, and a QEMU guest
+		// with no rng device has almost nothing to seed it with: no host IRQ
+		// jitter worth counting, no hardware source, and an idle VM generates
+		// none of its own. Measured on darwin/arm64, `random: crng init done`
+		// arrived 35s, 207s, and NEVER (>300s, twice) across five identical
+		// boots — so `[5/10] maintenance` failed 3 times in 5 against a
+		// five-minute budget, with the guest console frozen at
+		// "executing /sbin/init" and nothing to say why.
+		//
+		// virtio-rng-pci hands the guest the host's /dev/urandom and the wait
+		// becomes single-digit seconds. It is the standard fix, and the failure
+		// it removes reads like a hang anywhere else — the API never opens, so
+		// there is no node to ask.
+		"-device", "virtio-rng-pci",
 		"-display", "none",
 		"-serial", "file:" + filepath.Join(dir, "serial.log"),
 		"-pidfile", filepath.Join(dir, "qemu.pid"),

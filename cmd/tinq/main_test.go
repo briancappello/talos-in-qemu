@@ -400,6 +400,10 @@ func TestCreateQEMUArgs(t *testing.T) {
 				"-device", "virtio-blk-pci,drive=cd,bootindex=1",
 				"-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:50000-:50000",
 				"-device", "virtio-net-pci,netdev=n0",
+				// Without this the guest can sit at "executing /sbin/init"
+				// past the maintenance budget waiting on the CRNG. Asserted
+				// because it is invisible until a bring-up fails as a hang.
+				"-device", "virtio-rng-pci",
 				"-display", "none",
 				"-serial", "file:" + filepath.Join(dir, "serial.log"),
 				"-pidfile", filepath.Join(dir, "qemu.pid"),

@@ -334,6 +334,37 @@ even on a perfectly healthy node. Silent serial is not a dead VM — check the
 Talos API, not the log. (This is exactly what the `extraKernelArgs` patch fixes
 for the *installed* system, which is a different boot.)
 
+And the COUNTER-CASE to that one, because the rule above misfires on it. A console
+that stops at
+
+```
+[talos] [initramfs] executing /sbin/init
+```
+
+with an API that never opens either is the guest waiting for **entropy**. Talos's
+`/sbin/init` blocks until the kernel CRNG is seeded, and a QEMU guest with no rng
+device has almost nothing to seed it with: no hardware source, no host IRQ jitter
+worth counting, and an idle VM generates none of its own. Measured on
+darwin/arm64 over five identical boots, `random: crng init done` arrived at 35s,
+at 207s, and **never** (>300s) twice — so `[5/10] maintenance` failed **three
+times in five** against a five-minute budget, with nothing in the console to say
+why. The cure is one device:
+
+```
+-device virtio-rng-pci
+```
+
+which hands the guest the host's `/dev/urandom`. With it, `crng init done` lands
+at `t=0.000000` and maintenance is reachable in **18–20s** every time, against
+39s / ~210s / never / never / never without it. Whole bring-ups went from 284s
+and 480s (the two that finished at all) to 192–258s across four. TinQ passes the
+device, so this is only yours to add if you are driving qemu directly rather than
+through `tinq -apply`.
+
+So the two mute-console cases are told apart by the API, not by the log: mute
+console with a live API is the x86_64 cmdline above; mute console with a dead API,
+frozen at `/sbin/init`, is entropy.
+
 And one on **macOS/arm64**, which `-up` handles and a hand-rolled config does
 not: add
 
@@ -468,6 +499,20 @@ Working and exercised:
   kernel 6.12.18-talos arm64, containerd 2.0.3, node `Ready`, with Crossplane
   and a real workload serving HTTP on it. ~3 minutes cold. This predates `-up`
   and predates the platform abstraction; it is history, not a branch result.
+
+- **`-up`, end to end, on macOS/arm64.** Nine bring-ups on an Apple-silicon Mac
+  (macOS 26.6, QEMU 11.0.2, HVF) with a v1.13.7 arm64 ISO, `cpu: 4` and
+  `dataDisk: 40Gi`: node `Ready`, Kubernetes v1.36.2 on Talos v1.13.7, kernel
+  6.18.39-talos arm64, containerd 2.2.6, `local-path` the default StorageClass,
+  all pods `Running`, `-destroy` leaving only `images` and no `qemu-system`
+  process. **Two guest-side facts were checked rather than inferred**, because
+  the transcript cannot show either: `kernel.kexec_load_disabled` reads `1` from
+  `/proc/sys` inside the *installed* system, and `kexec_core: Starting new
+  kernel` appears **zero** times against two `Linux version` banners — the
+  firmware-reboot signature, at the `cpu: 4` that used to wedge six times in ten.
+  The last four runs are 4/4 at 192–258s; the five before them include the three
+  entropy failures described under "Doing it by hand", which is what
+  `virtio-rng-pci` fixed. Reliability beyond 4/4 is not claimed.
 
 - **`-up`, end to end, on Linux/KVM.** Verified on real hardware with a
   v1.13.7 amd64 ISO and `dataDisk: 40Gi`: node `talos-jzb-cu0` `Ready`,
