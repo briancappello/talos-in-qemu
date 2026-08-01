@@ -101,6 +101,13 @@ spec:
                       # gives tcp only, which leaves a QUIC/WebTransport service
                       # with no path from the host — and the TCP half still
                       # works, so it presents as a cert rejection.
+                      # Bind address for the forward. Loopback by default (macOS
+                      # Local Network Privacy exempts it, and nothing is exposed).
+                      # Set 0.0.0.0 to reach it from ANOTHER DEVICE — a phone on
+                      # the same Wi-Fi cannot see 127.0.0.1 at all.
+                      hostAddr:
+                        type: string
+                        default: "127.0.0.1"
                       protocol:
                         type: string
                         enum: [tcp, udp, both]

@@ -301,14 +301,26 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		// `both` is the common case for an HTTP/3 endpoint (h2 on TCP and H3 on
 		// UDP at the same port), so it is spelled once here rather than forcing
 		// two entries that must be kept in step.
+		// BIND ADDRESS is per-forward and defaults to loopback.
+		//
+		// Loopback is the safe default: on macOS it is what Local Network
+		// Privacy exempts, so a browser on the same machine reaches it without a
+		// permission prompt, and nothing is exposed to the network.
+		//
+		// But loopback is unreachable from ANOTHER DEVICE. A phone, a tablet, a
+		// second laptop on the same Wi-Fi cannot see it at all — which is the
+		// difference between "runs on my machine" and "runs in a demo". Set
+		// hostAddr to 0.0.0.0 (or a specific interface address) to publish it.
+		// That is a deliberate, per-port exposure decision, not a global switch.
+		addr := str(h["hostAddr"], "127.0.0.1")
 		switch strings.ToLower(str(h["protocol"], "tcp")) {
 		case "udp":
-			netdev += fmt.Sprintf(",hostfwd=udp:127.0.0.1:%d-:%d", hp, gp)
+			netdev += fmt.Sprintf(",hostfwd=udp:%s:%d-:%d", addr, hp, gp)
 		case "both", "tcp+udp":
-			netdev += fmt.Sprintf(",hostfwd=tcp:127.0.0.1:%d-:%d", hp, gp)
-			netdev += fmt.Sprintf(",hostfwd=udp:127.0.0.1:%d-:%d", hp, gp)
+			netdev += fmt.Sprintf(",hostfwd=tcp:%s:%d-:%d", addr, hp, gp)
+			netdev += fmt.Sprintf(",hostfwd=udp:%s:%d-:%d", addr, hp, gp)
 		default:
-			netdev += fmt.Sprintf(",hostfwd=tcp:127.0.0.1:%d-:%d", hp, gp)
+			netdev += fmt.Sprintf(",hostfwd=tcp:%s:%d-:%d", addr, hp, gp)
 		}
 	}
 
