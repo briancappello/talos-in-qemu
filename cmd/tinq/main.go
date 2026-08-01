@@ -1,15 +1,25 @@
-// provider-hvf — reconciles TalosMachine into a QEMU/HVF virtual machine.
+// tinq — reconciles TalosMachine into a QEMU virtual machine.
 //
-// It runs HOST-RESIDENT, not as a pod: HVF is a macOS kernel API with no
-// network endpoint, so a controller inside the cluster cannot reach it. That is
-// the same shape Sidero's own omni-infra-provider-libvirt uses (a binary beside
-// the hypervisor, talking to the control plane over the API). The provisioning
-// layer is unaffected — it sees a resource, not a hypervisor.
+// It runs HOST-RESIDENT, not as a pod, because a hardware accelerator is a
+// KERNEL API on the machine the VM runs on with no network endpoint: HVF on
+// macOS, /dev/kvm on Linux. A controller inside the cluster cannot reach either.
+// That is the same shape Sidero's own omni-infra-provider-libvirt uses (a binary
+// beside the hypervisor, talking to the control plane over the API). The
+// provisioning layer is unaffected — it sees a resource, not a hypervisor.
+//
+// Which binary, machine type, accelerator and firmware this host needs is
+// resolved at RUNTIME by the platform package, not by build tags — see its
+// package comment for why.
 //
 // The GC contract lives in driverkit and is identical for every substrate. What
 // is HERE is only what qemu decides for itself: its SCC (process + disk + pflash
 // + state dir are ONE unit), where the site tag lives (a path component), and
 // how a neutral profile name resolves to a local artifact.
+//
+// The `hvf` type and the ~/.hvf state root keep their names from when this was
+// macOS-only. They are load-bearing — the state path and the
+// machine.hvf.fleet.io API group are what installed machines already use — so
+// renaming them is a migration, not a rename.
 //
 // tier: compute uses QEMU user-mode networking, which requires NO ROOT. Root is
 // a vmnet requirement, so it arrives with tier fabric-sim, not before.
@@ -25,10 +35,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/coglative/talos-in-qemu/driverkit"
+	"github.com/coglative/talos-in-qemu/platform"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -40,6 +52,15 @@ type hvf struct {
 	// Where neutral profile names resolve. Provider config, not claim content
 	// (ARCHITECTURE.md D12).
 	imageRoot string
+	// platform.Detect execs `qemu-system-X -accel help` and walks two registry
+	// directories. create() runs on EVERY reconcile tick where Observe reports
+	// absent, so a VM that fails to start would re-run the whole probe forever
+	// and re-write the multi-line accel diagnostic into a status condition each
+	// pass. Host facts do not change while the process runs, so probe once.
+	//
+	// Deliberately NOT hoisted into main(): destroy must keep working on a host
+	// with no usable accelerator. Teardown cannot require a live hypervisor.
+	detect func() (*platform.Platform, error)
 }
 
 func main() {
@@ -54,7 +75,7 @@ func main() {
 	if err := os.MkdirAll(*stateRoot, 0o755); err != nil {
 		log.Fatalf("state root: %v", err)
 	}
-	d := &hvf{stateRoot: *stateRoot, imageRoot: *imageRoot}
+	d := &hvf{stateRoot: *stateRoot, imageRoot: *imageRoot, detect: sync.OnceValues(platform.Detect)}
 
 	// BOOTSTRAP MODE — the chicken-and-egg door.
 	//
@@ -202,6 +223,14 @@ func readPid(dir string) int {
 
 func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	spec, _, _ := unstructured.NestedMap(m.Object, "spec")
+
+	// Resolve host facts BEFORE creating any state. Failing here costs nothing;
+	// failing after the disk exists leaves residue behind.
+	p, err := h.detect()
+	if err != nil {
+		return 0, err
+	}
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return 0, err
 	}
@@ -221,11 +250,22 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	if _, err := os.Stat(image); err != nil {
 		return 0, fmt.Errorf("resolve profile %q under %s: %w", spec["image"], h.imageRoot, err)
 	}
-
-	cpu := int64(2)
-	if v, ok := spec["cpu"].(int64); ok {
-		cpu = v
+	// The symptom is NOT "no bootable media": Talos ISOs carry BOTH BOOTX64.EFI
+	// and BOOTAA64.EFI (the very property that defeats ESP-based detection — see
+	// platform.InspectImageArch), so UEFI does find a bootloader and GRUB is
+	// what fails, visibly, on the serial console. Do not "fix" this message back
+	// to the intuitive version; the wording below was observed, not guessed.
+	// Warn only; detection returning "" must never block a valid image we simply
+	// cannot classify.
+	if got := platform.InspectImageArch(image); got != "" && got != p.ImageArch {
+		log.Printf("warning: image is %s but host is %s\n"+
+			"  the VM starts and UEFI loads a bootloader (Talos ships stubs for\n"+
+			"  both arches), then GRUB stops at \"Failed to boot both default and\n"+
+			"  fallback entries.\" — no kernel runs, so there is no Talos API.\n"+
+			"  this is not a hang — it is the wrong image: %s", got, p.ImageArch, image)
 	}
+
+	cpu := specCPU(spec)
 	mem := toMB(str(spec["memory"], "2Gi"))
 	diskPath := filepath.Join(dir, "system.qcow2")
 	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
@@ -236,13 +276,9 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		}
 	}
 
-	// UEFI vars must be per-machine and writable; a shared copy is how two VMs
-	// end up fighting over boot state.
 	varsPath := filepath.Join(dir, "efivars.fd")
-	if _, err := os.Stat(varsPath); os.IsNotExist(err) {
-		if err := makeEFIVars(varsPath); err != nil {
-			return 0, err
-		}
+	if err := ensureEFIVars(varsPath, p.FirmwareVars); err != nil {
+		return 0, err
 	}
 
 	// user-mode networking: unprivileged by construction. hostfwd is how the
@@ -277,10 +313,10 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	}
 
 	args := []string{
-		"-machine", "virt,accel=hvf", "-cpu", "host",
-		"-smp", strconv.FormatInt(cpu, 10),
+		"-machine", p.Machine + ",accel=" + p.Accel, "-cpu", p.CPU,
+		"-smp", strconv.Itoa(cpu),
 		"-m", strconv.Itoa(mem),
-		"-drive", "if=pflash,format=raw,readonly=on,file=" + edk2Code(),
+		"-drive", "if=pflash,format=raw,readonly=on,file=" + p.FirmwareCode,
 		"-drive", "if=pflash,format=raw,file=" + varsPath,
 		// BOOT ORDER IS THE WHOLE INSTALL LIFECYCLE, and it has to be explicit.
 		//
@@ -316,7 +352,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		"-daemonize",
 	}
 
-	cmd := exec.Command("qemu-system-aarch64", args...)
+	cmd := exec.Command(p.QEMUBinary, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return 0, fmt.Errorf("qemu: %v: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -324,6 +360,11 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("pidfile: %w", err)
 	}
+	// The installed system writes its OWN kernel cmdline and does not inherit
+	// the ISO's console, so the config patch has to name it — and the name is
+	// architecture-specific (ttyS0 vs ttyAMA0). The README used to make the
+	// reader work that out; we already resolved it, so say it.
+	log.Printf("for the install config patch on this host: extraKernelArgs: [%s]", p.ConsoleArg)
 	return strconv.Atoi(strings.TrimSpace(string(b)))
 }
 
@@ -353,28 +394,47 @@ func destroy(dir string) error {
 
 func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
-func edk2Code() string {
-	for _, p := range []string{
-		"/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
-		"/usr/local/share/qemu/edk2-aarch64-code.fd",
-	} {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
-}
-
-// EDK2 expects a 64MiB flash volume; the shipped vars template is smaller.
-func makeEFIVars(path string) error {
-	src := strings.Replace(edk2Code(), "code.fd", "vars.fd", 1)
-	b, err := os.ReadFile(src)
+// ensureEFIVars makes path a per-machine, writable copy of the firmware's own
+// nvram template, VERBATIM. UEFI vars must be per-machine: a shared copy is how
+// two VMs end up fighting over boot state.
+//
+// Verbatim, because the previous version padded to 64 MiB — correct on aarch64
+// only by coincidence, since edk2's aarch64 vars template genuinely is 67108864
+// bytes. The x86_64 template is 540672 bytes, and padding it makes QEMU refuse
+// to start:
+//
+//	combined size of system firmware exceeds 8388608 bytes
+//
+// SIZE — not mere absence — IS THE REGENERATION TRIGGER. Any state dir the
+// padding version touched still holds that poisoned file, and an absence-only
+// check would preserve it forever: re-running would keep failing on exactly the
+// bug this replaces.
+//
+// The heal is NOT universal, and the x86_64 case is the only one that needs it.
+// On aarch64 the template is itself 67108864 bytes, so a file the padding
+// version wrote MATCHES the template size and is left alone here. That is
+// benign: the 8 MiB combined-firmware limit is an x86_64 limit, and a blank
+// 64 MiB varstore is what edk2 reformats in-guest on first boot anyway.
+//
+// It is deliberately NOT regenerated unconditionally. The guest writes its own
+// UEFI boot entries here, and discarding them on every re-create would lose real
+// state. A size that disagrees with the template is the signal that the file did
+// not come from this template and cannot be trusted; a size that agrees is left
+// strictly alone.
+func ensureEFIVars(path, template string) error {
+	tmplSt, err := os.Stat(template)
 	if err != nil {
-		b = []byte{}
+		// Unreachable in practice: Detect resolves FirmwareVars by statting it.
+		return fmt.Errorf("stat nvram template %s: %w", template, err)
 	}
-	buf := make([]byte, 64*1024*1024)
-	copy(buf, b)
-	return os.WriteFile(path, buf, 0o644)
+	if st, err := os.Stat(path); err == nil && st.Size() == tmplSt.Size() {
+		return nil
+	}
+	b, err := os.ReadFile(template)
+	if err != nil {
+		return fmt.Errorf("read nvram template %s: %w", template, err)
+	}
+	return os.WriteFile(path, b, 0o644)
 }
 
 // ── tiny helpers ────────────────────────────────────────────────────────────
@@ -384,6 +444,22 @@ func str(v interface{}, def string) string {
 		return s
 	}
 	return def
+}
+
+// specCPU resolves spec.cpu, defaulting to 2.
+//
+// sigs.k8s.io/yaml routes through JSON, so a bootstrap file yields float64 here
+// and NEVER int64 — a bare .(int64) assertion silently dropped every
+// user-specified cpu count back to the default. toInt takes both, which is also
+// what the API server (int64) path needs.
+//
+// It lives out here so the resolution is testable through the real YAML decoder
+// without dragging argv construction along.
+func specCPU(spec map[string]interface{}) int {
+	if v := toInt(spec["cpu"]); v > 0 {
+		return v
+	}
+	return 2
 }
 
 func toInt(v interface{}) int {
@@ -413,13 +489,7 @@ func toMB(s string) int {
 	return v * mult
 }
 
-func nested(m *unstructured.Unstructured, f ...string) int64 {
-	v, _, _ := unstructured.NestedInt64(m.Object, f...)
-	return v
-}
-
 func nestedSlice(m *unstructured.Unstructured, f ...string) []interface{} {
 	v, _, _ := unstructured.NestedSlice(m.Object, f...)
 	return v
 }
-

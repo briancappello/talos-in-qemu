@@ -27,8 +27,10 @@ spec:
   # property as a gcp label or an aws tag.
   site: clvc-local
   role: talos-cp
-  # Resolved under -image-root (~/.hvf/images) when not absolute.
-  image: talos-v1.9.5.iso   # matches the README; resolved under -image-root
+  # Resolved under -image-root (~/.hvf/images) when not absolute. The name must
+  # match what the README's curl wrote. THE ARCH MUST MATCH THE HOST — TinQ does
+  # not emulate a foreign one; on an arm64 host substitute talos-v1.9.5-arm64.iso.
+  image: talos-v1.9.5-amd64.iso
   cpu: 4
   memory: 6Gi
   disk: 20Gi

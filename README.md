@@ -1,15 +1,17 @@
 # Talos in QEMU (TinQ)
 
-Kubernetes nodes on macOS as **real VMs running the real production OS**, driven
-by a Kubernetes custom resource. No Docker. No root. No nested virtualization.
+Kubernetes nodes as **real VMs running the real production OS**, driven by a
+Kubernetes custom resource. No Docker. No root. No nested virtualization.
+Linux/KVM and macOS/Hypervisor.framework, on x86_64 and arm64.
 
 ```
 tinq -apply examples/bootstrap-machine.yaml
 ```
 
-Boots a [Talos Linux](https://www.talos.dev) control-plane VM on
-Hypervisor.framework via QEMU, with the Talos API forwarded to `127.0.0.1:50000`.
-Cold boot to "machine is reachable" measured at **~10 seconds** on an M5 Max.
+Boots a [Talos Linux](https://www.talos.dev) control-plane VM on the host's
+native hypervisor via QEMU — KVM on Linux, Hypervisor.framework on macOS — with
+the Talos API forwarded to `127.0.0.1:50000`. Cold boot to "machine is
+reachable" measured at **~10 seconds** on an M5 Max.
 
 ## Why this exists
 
@@ -36,21 +38,68 @@ probably the right tool. TinQ is for when the *node* is part of the test.
 
 ## Install
 
-Requires macOS on Apple silicon.
+Linux (KVM) or macOS (Hypervisor.framework). TinQ resolves the QEMU binary,
+machine type, accelerator and UEFI firmware at runtime from the host it is
+running on — nothing is hardcoded to one architecture.
+
+**Linux** — needs QEMU, a working `/dev/kvm`, and your distro's edk2/OVMF
+firmware package:
 
 ```sh
-brew install qemu siderolabs/talos/talosctl
-go install github.com/coglative/talos-in-qemu/cmd/tinq@latest
+# Arch
+sudo pacman -S qemu-full edk2-ovmf
+# Debian/Ubuntu
+sudo apt install qemu-system-x86 ovmf
+# Fedora
+sudo dnf install qemu-system-x86 edk2-ovmf
 ```
 
-Then fetch a Talos **ISO** and drop it where TinQ resolves profile names
-(default `~/.hvf/images`):
+`/dev/kvm` must be readable *and writable by your user*. On distros that gate it
+behind a group, add yourself and re-login:
+
+```sh
+ls -l /dev/kvm                  # want crw-rw---- root kvm, or crw-rw-rw-
+sudo usermod -aG kvm "$USER"    # then log out and back in
+```
+
+If `/dev/kvm` is missing or unwritable, TinQ fails loudly rather than silently
+falling back to TCG — a Talos VM under emulation is slow enough to look hung.
+
+**macOS** — Hypervisor.framework needs no privileges, only QEMU:
+
+```sh
+brew install qemu
+```
+
+Then, on either platform:
+
+```sh
+go install github.com/coglative/talos-in-qemu/cmd/tinq@latest
+# talosctl, for the cluster sequence below
+brew install siderolabs/talos/talosctl        # macOS
+# Linux: see https://www.talos.dev/latest/talos-guides/install/talosctl/
+```
+
+Finally fetch a Talos **ISO matching your host's architecture** and drop it where
+TinQ resolves profile names (default `~/.hvf/images`). x86_64 hosts want
+`metal-amd64.iso`; arm64 hosts (Apple silicon, arm64 Linux) want
+`metal-arm64.iso`:
 
 ```sh
 mkdir -p ~/.hvf/images
-curl -Lo ~/.hvf/images/talos-v1.9.5.iso \
+# x86_64 host
+curl -Lo ~/.hvf/images/talos-v1.9.5-amd64.iso \
+  https://github.com/siderolabs/talos/releases/download/v1.9.5/metal-amd64.iso
+# arm64 host
+curl -Lo ~/.hvf/images/talos-v1.9.5-arm64.iso \
   https://github.com/siderolabs/talos/releases/download/v1.9.5/metal-arm64.iso
 ```
+
+The arch has to match the host: TinQ does not emulate a foreign one. Point it at
+the wrong ISO and it warns before booting, because the failure mode otherwise
+looks like a hang — GRUB comes up (the Talos ISOs ship both `bootx64.efi` and
+`bootaa64.efi`), fails to load a kernel it cannot execute, and you get no console
+and no API.
 
 Note the version — you will pin the installer to it below, and that pin is not
 optional.
@@ -67,7 +116,9 @@ metadata:
 spec:
   site: clvc-local          # a path component in the state dir — see "Cleanup"
   role: talos-cp
-  image: talos-v1.9.5.iso   # resolved under -image-root when not absolute
+  # resolved under -image-root when not absolute; on an arm64 host substitute
+  # talos-v1.9.5-arm64.iso — the ISO arch must match the host
+  image: talos-v1.9.5-amd64.iso
   cpu: 4
   memory: 6Gi
   disk: 20Gi
@@ -124,10 +175,15 @@ machine:
     # /sbin/init with no console output.
     image: ghcr.io/siderolabs/installer:v1.9.5
     # The installed system writes its OWN kernel cmdline and does NOT inherit
-    # the ISO's console=ttyAMA0, so it goes silent on serial at exactly the
-    # moment you need to watch it boot.
+    # the ISO's console, so it goes silent on serial at exactly the moment you
+    # need to watch it boot.
+    # THE CONSOLE NAME IS ARCHITECTURE-SPECIFIC: ttyAMA0 is the arm64 PL011
+    # (Apple silicon, arm64 Linux); on x86_64 the serial port is ttyS0. Use the
+    # wrong one and you get a booting-but-mute node. No need to guess — `tinq
+    # -apply` prints the correct value for THIS host right after it creates the
+    # VM; copy that line.
     extraKernelArgs:
-      - console=ttyAMA0
+      - console=ttyAMA0     # arm64;  x86_64: console=ttyS0
 YAML
 
 talosctl gen config mycluster https://127.0.0.1:6443 \
@@ -154,6 +210,10 @@ Two probes that look right and are not: a TCP connect to a forwarded port
 succeeds even when nothing listens in the guest (qemu accepts on the host), and
 `talosctl version` always prints the *client's* tag. Use `talosctl get
 machinestatus` for liveness.
+
+A third, on x86_64: the `metal-amd64.iso` boots with `console=tty0` only, so
+`serial.log` stops after GRUB's `Booting 'Talos ISO'` even on a perfectly healthy
+node. Silent serial is not a dead VM — check the Talos API, not the log.
 
 ### If you plan to run workloads
 
@@ -219,7 +279,8 @@ Working and exercised:
 
 - `-apply` / `-destroy`, including re-apply (`Observe` reports present, so it
   will not start a second QEMU against the same state directory)
-- Talos boots on HVF; cold boot to reachable ~10s; Talos API via `hostForwards`
+- Talos boots on HVF (macOS/arm64) and on KVM (Linux/amd64, `q35` + `-cpu host`
+  + distro OVMF); cold boot to reachable ~10s; Talos API via `hostForwards`
 - Controller mode against a cluster with the CRD installed
 - `Destroy` sweeps process + state directory
 
@@ -243,9 +304,18 @@ Not done yet — stated plainly rather than implied:
   links, so no multi-node cluster and no simulated switch fabric. The QEMU
   backends needed (`socket`/`hubport`) are unprivileged, so this is a modeling
   gap in the resource, not a platform limit.
-- **Apple silicon only.** `qemu-system-aarch64` with `accel=hvf` is hardcoded.
-- **No tests.** The QEMU invocation is verified by running it, which is not the
-  same thing.
+- **macOS is not re-verified on this branch.** The runtime platform resolution
+  replaced the hardcoded Apple-silicon path, and Linux/amd64 is verified end to
+  end on real hardware (KVM, `q35`, `-cpu host`, distro OVMF, Talos booted to
+  maintenance mode). The macOS/HVF branch is covered by unit tests but has not
+  been run on an actual Mac since the change. Treat it as expected-to-work, not
+  proven.
+- **Partial test coverage.** The `platform` package has unit tests — arch
+  mapping, accelerator selection, firmware-registry scanning and image-arch
+  detection from the kernel's PE header, verified by mutation rather than by
+  assertion alone — plus integration tests against the real firmware registry
+  and real Talos ISOs when present. The QEMU invocation itself is still verified
+  by running it, which is not the same thing.
 
 ## License
 

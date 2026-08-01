@@ -1,0 +1,142 @@
+package platform
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+// kvmDiag distinguishes the three ways hardware acceleration is unavailable.
+// They need different fixes, so they get different messages.
+type kvmDiag int
+
+const (
+	kvmOK kvmDiag = iota
+	kvmMissing
+	kvmNoPerm
+)
+
+func accelFor(goos string) (string, error) {
+	switch goos {
+	case "linux":
+		return "kvm", nil
+	case "darwin":
+		// Verified on darwin/arm64 (macOS 26.6, Homebrew qemu 11.0.2): `-accel
+		// help` lists hvf, and -machine virt,accel=hvf -cpu host boots.
+		return "hvf", nil
+	}
+	return "", fmt.Errorf("unsupported host OS %q: TinQ supports linux (KVM) and darwin (HVF)", goos)
+}
+
+// diagnoseKVM reports whether /dev/kvm is usable, and if not, why. Opening
+// read-write is the real test: the device can exist and still be unusable.
+//
+// The underlying error is returned alongside the diagnosis because kvmNoPerm
+// covers every errno that is not ENOENT -- EBUSY (another hypervisor holds the
+// device) looks identical to EACCES from here, and only the raw error can tell
+// the user which one they are actually in. It is nil for kvmOK and non-nil for
+// both failure cases, kvmMissing included.
+func diagnoseKVM(path string) (kvmDiag, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err == nil {
+		f.Close()
+		return kvmOK, nil
+	}
+	if os.IsNotExist(err) {
+		return kvmMissing, err
+	}
+	return kvmNoPerm, err
+}
+
+// parseAccels reads `qemu-system-X -accel help`, which prints a header line
+// followed by one accelerator per line.
+func parseAccels(out string) []string {
+	var accels []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasSuffix(line, ":") {
+			continue
+		}
+		accels = append(accels, line)
+	}
+	return accels
+}
+
+// accelHelpTimeout bounds the `-accel help` probe. The query is a few
+// microseconds of work; anything near this is a wedged binary, not a slow one.
+const accelHelpTimeout = 5 * time.Second
+
+// compiledAccels asks the binary what it was BUILT with. That is a different
+// question from whether the accelerator is usable right now, and the two
+// failures deserve different messages.
+func compiledAccels(qemuBinary string) ([]string, error) {
+	return compiledAccelsWithin(qemuBinary, accelHelpTimeout)
+}
+
+// compiledAccelsWithin takes the timeout as a parameter so a test can prove the
+// deadline fires without waiting for the real one.
+//
+// The probe is bounded because an unbounded one turns a wedged qemu into a
+// hanging tinq, and a silent hang is the failure mode this whole package exists
+// to avoid — it is exactly what we refuse TCG to prevent.
+func compiledAccelsWithin(qemuBinary string, timeout time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, qemuBinary, "-accel", "help")
+	// Killing the process is not enough on its own: a grandchild that inherited
+	// the output pipe keeps CombinedOutput blocked, which is the hang we are
+	// trying to bound. WaitDelay gives up on the pipe shortly after the kill.
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// The deadline is only consulted on failure: a command that completed
+		// just as the context expired succeeded, and reporting that as a
+		// timeout would be a lie.
+		if ctx.Err() == context.DeadlineExceeded {
+			// The raw error here is "signal: killed", which reads like a crash.
+			return nil, fmt.Errorf("%s -accel help: timed out after %s (the binary is not responding)", qemuBinary, timeout)
+		}
+		return nil, fmt.Errorf("%s -accel help: %w", qemuBinary, err)
+	}
+	return parseAccels(string(out)), nil
+}
+
+// accelUnavailable explains why no accelerator is usable. diagErr is the raw
+// error from diagnoseKVM; it is quoted verbatim so the message never asserts a
+// cause the errno does not support.
+func accelUnavailable(goos, goarch, accel string, compiled bool, diag kvmDiag, diagErr error) error {
+	var reason, fix string
+	switch {
+	case !compiled:
+		reason = fmt.Sprintf("this QEMU build does not include %s (it was not built with it)", accel)
+		fix = "install a QEMU package built with " + accel + " support"
+	case goos == "linux" && diag == kvmMissing:
+		reason = "/dev/kvm does not exist"
+		fix = "load the kvm module (modprobe kvm_intel or kvm_amd), or enable\n" +
+			"       virtualization in firmware; in a VM, enable nested virtualization"
+	case goos == "linux" && diag == kvmNoPerm:
+		reason = fmt.Sprintf("/dev/kvm exists but could not be opened by uid %d: %v", os.Getuid(), diagErr)
+		fix = "if this is a permission error: sudo usermod -aG kvm $USER\n" +
+			"       (then log out and back in); if another hypervisor holds\n" +
+			"       /dev/kvm, stop it first"
+	default:
+		// The HVF path. Deliberately vague: there is no HVF analogue of
+		// diagnoseKVM -- HVF exposes no device node to probe -- so this branch
+		// cannot say which of the HVF failure modes the user is in, and
+		// guessing one would send them after the wrong fix.
+		reason = accel + " is not available"
+		fix = "ensure hardware virtualization is enabled on this host"
+	}
+	return fmt.Errorf(`no hardware accelerator available on %s/%s
+
+  %s
+  fix: %s
+
+TinQ requires KVM (Linux) or HVF (macOS). Talos under TCG emulation is
+slow enough to be indistinguishable from a hang, so falling back to it
+would turn "this host cannot do that" into "TinQ is broken"`,
+		goos, goarch, reason, fix)
+}
