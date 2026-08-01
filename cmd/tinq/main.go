@@ -39,6 +39,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coglative/talos-in-qemu/cluster"
 	"github.com/coglative/talos-in-qemu/driverkit"
 	"github.com/coglative/talos-in-qemu/platform"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -70,6 +71,7 @@ func main() {
 	interval := flag.Duration("interval", 5*time.Second, "reconcile interval")
 	apply := flag.String("apply", "", "BOOTSTRAP: reconcile ONE TalosMachine read from this YAML file, with no control plane, then exit")
 	destroyF := flag.String("destroy", "", "BOOTSTRAP: destroy the TalosMachine described by this YAML file, then exit")
+	up := flag.String("up", "", "BOOTSTRAP: -apply, then bring the machine up to a single-node Kubernetes cluster, then exit")
 	flag.Parse()
 
 	if err := os.MkdirAll(*stateRoot, 0o755); err != nil {
@@ -95,10 +97,18 @@ func main() {
 	// Once the first node is up and bootstrapped it becomes the management
 	// cluster, and this same binary runs against it in controller mode for
 	// every machine after.
-	if *apply != "" || *destroyF != "" {
+	//
+	// -up is -apply plus the cluster. It is the SAME create() and the same
+	// state layout — the VM half is byte-for-byte what -apply builds — with
+	// cluster.Up driving the Talos side afterwards. -apply stays VM-only, and
+	// -destroy stays working with no hypervisor and no reachable node.
+	if *apply != "" || *destroyF != "" || *up != "" {
 		path, verb := *apply, "apply"
-		if *destroyF != "" {
+		switch {
+		case *destroyF != "":
 			path, verb = *destroyF, "destroy"
+		case *up != "":
+			path, verb = *up, "up"
 		}
 		if err := standalone(context.Background(), d, path, verb); err != nil {
 			log.Fatalf("%s %s: %v", verb, path, err)
@@ -153,6 +163,8 @@ func standalone(ctx context.Context, d *hvf, path, verb string) error {
 			return nil
 		}
 		return d.Destroy(ctx, m)
+	case "up":
+		return bringUp(ctx, d, m, exists, status)
 	default:
 		if exists {
 			log.Printf("already running: %v", status)
@@ -168,6 +180,111 @@ func standalone(ctx context.Context, d *hvf, path, verb string) error {
 		log.Printf("created: %v", status)
 		return nil
 	}
+}
+
+// The two guest ports a bring-up talks to. They are Talos's, not ours: apid
+// serves on 50000 and kube-apiserver on 6443, so these are the guest sides that
+// spec.hostForwards has to map onto the host.
+const (
+	talosAPIGuestPort = 50000
+	kubeAPIGuestPort  = 6443
+)
+
+// hostForward reports the HOST port forwarded to guestPort, or 0 when the
+// machine forwards nothing there.
+//
+// Everything reachable from the host goes through a qemu user-mode forward, so
+// a missing entry is not a slow path — it is an address that will never answer.
+// cluster.Up refuses an empty endpoint up front rather than spending a wait's
+// whole budget discovering that.
+func hostForward(m *unstructured.Unstructured, guestPort int) int {
+	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
+		h, _ := hf.(map[string]interface{})
+		if toInt(h["guestPort"]) == guestPort {
+			return toInt(h["hostPort"])
+		}
+	}
+	return 0
+}
+
+// talosEndpoint is the host side of the Talos API forward, host:port, or "".
+func talosEndpoint(m *unstructured.Unstructured) string {
+	if p := hostForward(m, talosAPIGuestPort); p > 0 {
+		return fmt.Sprintf("127.0.0.1:%d", p)
+	}
+	return ""
+}
+
+// kubeEndpoint is the host side of the Kubernetes API forward, as a URL, or "".
+//
+// It is written into the generated config as the control-plane endpoint AND
+// into the kubeconfig, so it has to be the address the HOST can reach — the
+// guest's own is unroutable from here without a bridge.
+func kubeEndpoint(m *unstructured.Unstructured) string {
+	if p := hostForward(m, kubeAPIGuestPort); p > 0 {
+		return fmt.Sprintf("https://127.0.0.1:%d", p)
+	}
+	return ""
+}
+
+// bringUp is the -up verb: create (or adopt) the VM, then hand everything after
+// that to cluster.Up, which owns all ten steps and every line of output.
+func bringUp(ctx context.Context, d *hvf, m *unstructured.Unstructured, exists bool,
+	status map[string]interface{}) error {
+	opts, err := upOptions(d, m, exists, status)
+	if err != nil {
+		return err
+	}
+	return cluster.Up(ctx, opts)
+}
+
+// upOptions translates a TalosMachine into what cluster.Up needs.
+//
+// It is separate from bringUp so it can be ASSERTED without a hypervisor. Every
+// field below is a value that would compile just as happily wrong — the state
+// dir, the two endpoints, the two disk serials, the resolved image — and each
+// one is only visibly wrong minutes into a bring-up, on a node that is by then
+// half installed.
+//
+// The VM half is create(), unchanged and unbranched: -up must not become a
+// second way to build a machine. What is HERE is only the translation, and
+// package main is the only place that can do it — the serials, the qemu
+// forwards and the profile resolution are all its.
+func upOptions(d *hvf, m *unstructured.Unstructured, exists bool,
+	status map[string]interface{}) (cluster.UpOptions, error) {
+	spec, _, _ := unstructured.NestedMap(m.Object, "spec")
+
+	image, err := d.resolveImage(spec)
+	if err != nil {
+		return cluster.UpOptions{}, err
+	}
+
+	// The MACHINE's state dir, never the state root: the artifacts carry the
+	// identity they belong to, which is the property that makes -destroy sweep
+	// them. Written one level up they would outlive the cluster whose keys
+	// they are, and the residue check would not find them.
+	dir := d.dir(m)
+
+	return cluster.UpOptions{
+		ClusterName:      m.GetName(),
+		ImagePath:        image,
+		StateDir:         dir,
+		TalosEndpoint:    talosEndpoint(m),
+		KubeEndpoint:     kubeEndpoint(m),
+		SystemDiskSerial: DiskSerialSystem,
+		DataDiskSerial:   dataDiskSerial(spec),
+		Detect:           d.detect,
+		Boot: func() (int, error) {
+			// The same already-exists rule -apply applies, and it is what
+			// makes `-apply` then `-up` work: a VM already sitting in
+			// maintenance mode is ADOPTED, not duplicated. Starting a second
+			// qemu against one state dir would corrupt the disk it shares.
+			if exists {
+				return toInt(status["pid"]), nil
+			}
+			return d.create(m, dir)
+		},
+	}, nil
 }
 
 // dir keys state by SITE then UID. The site is IN THE PATH on purpose: artifacts
@@ -188,21 +305,42 @@ func (h *hvf) Observe(ctx context.Context, m *unstructured.Unstructured) (bool, 
 	if pid <= 0 || !processAlive(pid) {
 		return false, nil, nil
 	}
-	api := ""
-	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
-		hh, _ := hf.(map[string]interface{})
-		if toInt(hh["guestPort"]) == 50000 {
-			api = fmt.Sprintf("127.0.0.1:%d", toInt(hh["hostPort"]))
-		}
-	}
+	// talosEndpoint, not a second hand-rolled scan of hostForwards: status's
+	// apiEndpoint and the endpoint -up hands cluster.Up are two answers to one
+	// question, and nothing but this shared call keeps them equal. The
+	// hand-rolled loop also reported "127.0.0.1:0" for an entry with a
+	// guestPort and no hostPort — an address, printed as status, that cannot
+	// answer.
 	return true, map[string]interface{}{
-		"pid": int64(pid), "stateDir": dir, "apiEndpoint": api,
+		"pid": int64(pid), "stateDir": dir, "apiEndpoint": talosEndpoint(m),
 	}, nil
 }
 
 func (h *hvf) Create(ctx context.Context, m *unstructured.Unstructured) error {
-	_, err := h.create(m, h.dir(m))
-	return err
+	if _, err := h.create(m, h.dir(m)); err != nil {
+		return err
+	}
+
+	// The installed system writes its OWN kernel cmdline and does not inherit
+	// the ISO's console, so the config patch has to name it — and the name is
+	// architecture-specific (ttyS0 vs ttyAMA0). The README used to make the
+	// reader work that out; we already resolved it, so say it.
+	//
+	// SCOPED TO Create, not create(). -up calls create() directly, and this
+	// line went to stderr between steps 3 and 4 of a transcript that IS the
+	// feature — where step 6 already says the same thing, better and in the
+	// right place. -apply and the controller stop at a booted VM in
+	// maintenance mode and leave the operator to write that patch by hand, so
+	// they are the only callers that still need the hint.
+	//
+	// detect is memoized (sync.OnceValues), so create() has already paid for
+	// this and it cannot fail here after succeeding there — the guard exists
+	// so a future create() that stops probing does not nil-deref.
+	if p, err := h.detect(); err == nil {
+		log.Printf("for the install config patch on this host: extraKernelArgs: [%s]", p.ConsoleArg)
+	}
+
+	return nil
 }
 
 // Destroy takes the WHOLE SCC: the process (which sweeps everything inside the
@@ -221,6 +359,31 @@ func readPid(dir string) int {
 	return pid
 }
 
+// resolveImage turns spec.image into a path to a local artifact.
+//
+// The claim carries a NEUTRAL PROFILE NAME (talos-nocloud.img), not a path.
+// Resolving it to a local artifact is substrate-local configuration and belongs
+// to the provider — same argument as GCP's project. An absolute path in the
+// claim would be a leak: it cannot travel to GCP or AWS, where the same profile
+// resolves to an image URI or an AMI.
+//
+// It is a function of its own because -up needs the SAME answer create() uses:
+// the ISO it boots is the ISO whose volume id pins the installer, and two
+// resolutions of one profile name are two answers waiting to disagree.
+func (h *hvf) resolveImage(spec map[string]interface{}) (string, error) {
+	image, _ := spec["image"].(string)
+	if image == "" {
+		return "", fmt.Errorf("spec.image is required")
+	}
+	if !filepath.IsAbs(image) {
+		image = filepath.Join(h.imageRoot, image)
+	}
+	if _, err := os.Stat(image); err != nil {
+		return "", fmt.Errorf("resolve profile %q under %s: %w", spec["image"], h.imageRoot, err)
+	}
+	return image, nil
+}
+
 func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	spec, _, _ := unstructured.NestedMap(m.Object, "spec")
 
@@ -235,20 +398,9 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		return 0, err
 	}
 
-	image, _ := spec["image"].(string)
-	if image == "" {
-		return 0, fmt.Errorf("spec.image is required")
-	}
-	// The claim carries a NEUTRAL PROFILE NAME (talos-nocloud.img), not a path.
-	// Resolving it to a local artifact is substrate-local configuration and
-	// belongs to the provider — same argument as GCP's project. An absolute path
-	// in the claim would be a leak: it cannot travel to GCP or AWS, where the
-	// same profile resolves to an image URI or an AMI.
-	if !filepath.IsAbs(image) {
-		image = filepath.Join(h.imageRoot, image)
-	}
-	if _, err := os.Stat(image); err != nil {
-		return 0, fmt.Errorf("resolve profile %q under %s: %w", spec["image"], h.imageRoot, err)
+	image, err := h.resolveImage(spec)
+	if err != nil {
+		return 0, err
 	}
 	// The symptom is NOT "no bootable media": Talos ISOs carry BOTH BOOTX64.EFI
 	// and BOOTAA64.EFI (the very property that defeats ESP-based detection — see
@@ -268,11 +420,18 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	cpu := specCPU(spec)
 	mem := toMB(str(spec["memory"], "2Gi"))
 	diskPath := filepath.Join(dir, "system.qcow2")
-	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
-		size := strings.TrimSuffix(str(spec["disk"], "16Gi"), "i")
-		out, err := exec.Command("qemu-img", "create", "-f", "qcow2", diskPath, size).CombinedOutput()
-		if err != nil {
-			return 0, fmt.Errorf("qemu-img: %v: %s", err, out)
+	if err := ensureQcow2(diskPath, str(spec["disk"], "16Gi")); err != nil {
+		return 0, err
+	}
+	// The OPTIONAL second disk, for PVCs. It is created here beside the system
+	// disk but WIRED IN BELOW as an append, never woven into the arg literal:
+	// a machine with no dataDisk has to emit precisely the argv it emitted
+	// before this field existed.
+	dataPath := ""
+	if size := specDataDisk(spec); size != "" {
+		dataPath = filepath.Join(dir, "data.qcow2")
+		if err := ensureQcow2(dataPath, size); err != nil {
+			return 0, err
 		}
 	}
 
@@ -350,18 +509,56 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		// Explicit `-device` for BOTH (rather than the `if=virtio` shorthand) is
 		// required to carry bootindex, and it also pins guest enumeration: the
 		// system disk is vda and the ISO is vdb. Do not depend on that order for
-		// the install target anyway — select by size (see README); qemu arg order
-		// deciding a device name is not a contract worth resting on.
+		// the install target anyway — select by SERIAL; qemu arg order deciding
+		// a device name is not a contract worth resting on.
+		//
+		// THE SERIAL IS AN IDENTITY, AND THAT IS THE WHOLE POINT. `serial=`
+		// surfaces in the guest as /sys/block/<dev>/serial, which is what
+		// Talos's InstallDiskSelector.Serial reads, and it is what the README
+		// now hands out. The alternative it used to hand out — matching on
+		// size, `size: '> 10GB'` — only works while exactly one disk is large.
+		// Add a data disk and it becomes a coin flip between the OS install
+		// target and the user's data: measured on a live node, that selector
+		// matches BOTH this disk and the dataDisk below. Same failure the
+		// /dev/vdX warning above is about, arriving through a different door.
 		"-drive", "if=none,id=sys,format=qcow2,file=" + diskPath,
-		"-device", "virtio-blk-pci,drive=sys,bootindex=0",
+		"-device", "virtio-blk-pci,drive=sys,serial=" + DiskSerialSystem + ",bootindex=0",
 		"-drive", "if=none,id=cd,media=cdrom,file=" + image,
 		"-device", "virtio-blk-pci,drive=cd,bootindex=1",
 		"-netdev", netdev,
 		"-device", "virtio-net-pci,netdev=n0",
+		// ENTROPY, and it decides whether the bring-up works at all. Talos's
+		// /sbin/init blocks until the kernel CRNG is seeded, and a QEMU guest
+		// with no rng device has almost nothing to seed it with: no host IRQ
+		// jitter worth counting, no hardware source, and an idle VM generates
+		// none of its own. Measured on darwin/arm64, `random: crng init done`
+		// arrived 35s, 207s, and NEVER (>300s, twice) across five identical
+		// boots — so `[5/10] maintenance` failed 3 times in 5 against a
+		// five-minute budget, with the guest console frozen at
+		// "executing /sbin/init" and nothing to say why.
+		//
+		// virtio-rng-pci hands the guest the host's /dev/urandom and the wait
+		// becomes single-digit seconds. It is the standard fix, and the failure
+		// it removes reads like a hang anywhere else — the API never opens, so
+		// there is no node to ask.
+		"-device", "virtio-rng-pci",
 		"-display", "none",
 		"-serial", "file:" + filepath.Join(dir, "serial.log"),
 		"-pidfile", filepath.Join(dir, "qemu.pid"),
 		"-daemonize",
+	}
+
+	// APPENDED, not spliced into the literal above, so the no-dataDisk argv is
+	// unchanged down to the position of every element.
+	//
+	// NO bootindex, deliberately. Firmware tries every bootindex it is handed,
+	// and this disk must never be a boot candidate: while the system disk is
+	// still blank the only thing that may follow it is the install ISO. A
+	// bootindex here would insert the PVC disk into that sequence.
+	if dataPath != "" {
+		args = append(args,
+			"-drive", "if=none,id=data,format=qcow2,file="+dataPath,
+			"-device", "virtio-blk-pci,drive=data,serial="+DiskSerialData)
 	}
 
 	cmd := exec.Command(p.QEMUBinary, args...)
@@ -372,12 +569,36 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("pidfile: %w", err)
 	}
-	// The installed system writes its OWN kernel cmdline and does not inherit
-	// the ISO's console, so the config patch has to name it — and the name is
-	// architecture-specific (ttyS0 vs ttyAMA0). The README used to make the
-	// reader work that out; we already resolved it, so say it.
-	log.Printf("for the install config patch on this host: extraKernelArgs: [%s]", p.ConsoleArg)
 	return strconv.Atoi(strings.TrimSpace(string(b)))
+}
+
+// ensureQcow2 creates a sparse qcow2 at path, and does NOTHING if one is
+// already there.
+//
+// Never recreated, never resized: system.qcow2 holds the installed OS and
+// data.qcow2 holds the user's PVCs. create() runs on EVERY reconcile tick where
+// Observe reports absent, so a version of this that rewrote the file would wipe
+// a machine the moment its qemu process died and the controller tried to bring
+// it back — the exact case where the data matters most.
+//
+// The suffix trim is not cosmetic. Kubernetes quantities are Gi/Mi; qemu-img
+// accepts only G/M and rejects the "i" outright with "Invalid image size
+// specified!". Both spellings mean the same power-of-two bytes, so dropping the
+// "i" is exact, not a rounding.
+func ensureQcow2(path, size string) error {
+	// Only ENOENT means "create it". EACCES, ENOTDIR or a symlink loop are
+	// reported: treating them as "already there" skips creation and then
+	// launches QEMU against a file that does not exist.
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	out, err := exec.Command("qemu-img", "create", "-f", "qcow2", path, strings.TrimSuffix(size, "i")).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("qemu-img: %v: %s", err, out)
+	}
+	return nil
 }
 
 // destroy is idempotent — it is called on every delete tick until it succeeds.
@@ -472,6 +693,46 @@ func specCPU(spec map[string]interface{}) int {
 		return v
 	}
 	return 2
+}
+
+// Disk serials are the machine's DISK NAMING CONTRACT, not decoration. QEMU
+// passes `serial=` through to the guest as /sys/block/<dev>/serial, and Talos
+// reads it back through InstallDiskSelector.Serial — so these two strings are
+// what a generated machine config selects on. Changing one renames a disk out
+// from under an already-installed node.
+const (
+	DiskSerialSystem = "talos-system"
+	DiskSerialData   = "talos-data"
+)
+
+// specDataDisk resolves spec.dataDisk, the OPTIONAL second disk for PVCs.
+//
+// "" means no second disk, and that is the default on purpose: a machine
+// without it must be the machine this tool built before the field existed —
+// same qemu args, same devices, same guest.
+//
+// Same YAML-through-JSON caveat as specCPU, which is why it reads through str
+// rather than asserting .(string) at the call site: a non-string value is "not
+// set", never a panic.
+func specDataDisk(spec map[string]interface{}) string {
+	return str(spec["dataDisk"], "")
+}
+
+// dataDiskSerial is the serial cluster.Up selects the PVC volume on, or "" when
+// this machine has no data disk.
+//
+// ONE field decides BOTH halves of storage — the UserVolumeConfig in the
+// generated machine config and the StorageClass installed into the cluster — so
+// they cannot disagree. It reads through specDataDisk, the same resolution
+// create() uses to decide whether to make the disk at all: a `dataDisk: 40`
+// with the unit left off is "not set" in both places, which is what makes the
+// announced skip in step 10 the first visible sign of the typo rather than a
+// Pending PVC an hour later.
+func dataDiskSerial(spec map[string]interface{}) string {
+	if specDataDisk(spec) == "" {
+		return ""
+	}
+	return DiskSerialData
 }
 
 func toInt(v interface{}) int {

@@ -1,1 +1,9 @@
+# the built binary
 /tinq
+
+# Editor/IDE state — local to whoever is working, never shared. A committed
+# .iml or .idea/ pins module paths and SDK names to one machine and conflicts
+# on every merge.
+.idea/
+*.iml
+.vscode/

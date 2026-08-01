@@ -2,9 +2,18 @@
 #
 # Everything Talos-side (secrets, machine config, config-apply, bootstrap,
 # kubeconfig, Image Factory schematics) is crossplane-contrib/provider-talos.
-# This owns only the thing no project anywhere provides: a QEMU/HVF virtual
-# machine on macOS, where there is no network-addressable hypervisor API for an
-# existing provider to talk to.
+# This owns only the thing no project anywhere provides: a QEMU virtual machine
+# on a laptop or workstation — HVF on macOS, KVM on Linux — where there is no
+# network-addressable hypervisor API for an existing provider to talk to.
+#
+# THAT BOUNDARY IS THE CONTROLLER'S, NOT THE CLI'S. It says what a controller
+# reconciling a running cluster must delegate. `tinq -up` implements secrets,
+# machine config, config-apply, bootstrap and kubeconfig anyway, because
+# provider-talos runs INSIDE a Kubernetes cluster and therefore cannot create
+# your first one — it is the same bootstrap escape hatch `-apply` already is.
+# The split is BOOTSTRAP vs STEADY STATE, not tinq vs provider-talos: the
+# `cluster` package creates a cluster once and never upgrades, scales or
+# reconciles one. Anything ongoing is still provider-talos's.
 #
 # GRANULARITY IS DELIBERATE: one resource == one VM == one chargeable thing,
 # matching provider-gcp's Instance and provider-aws's Instance. Talos's own
@@ -72,7 +81,16 @@ spec:
                   description: e.g. 4Gi — passed to qemu -m.
                 disk:
                   type: string
-                  description: e.g. 16Gi — size of the sparse system disk.
+                  description: >-
+                    e.g. 16Gi — size of the sparse system disk. This is the
+                    Talos install target, selected by SERIAL (talos-system).
+                dataDisk:
+                  type: string
+                  description: >-
+                    Optional second disk for PVCs, e.g. 40Gi. Selected by SERIAL
+                    (talos-data), never by size — with two large disks a size
+                    matcher becomes a coin flip between the OS target and this.
+                    Omit for a single-disk machine with no StorageClass.
                 machineConfigSecretRef:
                   type: object
                   description: >-

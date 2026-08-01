@@ -71,6 +71,7 @@ func TestDetectOnThisHost(t *testing.T) {
 	}
 
 	for _, c := range []struct{ field, got, want string }{
+		{"OS", p.OS, runtime.GOOS},
 		{"QEMUBinary", p.QEMUBinary, ai.qemuBinary},
 		{"Machine", p.Machine, ai.machine},
 		{"ConsoleArg", p.ConsoleArg, ai.console},
