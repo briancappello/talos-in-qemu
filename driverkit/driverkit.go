@@ -71,6 +71,26 @@ type Driver interface {
 	// returns status fields to publish. It must not report Running on the
 	// strength of a file: a pidfile is a claim, and this interface exists
 	// because talosctl's cluster show believed one about a long-dead cluster.
+	//
+	// THAT RULE BINDS A DRIVER THAT OWNS ITS RESOURCE'S LIFECYCLE, and is not
+	// relaxed for one: if you started it, you can verify it, and a file
+	// standing in for that verification is the exact bug above.
+	//
+	// A driver may also be handed a resource it did NOT create and cannot
+	// power-cycle — the qemu driver's adopted baremetal machines are the case
+	// in this repo. It then has no process to verify and no cheap truthful
+	// liveness answer, since Observe is host-side, read-only and runs every
+	// tick. Such a driver is expected to report Running and to publish an
+	// address the operator can ask instead. Not because it knows the thing is
+	// up, but because Absent and Stopped are the two answers plan() turns into
+	// a Create against a machine it must never touch, and a driver with no
+	// work to do must converge the loop on doing none.
+	//
+	// THE COST IS BORNE HERE: publish marks Ready=True on state == Running, so
+	// such a resource reads Ready even while physically powered off. That is
+	// the price of not creating hardware, paid in a status field, rather than
+	// in a Create against it. Keep it in view — it is why the exception is
+	// written down instead of left in the driver.
 	Observe(ctx context.Context, m *unstructured.Unstructured) (state State, status map[string]interface{}, err error)
 
 	// Create brings the resource to Running from EITHER Absent or Stopped, so
