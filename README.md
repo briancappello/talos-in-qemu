@@ -307,7 +307,7 @@ knowing more about Talos than when you started — not that you trust a spinner:
 
 ```
 [ 1/10] platform      linux/amd64, kvm, qemu-system-x86_64
-[ 2/10] image         talos-v1.13.7-amd64.iso -> v1.13.7 (ISO volume id)
+[ 2/10] version       talos-v1.13.7-amd64.iso (ISO volume id) -> v1.13.7
 [ 3/10] version guard machinery v1.13.7 >= image v1.13.7  ok
 [ 4/10] boot          pid 1003824, api 127.0.0.1:50000
 [ 5/10] maintenance   reachable after 18s
