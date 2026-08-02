@@ -1316,6 +1316,58 @@ func TestStopHaltsAVerifiedProcessAndKeepsTheDisks(t *testing.T) {
 	}
 }
 
+// The `stop` CLI verb, end to end through standalone.
+//
+// The failure this pins is not "Stop does not work" — that is covered above.
+// It is the DISPATCH: standalone's switch falls through to its apply branch for
+// any verb it does not recognise, so a `stop` that never reaches the "stop"
+// case leaves the VM alive. Verified by mutation: rename the case and this
+// reports "already running", returns nil, and the process below is still ours —
+// a silent no-op that an exit code would never expose.
+//
+// detect is left nil ON PURPOSE. Nothing on this path may probe the host, and a
+// fall-through that got as far as Create would nil-deref here rather than
+// quietly booting a machine someone asked to halt.
+func TestStandaloneStopHaltsAndDoesNotFallThroughToCreate(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir()}
+	// The UID standalone derives for a file with no metadata.uid, so the state
+	// dir below is the one it will look in.
+	m := testMachine(t, "site-a", "bootstrap-default-t")
+	dir := h.dir(m)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(dir, "system.qcow2")
+	if err := os.WriteFile(disk, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pid := startDecoy(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, "qemu.pid"),
+		[]byte(strconv.Itoa(pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "machine.yaml")
+	if err := os.WriteFile(path, []byte(`apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata: {name: t, namespace: default}
+spec:
+  site: site-a
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := standalone(context.Background(), h, path, "stop"); err != nil {
+		t.Fatalf("standalone stop = %v, want nil", err)
+	}
+	if platform.ProcessMatches(pid, dir) {
+		t.Errorf("process %d is still this machine's qemu; stop did not halt it", pid)
+	}
+	if _, err := os.Stat(disk); err != nil {
+		t.Errorf("stop must KEEP the disks — that is what separates it from destroy: %v", err)
+	}
+}
+
 // kill(0, sig) is NOT a no-op: POSIX sends the signal to every process in the
 // CALLER's process group. readPid returns 0 for a pidfile that has vanished —
 // which a concurrent destroy causes, since it removes the whole state dir — so

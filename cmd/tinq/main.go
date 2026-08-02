@@ -149,6 +149,20 @@ func newRootCmd() *cobra.Command {
 		RunE: runVerb("apply"),
 	}
 
+	stop := &cobra.Command{
+		Use:   "stop <machine.yaml>",
+		Short: "Halt the VM but KEEP its disks, then exit",
+		Long: "A shutdown, not a teardown. The installed OS and any PVCs survive, and\n" +
+			"`tinq apply` starts the machine again from the same disks — that\n" +
+			"distinction is the only reason this exists beside `destroy`. Idempotent:\n" +
+			"already stopped, or never created, is success.\n\n" +
+			"Today this is a POWER CUT. QEMU is signalled (SIGTERM, then SIGKILL)\n" +
+			"rather than Talos being asked to power itself off, so the guest never\n" +
+			"learns it is going down and its filesystem is never quiesced.",
+		Args: cobra.ExactArgs(1),
+		RunE: runVerb("stop"),
+	}
+
 	destroy := &cobra.Command{
 		Use:   "destroy <machine.yaml>",
 		Short: "Destroy the VM and its whole state directory, then exit",
@@ -196,7 +210,7 @@ func newRootCmd() *cobra.Command {
 	}
 	controller.Flags().DurationVar(&interval, "interval", 5*time.Second, "reconcile interval")
 
-	root.AddCommand(apply, destroy, up, controller)
+	root.AddCommand(apply, stop, destroy, up, controller)
 	return root
 }
 
@@ -251,6 +265,22 @@ func standalone(ctx context.Context, d *hvf, path, verb string) error {
 			return nil
 		}
 		return d.Destroy(ctx, m)
+	case "stop":
+		// Both early returns exist so a re-run is quiet and cheap rather than
+		// merely harmless: Stop already re-Observes and returns nil for
+		// anything that is not Running, so without these the operator gets no
+		// word on WHY nothing happened — and "nothing to stop" and "already
+		// stopped" are different facts. The first means no disks exist; the
+		// second means they do and survive.
+		if state == driverkit.Absent {
+			log.Printf("nothing to stop: %s", d.dir(m))
+			return nil
+		}
+		if state == driverkit.Stopped {
+			log.Printf("already stopped: %s", d.dir(m))
+			return nil
+		}
+		return d.Stop(ctx, m)
 	case "up":
 		return bringUp(ctx, d, m, state, status)
 	default:
