@@ -343,6 +343,53 @@ func TestGenerateConfigCarriesConsoleArgToTheInstalledSystem(t *testing.T) {
 	}
 }
 
+func TestEmptyConsoleArgEmitsNoKernelArgsAndLeavesUKIAlone(t *testing.T) {
+	in := testInput()
+	in.ConsoleArg = ""
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	if regexp.MustCompile(`(?m)^ {8}extraKernelArgs:`).MatchString(doc) {
+		t.Errorf("install emitted extraKernelArgs with no console arg set\n"+
+			"  reason: real hardware has a firmware-configured console; forcing one "+
+			"derived from the HOST's architecture is how a node boots with a dead "+
+			"console\n%s", redact(doc))
+	}
+
+	// The UKI switch exists ONLY to stop GRUB ignoring extraKernelArgs. With no
+	// extraKernelArgs there is nothing to stop, and flipping it anyway changes a
+	// node's boot path for no reason. Anchored to `: false` because the absent
+	// case and the explicitly-false case are different facts.
+	if regexp.MustCompile(`(?m)^ {8}grubUseUKICmdline: false`).MatchString(doc) {
+		t.Errorf("grubUseUKICmdline was forced false with no console arg to protect\n"+
+			"  reason: its only purpose is that GRUB's UKI cmdline and extraKernelArgs "+
+			"cannot coexist — with no extraKernelArgs there is no conflict\n%s", redact(doc))
+	}
+}
+
+// The QEMU regression: with a console arg set, both halves must behave exactly
+// as they did before this task. This duplicates the existing assertion at
+// config_test.go:331-341 deliberately — that one runs on mustGenerateDefault
+// and would keep passing even if the conditional were wired backwards.
+func TestConsoleArgStillEmittedWhenSet(t *testing.T) {
+	in := testInput()
+	in.ConsoleArg = "console=ttyS0"
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	if !regexp.MustCompile(`(?m)^ {8}extraKernelArgs:\n {12}- console=ttyS0$`).MatchString(doc) {
+		t.Errorf("install has no extraKernelArgs console=ttyS0\n"+
+			"  reason: the installed system writes its own cmdline and inherits nothing "+
+			"from the ISO\n%s", redact(doc))
+	}
+
+	if regexp.MustCompile(`(?m)^ {8}grubUseUKICmdline: true`).MatchString(doc) {
+		t.Errorf("extraKernelArgs is set while GRUB takes its cmdline from the "+
+			"installer's UKI\n  reason: machinery rejects the two together, so this "+
+			"config does not validate in metal mode\n%s", redact(doc))
+	}
+}
+
 // NewInput takes clusterName and endpoint adjacently and both are strings, so
 // a swap compiles and produces a self-consistent — and useless — cluster.
 func TestGenerateConfigNamesTheClusterAndTheEndpointTheRightWayRound(t *testing.T) {

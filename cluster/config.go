@@ -169,16 +169,13 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 		return nil, err
 	}
 
-	input, err := generate.NewInput(in.ClusterName, in.Endpoint, k8sVersion,
+	genOpts := []generate.Option{
 		// Without a contract every version-gated default is generated for the
 		// machinery's own version instead of the image's.
 		generate.WithVersionContract(contract),
 		// Pinned to the IMAGE. Left unset, Talos substitutes the generator's
 		// version and a fresh install silently becomes a cross-version upgrade.
-		generate.WithInstallImage("ghcr.io/siderolabs/installer:"+version),
-		// The installed system writes its own kernel cmdline and inherits
-		// nothing from the ISO, so without this it boots with no serial console.
-		generate.WithInstallExtraKernelArgs([]string{in.ConsoleArg}),
+		generate.WithInstallImage("ghcr.io/siderolabs/installer:" + version),
 		// A topology correction, not a security weakening: with the
 		// control-plane taint in place a single-node cluster schedules nothing.
 		generate.WithAllowSchedulingOnControlPlanes(true),
@@ -187,7 +184,19 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 		// cannot disagree.
 		generate.WithAdditionalSubjectAltNames([]string{in.APIAddress}),
 		generate.WithEndpointList([]string{in.APIAddress}),
-	)
+	}
+
+	// OPTIONAL, and empty is a real answer rather than a missing one. Under
+	// QEMU the console is the only way to watch a boot, and the installed
+	// system inherits nothing from the ISO — so it must be named. On hardware
+	// the firmware has already configured a console and there is usually a
+	// display, so naming one derived from THIS laptop's architecture is not a
+	// default, it is a guess that boots the node with a dead console.
+	if in.ConsoleArg != "" {
+		genOpts = append(genOpts, generate.WithInstallExtraKernelArgs([]string{in.ConsoleArg}))
+	}
+
+	input, err := generate.NewInput(in.ClusterName, in.Endpoint, k8sVersion, genOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("preparing config generation: %w", err)
 	}
@@ -206,16 +215,20 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 			Serial: in.SystemDiskSerial,
 		}
 
-		// A 1.12+ contract turns grubUseUKICmdline ON, which makes GRUB take
-		// its cmdline from the installer's UKI and IGNORE extraKernelArgs —
-		// machinery rejects the two together, so a config carrying a console
-		// arg does not even validate in metal mode. Talos 1.8 dropped
-		// console=ttyS0 from the metal image's own defaults (imager/quirks),
-		// so the arg has to come from here and the UKI cmdline has to yield.
-		// Only touched when machinery set it: the field is unknown to older
-		// Talos, and the contract exists to avoid emitting fields a node
+		// GATED ON A CONSOLE ARG ACTUALLY BEING PASSED. A 1.12+ contract turns
+		// grubUseUKICmdline ON, which makes GRUB take its cmdline from the
+		// installer's UKI and IGNORE extraKernelArgs — machinery rejects the two
+		// together, so a config carrying a console arg does not even validate in
+		// metal mode. Talos 1.8 dropped console=ttyS0 from the metal image's own
+		// defaults (imager/quirks), so the arg has to come from here and the UKI
+		// cmdline has to yield.
+		//
+		// With NO console arg there is no conflict to resolve, and switching a
+		// node's boot path off the UKI cmdline anyway is a change made for
+		// nothing. Only touched when machinery set it: the field is unknown to
+		// older Talos, and the contract exists to avoid emitting fields a node
 		// cannot parse.
-		if c.MachineConfig.MachineInstall.InstallGrubUseUKICmdline != nil {
+		if in.ConsoleArg != "" && c.MachineConfig.MachineInstall.InstallGrubUseUKICmdline != nil {
 			c.MachineConfig.MachineInstall.InstallGrubUseUKICmdline = new(false)
 		}
 
