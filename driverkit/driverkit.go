@@ -177,7 +177,20 @@ func reconcile(ctx context.Context, dc dynamic.Interface, cfg Config, d Driver, 
 		if err := d.Destroy(ctx, m); err != nil {
 			return fmt.Errorf("destroy (deletion BLOCKED, which is correct): %w", err)
 		}
-		log.Printf("%s: destroyed", m.GetName())
+		// CLAIM ONLY WHAT nil PROMISES, which is "the driver has no teardown
+		// work left", not "the resource is gone". Those coincide for a driver
+		// that owns its resource's lifecycle and do not for one that does not:
+		// the qemu driver's Destroy on an adopted machine deliberately removes
+		// nothing and says so on the line above, and "bm0: destroyed" printed
+		// underneath is the operator-facing summary contradicting it.
+		//
+		// Softened here rather than fixed with an outcome value returned from
+		// Destroy: an extra return would change the Driver interface for every
+		// driver to carry one driver's special case, and driverkit must not
+		// learn what "baremetal" means. A driver that did something noteworthy
+		// already has a log line for it; the loop's job is only to say the
+		// finalizer is going, which is the part the loop actually did.
+		log.Printf("%s: teardown reported complete, releasing the finalizer", m.GetName())
 		_, err := ri.Patch(ctx, m.GetName(), "application/merge-patch+json",
 			[]byte(`{"metadata":{"finalizers":[]}}`), metav1.PatchOptions{})
 		return err
