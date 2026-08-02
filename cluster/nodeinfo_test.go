@@ -7,6 +7,59 @@ import (
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 )
 
+func testDisks() []Disk {
+	return []Disk{
+		{ID: "sda", Serial: "S1", Model: "Samsung SSD", Size: "500 GB", Transport: "sata"},
+		{ID: "sdb", Serial: "", Model: "SanDisk Cruzer", Size: "32 GB", Transport: "usb", Readonly: true},
+	}
+}
+
+func TestRequireDiskRefusesAnEmptySerialAndShowsTheTable(t *testing.T) {
+	err := RequireDisk(testDisks(), "", "install target")
+	if err == nil {
+		t.Fatal("RequireDisk accepted an empty serial\n" +
+			"  reason: nothing may install until a human has chosen a disk")
+	}
+
+	for _, want := range []string{"S1", "Samsung SSD", "500 GB", "SanDisk Cruzer", "readonly"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not show %q:\n%s\n"+
+				"  reason: the table IS the remedy — without it there is no way to "+
+				"learn a serial without talosctl", want, err)
+		}
+	}
+}
+
+func TestRequireDiskRefusesAnUnmatchedSerialAsATypo(t *testing.T) {
+	err := RequireDisk(testDisks(), "S9", "install target")
+	if err == nil {
+		t.Fatal("RequireDisk accepted a serial matching no disk\n" +
+			"  reason: this is the realistic failure — a typo installs nowhere, and " +
+			"Talos reports it as a hang")
+	}
+
+	if !strings.Contains(err.Error(), "S9") {
+		t.Errorf("the refusal does not quote the serial that matched nothing: %s", err)
+	}
+}
+
+func TestRequireDiskAcceptsAMatch(t *testing.T) {
+	if err := RequireDisk(testDisks(), "S1", "install target"); err != nil {
+		t.Fatalf("RequireDisk rejected a serial that matches: %s", err)
+	}
+}
+
+// The boot medium is identified by READONLY, not CDROM: client_test.go:929-935
+// records that a Talos ISO presents as a read-only virtio-blk device, and so
+// does the squashfs loop device. A table flagging only cdrom shows the stick
+// you booted from as an ordinary candidate.
+func TestFormatDisksFlagsReadonlyNotJustCDROM(t *testing.T) {
+	out := FormatDisks([]Disk{{ID: "sdb", Serial: "S2", Readonly: true}})
+	if !strings.Contains(out, "readonly") {
+		t.Errorf("readonly is not flagged:\n%s", out)
+	}
+}
+
 func TestNodeVersionRefusesAnEmptyEndpoint(t *testing.T) {
 	_, err := NodeVersion(t.Context(), "")
 	if err == nil {

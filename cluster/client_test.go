@@ -902,22 +902,29 @@ func TestAgainstARealNode(t *testing.T) {
 
 	defer c.Close() //nolint:errcheck
 
-	// The branch's one openly-unverified assumption: config.go selects both the
-	// install target and the user volume by disk.serial, and nothing had ever
-	// read a serial off a real qemu virtio disk.
-	disks, err := safe.StateListAll[*block.Disk](ctx, c.COSI)
+	// Nothing here is generated material, so it is logged unredacted: this is
+	// the evidence. It is gathered through the exported ListDisks so that the
+	// function adopt refuses on is the one hardware exercises.
+	found, err := ListDisks(ctx, endpoint)
 	if err != nil {
-		t.Fatalf("listing disks over COSI: %s", redactErr(err))
+		t.Fatalf("ListDisks: %s", redactErr(err))
 	}
 
-	if disks.Len() == 0 {
+	if len(found) == 0 {
 		t.Fatal("the node reports no disks at all")
 	}
 
-	// Nothing here is generated material, so it is logged unredacted: this is
-	// the evidence.
-	for d := range disks.All() {
-		t.Logf("%s: %+v", d.Metadata().ID(), *d.TypedSpec())
+	t.Logf("disks:\n%s", FormatDisks(found))
+
+	// The branch's one openly-unverified assumption: config.go selects both the
+	// install target and the user volume by disk.serial, and nothing had ever
+	// read a serial off a real qemu virtio disk.
+	//
+	// The raw resources are still listed because the CEL fallback below
+	// converts each one to proto; ListDisks returns our own reduced struct.
+	disks, err := safe.StateListAll[*block.Disk](ctx, c.COSI)
+	if err != nil {
+		t.Fatalf("listing disks over COSI: %s", redactErr(err))
 	}
 
 	in := testInput()
