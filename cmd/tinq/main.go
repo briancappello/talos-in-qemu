@@ -908,8 +908,6 @@ func destroy(dir string) error {
 	return nil
 }
 
-func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
-
 // ensureEFIVars makes path a per-machine, writable copy of the firmware's own
 // nvram template, VERBATIM. UEFI vars must be per-machine: a shared copy is how
 // two VMs end up fighting over boot state.
