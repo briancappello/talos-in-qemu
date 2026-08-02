@@ -247,29 +247,11 @@ func TestEmptyConsoleArgEmitsNoKernelArgsAndLeavesUKIAlone(t *testing.T) {
 	}
 }
 
-// The QEMU regression: with a console arg set, both halves must behave exactly
-// as they did before this task. This duplicates the existing assertion at
-// config_test.go:331-341 deliberately — that one runs on mustGenerateDefault
-// and would keep passing even if the conditional were wired backwards.
-func TestConsoleArgStillEmittedWhenSet(t *testing.T) {
-	in := testInput()
-	in.ConsoleArg = "console=ttyS0"
-
-	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
-
-	if !regexp.MustCompile(`(?m)^ {8}extraKernelArgs:\n {12}- console=ttyS0$`).MatchString(doc) {
-		t.Errorf("install has no extraKernelArgs console=ttyS0\n"+
-			"  reason: the installed system writes its own cmdline and inherits nothing "+
-			"from the ISO\n%s", redact(doc))
-	}
-
-	if regexp.MustCompile(`(?m)^ {8}grubUseUKICmdline: true`).MatchString(doc) {
-		t.Errorf("extraKernelArgs is set while GRUB takes its cmdline from the "+
-			"installer's UKI\n  reason: machinery rejects the two together, so this "+
-			"config does not validate in metal mode\n%s", redact(doc))
-	}
-}
 ```
+
+**Do NOT add a console-arg-set test.** The console-set regression is already carried by `TestGenerateConfigCarriesConsoleArgToTheInstalledSystem` (config_test.go:331-344), and it is genuinely load-bearing: `mustGenerateDefault` generates from `testInput()`, which sets `ConsoleArg: "console=ttyS0"`, so that test runs on exactly the input a console-set test would use and dies under the same mutants (conditional wired backwards, UKI gate inverted).
+
+*An earlier revision of this plan mandated such a test with a comment claiming the pre-existing one "would keep passing even if the conditional were wired backwards." That was false — the two would have been byte-identical regexps over identical input — and it cost a full five-CA generation in a package whose own comment (config_test.go:108-110) says config generation dominates its runtime.*
 
 - [ ] **Step 2: Run test to verify it fails**
 
