@@ -133,6 +133,11 @@ spec:
                   properties:
                     endpoint:
                       type: string
+                      # minLength CARRIES THE WEIGHT `required` LOOKS LIKE IT DOES.
+                      # `required: [endpoint]` is key presence only, so `endpoint: ""`
+                      # satisfies it and travels all the way to adopt.go, which then
+                      # rejects it. The schema should refuse what it appears to refuse.
+                      minLength: 1
                       description: >-
                         The node's address, no port. Talos's own defaults are used
                         (50000 for apid, 6443 for kube-apiserver) because there is no
