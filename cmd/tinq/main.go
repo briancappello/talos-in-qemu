@@ -521,17 +521,31 @@ func (h *hvf) Stop(ctx context.Context, m *unstructured.Unstructured) error {
 
 	if err := h.shutdownGuest(ctx, m); err != nil {
 		log.Printf("graceful shutdown unavailable (%v); falling back to signals", err)
-	} else if waitGone(pid, dir, gracefulStopTimeout) {
-		return nil
 	} else {
+		gone, err := waitGone(ctx, pid, dir, gracefulStopTimeout)
+		if err != nil {
+			// Named, not generic. The guest was ASKED to power off and may well
+			// be part-way through doing it; what we no longer know is whether it
+			// finished. Saying so is the difference between an operator who
+			// re-runs the stop and one who believes the machine is down.
+			return fmt.Errorf("stop of %s abandoned while waiting for the guest to power "+
+				"off; it may still be running: %w", m.GetName(), err)
+		}
+		if gone {
+			return nil
+		}
 		log.Printf("guest did not power off within %s; escalating to SIGTERM", gracefulStopTimeout)
 	}
-	return halt(pid, dir)
+	return halt(ctx, pid, dir)
 }
 
 const (
 	gracefulStopTimeout = 60 * time.Second
 	sigtermTimeout      = 5 * time.Second
+	// How often waitGone re-asks, and therefore the WORST-CASE latency of a
+	// Ctrl-C landing mid-wait. Shortening it makes cancellation crisper and
+	// costs darwin a `ps` fork every tick; see waitGone.
+	pollInterval = 100 * time.Millisecond
 	// The budget for the Shutdown REQUEST, not for the power-off it triggers —
 	// that is gracefulStopTimeout, waited out by Stop against the process.
 	// Talos answers this RPC and runs its shutdown sequence afterwards, so a
@@ -636,26 +650,66 @@ func (h *hvf) shutdownGuest(ctx context.Context, m *unstructured.Unstructured) e
 // permission to signal, not merely its own process group. ProcessMatches covers
 // both cases, but it does not EXPLAIN them, and a future reader deleting the
 // comparison as dead code is the failure this paragraph prevents.
-func halt(pid int, dir string) error {
+//
+// A CANCELLED ctx stops the ladder where it stands and returns the error: it
+// never escalates, and it never reports success. Both halves are deliberate.
+// Escalating would read Ctrl-C as "kill it harder" when it means "stop what you
+// are doing" — the operator interrupting a stop did not ask for a power cut, and
+// the SIGTERM already sent may yet be honoured. Reporting nil would be worse
+// still: the process is very likely alive, and Stop's caller would record a
+// machine as stopped that is still running.
+//
+// The first SIGTERM is NOT gated on ctx. Cancellation cuts the waiting short,
+// which is what took ~85s; the signal itself is instant, already gated on
+// ProcessMatches, and skipping it would mean an interrupted destroy left a qemu
+// running that it had not even asked to exit.
+func halt(ctx context.Context, pid int, dir string) error {
 	if pid <= 0 || !platform.ProcessMatches(pid, dir) {
 		return nil
 	}
 	_ = syscall.Kill(pid, syscall.SIGTERM)
-	if waitGone(pid, dir, sigtermTimeout) {
+	gone, err := waitGone(ctx, pid, dir, sigtermTimeout)
+	if err != nil {
+		return err
+	}
+	if gone {
 		return nil
 	}
 	log.Printf("process %d survived SIGTERM after %s; escalating to SIGKILL", pid, sigtermTimeout)
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 
-	if !waitGone(pid, dir, sigtermTimeout) {
+	gone, err = waitGone(ctx, pid, dir, sigtermTimeout)
+	if err != nil {
+		return err
+	}
+	if !gone {
 		return fmt.Errorf("process %d survived SIGKILL", pid)
 	}
 	return nil
 }
 
-// waitGone polls until the process is no longer OUR qemu, or the deadline
-// passes. It re-checks identity rather than mere liveness, so a pid recycled
-// mid-wait cannot read as "still running".
+// waitGone polls until the process is no longer OUR qemu, the deadline passes,
+// or ctx is cancelled. It re-checks identity rather than mere liveness, so a pid
+// recycled mid-wait cannot read as "still running".
+//
+// The three outcomes are distinct and callers must keep them distinct:
+// (true, nil) gone, (false, nil) deadline passed and it is STILL ours — the only
+// outcome that may escalate — and (false, err) the wait was ABANDONED, having
+// learned nothing. Collapsing the third into either of the others is the bug
+// this signature exists to prevent: read as "gone" it reports a success that did
+// not happen, read as "still running" it escalates to SIGKILL on a Ctrl-C, and
+// Ctrl-C means "stop what you are doing", not "kill it harder".
+//
+// The poll is a select on ctx.Done(), not time.Sleep, because a sleeping wait is
+// an UNINTERRUPTIBLE one. With a bare sleep the whole ladder was deaf to
+// cancellation for as long as it ran — up to ~85s per machine (15s shutdown RPC
+// + 60s graceful + 5s SIGTERM + 5s SIGKILL) — and driverkit.Run only looks at
+// ctx BETWEEN reconcile ticks, never during one, so a Ctrl-C mid-stop was
+// ignored for over a minute with no output to say why. Cancellation is now
+// observed within one poll interval.
+//
+// A Ticker rather than a per-iteration Timer: one allocation for a loop that can
+// run 600 times across the graceful budget, and nothing to leak on the way out.
 //
 // Identity is also what gets this right for a ZOMBIE, which kill(pid, 0) calls
 // alive: a zombie's command line is empty, so it matches nothing and the wait
@@ -664,22 +718,37 @@ func halt(pid int, dir string) error {
 // shares this loop: on darwin ProcessMatches forks `ps`, ten times a second
 // for as long as the wait runs — up to 51 forks across a full 5s deadline,
 // where a plain liveness check was a single syscall.
-func waitGone(pid int, dir string, d time.Duration) bool {
+func waitGone(ctx context.Context, pid int, dir string, d time.Duration) (bool, error) {
 	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
+	tick := time.NewTicker(pollInterval)
+	defer tick.Stop()
+	for {
+		// Identity first, deadline second, so a zero or already-expired budget
+		// still gets exactly one check — the same shape the sleeping loop had,
+		// where the post-deadline re-check was that final look.
 		if !platform.ProcessMatches(pid, dir) {
-			return true
+			return true, nil
 		}
-		time.Sleep(100 * time.Millisecond)
+		if !time.Now().Before(deadline) {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			// Named, not generic: the caller has to be able to tell "we gave up
+			// waiting" from "it is gone", because the process is very likely
+			// still running and a caller that believes it stopped acts on a
+			// false premise.
+			return false, fmt.Errorf("gave up waiting for process %d to exit: %w", pid, ctx.Err())
+		case <-tick.C:
+		}
 	}
-	return !platform.ProcessMatches(pid, dir)
 }
 
 // Destroy takes the WHOLE SCC: the process (which sweeps everything inside the
 // VM) and the state dir (everything outside it). Idempotent — it is called on
 // every delete tick until it succeeds.
 func (h *hvf) Destroy(ctx context.Context, m *unstructured.Unstructured) error {
-	return destroy(h.dir(m))
+	return destroy(ctx, h.dir(m))
 }
 
 func readPid(dir string) int {
@@ -934,7 +1003,7 @@ func ensureQcow2(path, size string) error {
 }
 
 // destroy is idempotent — it is called on every delete tick until it succeeds.
-func destroy(dir string) error {
+func destroy(ctx context.Context, dir string) error {
 	// Destroy does NOT ask the guest to shut down, and that is deliberate: the
 	// disks are deleted immediately below, so a clean shutdown buys nothing and
 	// costs up to a minute. The asymmetry with Stop is the entire point of
@@ -950,7 +1019,27 @@ func destroy(dir string) error {
 	// ProcessMatches, THE FIRST ONE INCLUDED, is stated on halt now and kept
 	// where the signals are, so no caller can route around it and no second
 	// copy can drift away from it again.
-	if err := halt(readPid(dir), dir); err != nil {
+	if err := halt(ctx, readPid(dir), dir); err != nil {
+		// A CANCELLED teardown is the one failure that must NOT sweep. The
+		// ladder stopped early, so the qemu is probably still live and still
+		// has system.qcow2 open — deleting the state dir out from under it is
+		// not a teardown, it is corruption with a running writer. Blocking is
+		// safe precisely because this is idempotent: the next delete tick
+		// retries, and until then the finalizer holds, which driverkit's
+		// reconcile already calls the correct outcome.
+		//
+		// A cancel arriving between halt's return and this check reads as
+		// cancellation for an error that was really "survived SIGKILL". That
+		// costs one retry of an idempotent sweep; the reverse mistake costs a
+		// disk.
+		//
+		// An already-gone machine never reaches here: halt's pid/ProcessMatches
+		// gate returns nil without waiting, so teardown still needs neither a
+		// live hypervisor nor a reachable node.
+		if ctx.Err() != nil {
+			return fmt.Errorf("teardown of %s abandoned before the process was confirmed "+
+				"gone; state left in place rather than swept from under a live qemu: %w", dir, err)
+		}
 		// Not fatal, and the asymmetry is the point: destroy is called on every
 		// delete tick until it succeeds, so a process we could not kill must
 		// not stop the sweep. Leaving the disks behind forever is the worse

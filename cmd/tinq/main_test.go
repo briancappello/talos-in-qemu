@@ -1049,7 +1049,7 @@ func TestDestroyDoesNotSignalAPidItCannotProveIsOurs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := destroy(dir); err != nil {
+	if err := destroy(context.Background(), dir); err != nil {
 		t.Fatalf("destroy: %v", err)
 	}
 	// Still idempotent: an unkillable pid must not stop the sweep.
@@ -1208,7 +1208,7 @@ func TestHaltEscalatesToSIGKILLWhenSIGTERMIsIgnored(t *testing.T) {
 	pid := startStubbornDecoy(t, dir, marker)
 
 	start := time.Now()
-	err := halt(pid, dir)
+	err := halt(context.Background(), pid, dir)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("halt = %v, want nil: SIGKILL must end a process SIGTERM cannot", err)
@@ -1225,6 +1225,145 @@ func TestHaltEscalatesToSIGKILLWhenSIGTERMIsIgnored(t *testing.T) {
 	if platform.ProcessMatches(pid, dir) {
 		t.Errorf("process %d is still this machine's qemu after %v: the ladder never reached SIGKILL",
 			pid, elapsed)
+	}
+}
+
+// A cancelled context must cut the wait short, PROMPTLY, and must not report
+// success.
+//
+// The bug: waitGone took no context and polled with a bare time.Sleep, and
+// driverkit.Run only looks at ctx BETWEEN reconcile ticks. A Ctrl-C during a
+// stop was therefore ignored for up to ~85s (15s shutdown RPC + 60s graceful +
+// 5s SIGTERM + 5s SIGKILL). Elapsed time IS the assertion here: cancel at 200ms
+// against a 5s rung, and anything near the budget means the wait was deaf again.
+//
+// The stubborn decoy is load-bearing twice over: it survives SIGTERM, so the
+// wait is genuinely entered rather than satisfied instantly, and its SURVIVAL
+// proves cancellation did not escalate. Measured against the sleeping version:
+// this returned nil after 5.0s having SIGKILLed the decoy — late, escalated, and
+// reporting success for a machine it had only just killed by force.
+//
+// Non-vacuity is the elapsed FLOOR, not the decoy's SIGTERM marker. The marker
+// cannot be used here: the shell runs a trap only after the foreground `sleep`
+// returns, so it lags by up to a second — longer than the window this test
+// exists to measure, and asserting on it fails every time. The floor proves the
+// same thing for this test's purpose: a halt that took its early return, or
+// never entered a wait, cannot spend 200ms doing it.
+func TestHaltAbandonsTheWaitWhenTheContextIsCancelled(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	pid := startStubbornDecoy(t, dir, filepath.Join(dir, "sigterm-received"))
+
+	// Long enough that halt is demonstrably inside the wait when it lands, two
+	// orders of magnitude short of the 5s rung it is interrupting.
+	const cancelAfter = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), cancelAfter)
+	defer cancel()
+
+	start := time.Now()
+	err := halt(ctx, pid, dir)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("halt = nil after %v on a cancelled context: the process is still running "+
+			"and the caller has just been told it stopped", elapsed)
+	}
+	if elapsed < cancelAfter {
+		t.Fatalf("halt returned in %v, before the context was even cancelled: it never "+
+			"entered the wait, so the deadline below proves nothing", elapsed)
+	}
+	if elapsed > time.Second {
+		t.Errorf("halt took %v to notice cancellation; the whole point is that Ctrl-C is "+
+			"observed within a poll interval, not at the end of the %v budget", elapsed, sigtermTimeout)
+	}
+	if !platform.ProcessMatches(pid, dir) {
+		t.Errorf("process %d is gone: a cancelled halt escalated to SIGKILL. Ctrl-C means "+
+			"stop what you are doing, not kill it harder", pid)
+	}
+	if !strings.Contains(err.Error(), "context") {
+		t.Errorf("error %q does not name cancellation; an operator has to be able to tell "+
+			"an abandoned stop from a failed one", err)
+	}
+}
+
+// A cancelled teardown must NOT sweep the state dir.
+//
+// The ladder stopped early, so the qemu is probably still live with
+// system.qcow2 open — removing the dir under it is corruption with a running
+// writer, not a teardown. Blocking is safe because destroy is idempotent and the
+// finalizer holds until a later tick succeeds.
+//
+// This pins the decision separately from halt's because it is a different one:
+// destroy deliberately SWALLOWS an ordinary halt failure and sweeps anyway
+// (TestDestroyDoesNotSignalAPidItCannotProveIsOurs pins that), and cancellation
+// is the one case that must not take that path.
+func TestDestroyDoesNotSweepStateWhenTheContextIsCancelled(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	marker := filepath.Join(root, "sigterm-received")
+	dir := filepath.Join(root, "site-a", "uid-1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pid := startStubbornDecoy(t, dir, marker)
+	disk := filepath.Join(dir, "system.qcow2")
+	if err := os.WriteFile(disk, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "qemu.pid"),
+		[]byte(strconv.Itoa(pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const cancelAfter = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), cancelAfter)
+	defer cancel()
+
+	start := time.Now()
+	err := destroy(ctx, dir)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("destroy = nil after %v on a cancelled context: deletion would proceed "+
+			"with the VM still up", elapsed)
+	}
+	if elapsed < cancelAfter {
+		t.Fatalf("destroy returned in %v, before the context was cancelled: it never "+
+			"entered the wait", elapsed)
+	}
+	if elapsed > time.Second {
+		t.Errorf("destroy took %v to notice cancellation, against a %v rung", elapsed, sigtermTimeout)
+	}
+	if _, statErr := os.Stat(disk); statErr != nil {
+		t.Errorf("the disk was deleted (%v) while its qemu is still live: an abandoned "+
+			"teardown must leave the state dir for the next tick", statErr)
+	}
+}
+
+// A machine whose process is already gone must destroy CLEANLY even on a dead
+// context. Teardown may not require a live hypervisor or a reachable node, and
+// the cancellation handling above is one `ctx.Err() != nil` away from breaking
+// that for every already-stopped machine.
+func TestDestroyOfAnAlreadyGoneMachineSucceedsOnACancelledContext(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "site-a", "uid-1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A pid that is nobody's: halt's gate returns before any wait, so there is
+	// nothing for cancellation to interrupt.
+	if err := os.WriteFile(filepath.Join(dir, "qemu.pid"), []byte("0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := destroy(ctx, dir); err != nil {
+		t.Fatalf("destroy on an already-gone machine = %v, want nil: a cancelled context "+
+			"must not wedge a finalizer that has nothing left to wait for", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("state dir must be gone, stat = %v", err)
 	}
 }
 
@@ -1250,7 +1389,7 @@ func TestDestroyEscalatesToSIGKILLAndStillSweepsTheState(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := destroy(dir); err != nil {
+	if err := destroy(context.Background(), dir); err != nil {
 		t.Fatalf("destroy = %v, want nil", err)
 	}
 	elapsed := time.Since(start)
@@ -1541,8 +1680,8 @@ func TestStopFallsBackToSignalsWhenTheGuestCannotBeAsked(t *testing.T) {
 // CI job that dies without a failing test to explain it, and this file is
 // where someone bisecting that will end up.
 func TestHaltRefusesToSignalPidZero(t *testing.T) {
-	if err := halt(0, t.TempDir()); err != nil {
-		t.Fatalf("halt(0, dir) = %v, want nil", err)
+	if err := halt(context.Background(), 0, t.TempDir()); err != nil {
+		t.Fatalf("halt(ctx, 0, dir) = %v, want nil", err)
 	}
 }
 
@@ -1581,7 +1720,7 @@ func TestHaltRefusesToSignalAPidItCannotProveIsOurs(t *testing.T) {
 		t.Fatalf("fixture is wrong: stranger %d matches %q", pid, dir)
 	}
 
-	if err := halt(pid, dir); err != nil {
+	if err := halt(context.Background(), pid, dir); err != nil {
 		t.Fatalf("halt on an unprovable pid = %v, want nil", err)
 	}
 	select {

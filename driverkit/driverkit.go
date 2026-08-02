@@ -109,6 +109,30 @@ type Config struct {
 
 // Run is the reconcile loop. It owns the finalizer dance and status publishing
 // so no driver can get that half subtly wrong.
+//
+// DEFERRED: reconciliation is SERIAL. One machine that is stopping holds the
+// loop for as long as its stop takes — for the qemu driver, up to ~85s (15s
+// shutdown RPC + 60s graceful power-off + 5s SIGTERM + 5s SIGKILL) — and every
+// other machine waits it out. That is a real stall, and it is knowingly not
+// fixed:
+//
+//   - There is one machine. Multi-node is blocked on QEMU user-mode networking
+//     (SLIRP: one NIC, no VM-to-VM link) and is a stated non-goal in the README,
+//     so the queue this would relieve does not exist yet.
+//   - The fix is not "go reconcile(...)". Concurrent reconciliation needs
+//     per-key locking to guarantee one machine is never reconciled twice at
+//     once. Without it, two ticks overlap and two qemu processes run against a
+//     single state dir — which the qemu driver's own Boot closure calls
+//     corrupting the disk they share (cmd/tinq/main.go, "Starting a second qemu
+//     against one state dir"). A stall is recoverable; that is not.
+//
+// The trigger is a CONDITION, not a date: revisit when a second machine can
+// exist. Until then a slow neighbour is the cheaper failure.
+//
+// Cancellation is NOT part of that deferral and is already handled: the driver
+// verbs take this ctx and must honour it, so a Ctrl-C mid-stop returns within a
+// poll interval rather than at the end of the budget. The ~85s above is the
+// stall one machine imposes on another, not the delay an operator sees.
 func Run(ctx context.Context, cfg Config, d Driver) error {
 	kubeconfig := flag.Lookup("kubeconfig").Value.String()
 	rc, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
