@@ -244,7 +244,9 @@ func newRootCmd() *cobra.Command {
 }
 
 // standalone runs one CR through the Driver with no control plane. It is
-// deliberately thin: decode, Observe, then Create, Stop or Destroy. Every
+// deliberately thin: decode, refuse the wrong substrate, Observe, then Create,
+// Stop or Destroy — the refusal comes second because a machine this tool did
+// not create has no honest answer to any of the three. Every
 // decision about WHAT a machine is stays in the driver, so bootstrap and steady
 // state cannot disagree.
 //

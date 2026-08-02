@@ -124,6 +124,14 @@ spec:
 			if err == nil {
 				t.Fatalf("standalone %s ran against a baremetal machine", verb)
 			}
+			// LOAD-BEARING ON hvf.Observe RETURNING AN ERROR FOR ENOTDIR.
+			// This assertion can only tell "refused first" from "observed
+			// first" because a stat failure that is not ENOENT propagates —
+			// see Observe's `return driverkit.Absent, nil, err`. Soften that
+			// to Absent for every stat error and standalone stops erroring in
+			// Observe at all, so this branch goes vacuous while staying green
+			// and the ordering it exists to pin is silently unasserted.
+			// Change Observe there and this test needs a new lever.
 			if strings.HasPrefix(err.Error(), "observe:") {
 				t.Fatalf("standalone %s observed before refusing: %v\n"+
 					"  reason: Observe stats system.qcow2 and reports hardware as "+
@@ -187,7 +195,8 @@ spec:
 		t.Fatal(err)
 	}
 
-	d := &hvf{stateRoot: t.TempDir(), imageRoot: t.TempDir()}
+	root := t.TempDir()
+	d := &hvf{stateRoot: root, imageRoot: t.TempDir()}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -201,6 +210,17 @@ spec:
 	}
 	if !strings.Contains(err.Error(), "10.0.0.5:50000") {
 		t.Errorf("the refusal does not quote the endpoint it rejected: %v", err)
+	}
+	// The check sits before MkdirAll, and this is the property that buys.
+	// Without it the deadline assertion above is equally green against a
+	// refusal that has already carved out a state dir for a machine it just
+	// rejected — residue named after a typo, left for the operator to find.
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatalf("state root: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("a refused adopt created %d entries under the state root, want 0", len(entries))
 	}
 }
 
