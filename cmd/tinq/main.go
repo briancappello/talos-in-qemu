@@ -156,9 +156,12 @@ func newRootCmd() *cobra.Command {
 			"`tinq apply` starts the machine again from the same disks — that\n" +
 			"distinction is the only reason this exists beside `destroy`. Idempotent:\n" +
 			"already stopped, or never created, is success.\n\n" +
-			"Today this is a POWER CUT. QEMU is signalled (SIGTERM, then SIGKILL)\n" +
-			"rather than Talos being asked to power itself off, so the guest never\n" +
-			"learns it is going down and its filesystem is never quiesced.",
+			"A bootstrapped machine is asked to power itself off over the Talos API,\n" +
+			"so its filesystem is quiesced. A machine still in maintenance mode has no\n" +
+			"talosconfig to ask with, and QEMU is signalled instead (SIGTERM, then\n" +
+			"SIGKILL) — a power cut the guest never learns about, which is safe there\n" +
+			"because it holds no applied config and nothing persistent. Either way the\n" +
+			"escalation is announced in the log rather than performed silently.",
 		Args: cobra.ExactArgs(1),
 		RunE: runVerb("stop"),
 	}
@@ -522,24 +525,74 @@ func (h *hvf) Stop(ctx context.Context, m *unstructured.Unstructured) error {
 const (
 	gracefulStopTimeout = 60 * time.Second
 	sigtermTimeout      = 5 * time.Second
+	// The budget for the Shutdown REQUEST, not for the power-off it triggers —
+	// that is gracefulStopTimeout, waited out by Stop against the process.
+	// Talos answers this RPC and runs its shutdown sequence afterwards, so a
+	// reachable guest replies in milliseconds over a loopback forward.
+	//
+	// It exists because ctx here reaches Stop unbounded (cobra's, or the
+	// controller loop's), and a gRPC call is only fail-fast once the channel
+	// reports TRANSIENT_FAILURE. A guest whose apid accepts the TCP connection
+	// and then never completes the TLS handshake leaves the channel CONNECTING
+	// forever, and the call blocks with it — so `tinq stop` on a half-wedged
+	// node would hang instead of falling through to the signal ladder. A
+	// wedged guest must still be stoppable; that is the failure this bounds.
+	shutdownRequestTimeout = 15 * time.Second
 )
 
-// shutdownGuest asks the GUEST to power itself off.
+// shutdownGuest asks the GUEST to power itself off, over the authenticated
+// Talos API, so the filesystem is quiesced before the VM goes.
 //
-// DEFERRED, not blocked. It needs an authenticated Talos client, and the
-// cluster package now has one — so this is a follow-up that can be written,
-// not a hole waiting on a dependency. It is left a stub here so that change
-// arrives on its own: wiring a Talos client into Stop is a different review
-// from moving the lifecycle onto this base, and mixing them makes both harder
-// to judge. Until it lands, Stop is honest about escalating straight to
-// signals rather than pretending the guest was ever asked.
+// The alternative is what Stop falls back to: signalling the QEMU PROCESS,
+// which is a power cut the guest never learns about. etcd survives that (its
+// WAL is fsynced), but a workload's in-flight writes are the exposure.
 //
-// A machine in maintenance mode will never get a graceful stop even then: it
-// cannot satisfy the mutual TLS that Shutdown requires. That is safe rather
-// than a compromise — a maintenance node is a booted ISO with no applied config
-// and nothing persistent to corrupt.
+// The talosconfig is the one cluster.Up wrote into this machine's state dir at
+// step 4. Reading it from there rather than $TALOSCONFIG is deliberate: the
+// credentials that stop a machine must be THAT machine's, and the operator's
+// environment may be pointed anywhere.
+//
+// A machine in MAINTENANCE MODE — created by `apply`, never bootstrapped —
+// never gets this rung: it has no talosconfig, so it cannot satisfy the mutual
+// TLS that Shutdown requires, and this returns immediately rather than
+// dialling. That is safe rather than a compromise — a maintenance node is a
+// booted ISO with no applied config and nothing persistent to corrupt.
+//
+// talosconfig is SECRET. It is never logged and never interpolated into an
+// error; see cluster.errSecretParse for why even a parser's own message is
+// withheld.
 func (h *hvf) shutdownGuest(ctx context.Context, m *unstructured.Unstructured) error {
-	return fmt.Errorf("not implemented on this branch")
+	// os.ReadFile's error quotes the PATH and never the contents, so it is
+	// safe to wrap. Nothing below may relax that.
+	talosconfig, err := os.ReadFile(filepath.Join(h.dir(m), "talosconfig"))
+	if err != nil {
+		return fmt.Errorf("no credentials to ask the guest with (a machine still in "+
+			"maintenance mode has none): %w", err)
+	}
+
+	endpoint := talosEndpoint(m)
+
+	ctx, cancel := context.WithTimeout(ctx, shutdownRequestTimeout)
+	defer cancel()
+
+	c, err := cluster.AuthenticatedClient(ctx, talosconfig, endpoint)
+	if err != nil {
+		return fmt.Errorf("authenticated Talos client: %w", err)
+	}
+
+	defer c.Close() //nolint:errcheck
+
+	// MachineService.Shutdown, exposed on the client — NOT LifecycleService,
+	// which carries only Install and Upgrade.
+	//
+	// It returns once the node has ACCEPTED the request; Talos runs the
+	// shutdown sequence after replying. So nil here means "asked", not "gone",
+	// and Stop is right to wait on the process afterwards rather than trust it.
+	if err := c.Shutdown(ctx); err != nil {
+		return fmt.Errorf("asking the Talos API at %s to power the guest off: %w", endpoint, err)
+	}
+
+	return nil
 }
 
 // halt escalates signals at pid until it is no longer this machine's qemu.

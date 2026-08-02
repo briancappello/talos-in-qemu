@@ -1368,6 +1368,164 @@ spec:
 	}
 }
 
+// withTalosForward gives m a host forward to the Talos API, so talosEndpoint(m)
+// is non-empty. Port 1 rather than 50000: nothing may actually connect here,
+// and a real forward port could collide with a developer's running VM.
+func withTalosForward(t *testing.T, m *unstructured.Unstructured) {
+	t.Helper()
+	if err := unstructured.SetNestedSlice(m.Object, []interface{}{
+		map[string]interface{}{"guestPort": int64(talosAPIGuestPort), "hostPort": int64(1)},
+	}, "spec", "hostForwards"); err != nil {
+		t.Fatal(err)
+	}
+	if talosEndpoint(m) == "" {
+		t.Fatal("fixture is wrong: talosEndpoint is still empty, so the client is refused " +
+			"before the talosconfig is read and the test below proves nothing")
+	}
+}
+
+// A machine still in MAINTENANCE MODE has no talosconfig, and must be refused
+// immediately rather than dialled.
+//
+// The deadline is the assertion. `apply` creates machines that never get one,
+// and the graceful rung is entered on every `stop` of a Running machine — so a
+// shutdownGuest that reached for the network here would make the ordinary
+// maintenance-mode stop wait out a dial timeout before it could signal
+// anything. Fast is the behaviour, not merely the outcome.
+func TestShutdownGuestFailsFastOnAMachineWithNoTalosconfig(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir()}
+	m := testMachine(t, "site-a", "uid-1")
+	if err := os.MkdirAll(h.dir(m), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err := h.shutdownGuest(context.Background(), m)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("shutdownGuest with no talosconfig = nil: Stop would then wait out its "+
+			"whole %v graceful budget for a power-off nobody was ever asked for", gracefulStopTimeout)
+	}
+	// Two orders of magnitude under shutdownRequestTimeout: this must be a
+	// file-not-found, not a dial that happened to fail quickly.
+	if elapsed > time.Second {
+		t.Errorf("shutdownGuest took %v to refuse a machine with no talosconfig; it must not "+
+			"reach the network to discover it has no credentials", elapsed)
+	}
+	if !strings.Contains(err.Error(), "talosconfig") {
+		t.Errorf("error %q does not name talosconfig; Stop logs this verbatim and the "+
+			"operator has to be able to tell maintenance mode from a broken node", err)
+	}
+}
+
+// The talosconfig is a PRIVATE KEY and must never appear in an error.
+//
+// cluster.errSecretParse withholds even the parser's own message for this
+// reason; the failure guarded here is a wrapper on THIS side quoting the bytes
+// that the cluster package took care not to. Stop prints whatever comes back,
+// so a leak lands in the operator's terminal and their CI log.
+func TestShutdownGuestNeverQuotesTheTalosconfig(t *testing.T) {
+	const secret = "TOTALLY-NOT-A-REAL-PRIVATE-KEY-8f3a1c"
+
+	h := &hvf{stateRoot: t.TempDir()}
+	m := testMachine(t, "site-a", "uid-1")
+	// A Talos forward is a PRECONDITION, not decoration: AuthenticatedClient
+	// refuses an empty endpoint before it ever looks at the bytes, so without
+	// this the parse is never reached and the assertion below passes
+	// vacuously.
+	withTalosForward(t, m)
+	dir := h.dir(m)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Unterminated flow sequence: this must fail in the YAML PARSER, which is
+	// the one failure with the whole document in scope to quote. Well-formed
+	// YAML that merely lacks a context fails later, in client.New, with
+	// nothing but its own words — a weaker case, and not the one
+	// cluster.errSecretParse exists for.
+	if err := os.WriteFile(filepath.Join(dir, "talosconfig"),
+		[]byte("context: ["+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := h.shutdownGuest(context.Background(), m)
+	if err == nil {
+		t.Fatal("shutdownGuest on an unparseable talosconfig = nil, want an error")
+	}
+	// Pins the fixture to the parser: if a future machinery accepts this
+	// document, the assertion below would be guarding the wrong failure.
+	if !strings.Contains(err.Error(), "could not be parsed") {
+		t.Fatalf("fixture no longer fails in the parser (%v); the leak this guards "+
+			"against is the parser's message quoting the document", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("the error quotes the talosconfig: %q\n"+
+			"  that document is a private key, and Stop logs this", err)
+	}
+}
+
+// A failed graceful shutdown must FALL THROUGH to the signal ladder, and say so.
+//
+// This is the property that keeps a wedged guest stoppable: the graceful rung
+// is best-effort, never a precondition. Distinct from
+// TestStopHaltsAVerifiedProcessAndKeepsTheDisks above, which reaches the ladder
+// with NO talosconfig at all — here one exists and the client build is what
+// fails, so the fall-through is proven for the dial/credential path too, which
+// is the one a real broken node takes.
+//
+// The log line is asserted because silence is the specific failure: a stop that
+// hard-kills without announcing it is how you find out months later that none
+// of your stops were ever clean.
+func TestStopFallsBackToSignalsWhenTheGuestCannotBeAsked(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir()}
+	m := testMachine(t, "site-a", "uid-1")
+	// So the failure below is a CREDENTIAL failure and not "no endpoint" —
+	// the machine looks reachable and the talosconfig is what is wrong, which
+	// is the shape a real broken node has.
+	withTalosForward(t, m)
+	dir := h.dir(m)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(dir, "system.qcow2")
+	if err := os.WriteFile(disk, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "talosconfig"),
+		[]byte("not a talosconfig\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pid := startDecoy(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, "qemu.pid"),
+		[]byte(strconv.Itoa(pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Without Running, Stop takes its early return and everything below passes
+	// for the wrong reason.
+	if state, _, err := h.Observe(context.Background(), m); err != nil || state != driverkit.Running {
+		t.Fatalf("Observe = %v, %v before Stop; want Running or the ladder is never entered", state, err)
+	}
+
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	if err := h.Stop(context.Background(), m); err != nil {
+		t.Fatalf("Stop = %v, want nil: a guest that cannot be asked must still be stoppable", err)
+	}
+	if platform.ProcessMatches(pid, dir) {
+		t.Errorf("process %d is still this machine's qemu: a failed graceful shutdown "+
+			"became a failed stop", pid)
+	}
+	if _, err := os.Stat(disk); err != nil {
+		t.Errorf("Stop must KEEP the disks: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "falling back to signals") {
+		t.Errorf("Stop hard-killed the VM without announcing it; log was %q", out)
+	}
+}
+
 // kill(0, sig) is NOT a no-op: POSIX sends the signal to every process in the
 // CALLER's process group. readPid returns 0 for a pidfile that has vanished —
 // which a concurrent destroy causes, since it removes the whole state dir — so

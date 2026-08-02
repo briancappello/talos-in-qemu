@@ -192,11 +192,20 @@ destroy b.yaml` is rejected by the parser (`accepts 1 arg(s), received 3`)
 rather than silently resolving to one of them: there is no precedence rule to
 learn because a contradictory command line is no longer expressible.
 
-Today `stop` signals QEMU (SIGTERM, then SIGKILL) rather than asking Talos to
-power itself off — the graceful rung needs an authenticated Talos client, which
-is written but not yet wired in here (see Status). It escalates loudly in the
-log rather than claiming a clean shutdown it did not perform. That is a power
-cut the guest never learns about: the filesystem is never quiesced, so whatever
+`stop` asks the guest first. A **bootstrapped** machine is sent Talos's
+`Shutdown` over the authenticated API, using the `talosconfig` `up` wrote into
+that machine's state directory, and gets a clean power-off with its filesystem
+quiesced. Only if that fails, or if the guest is still up sixty seconds later,
+does it fall back to signalling QEMU (SIGTERM, then SIGKILL), and it says so in
+the log rather than claiming a clean shutdown it did not perform.
+
+A machine still in **maintenance mode** — created by `apply`, never
+bootstrapped — has no `talosconfig`, so it cannot satisfy the mutual TLS
+`Shutdown` requires and always takes the signal path. That is a power cut the
+guest never learns about, and it is safe here rather than a compromise: a
+maintenance node is a booted ISO with no applied config and nothing persistent
+to corrupt. The same is true of a bootstrapped guest that is too wedged to
+answer — a hard stop is still better than an unstoppable machine, and whatever
 a workload had in flight is the exposure.
 
 `apply` exists because of a chicken-and-egg: a controller needs a control plane
@@ -606,14 +615,14 @@ Working and exercised:
 
 Not done yet — stated plainly rather than implied:
 
-- **No graceful guest shutdown.** `stop` escalates straight to SIGTERM/SIGKILL
-  on the QEMU process. Asking Talos to power itself off needs an authenticated
-  client — `cluster.AuthenticatedClient` is exactly that and already exists,
-  so this is a wiring job rather than a missing capability, and it is left to
-  its own change. Disks survive either way; a power-off is simply not the same
-  as a clean one. A node still in maintenance mode will never get the graceful
-  rung regardless: it cannot satisfy the mutual TLS, which is safe rather than
-  a compromise, since it holds no applied config and nothing persistent to
+- **The graceful rung of `stop` has never met a real guest.** `stop` now sends
+  Talos's `Shutdown` before it signals anything, but nothing in CI can answer
+  that call, so only the FAILURE paths are tested: no `talosconfig` fails fast,
+  an unusable one falls through to SIGTERM/SIGKILL, and neither puts secret
+  material in an error. That the clean power-off actually happens is
+  expected-to-work, not proven. A node still in maintenance mode never gets
+  that rung by design: it cannot satisfy the mutual TLS, which is safe rather
+  than a compromise, since it holds no applied config and nothing persistent to
   corrupt.
 - **`tinq stop` and `spec.powerState` reconciliation are unit-tested, not
   hardware-exercised.** The transition table, the `Synced`/`Ready` split and
