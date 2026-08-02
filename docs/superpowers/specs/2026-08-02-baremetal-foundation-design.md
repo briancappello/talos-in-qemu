@@ -28,7 +28,15 @@ cluster, using the same ten-step sequence `up` uses.
 - **PXE / netboot.** The node is booted by hand from USB or virtual media.
 - **BMC, power control, Wake-on-LAN.** Nothing here powers a machine on.
 - **A baremetal `driverkit` driver.** With no power control, `Create`, `Stop`
-  and `Destroy` have no honest implementation.
+  and `Destroy` have no honest implementation, and none was written. What
+  shipped instead — after the review found that the controller reaches the
+  driver without passing any of D4's CLI refusals — is the qemu driver
+  DECLINING on all four methods: `Observe` reports `Running` so the loop
+  converges on doing nothing, `Create` and `Stop` log a refusal and return nil
+  so a tick cannot spin forever, and `Destroy` forgets the machine rather than
+  deleting the only credential that reaches it. Four no-ops that make a
+  controller leave hardware alone are not a driver for it; `tinq adopt` is
+  still the only verb that acts.
 - **Network configuration.** DHCP only. Static addressing, bonds and VLANs have
   nowhere to live in `ConfigInput` and are not being given one yet.
 
@@ -134,6 +142,22 @@ The QEMU provisioning fields — `image`, `cpu`, `memory`, `disk`, `dataDisk`,
 property `up.go:412` depends on: the user volume and the StorageClass read one
 field and therefore cannot disagree.
 
+**Strengthened as shipped: unused became REFUSED, for all six.** This design
+said "unused", and the plan's task 7 drafted one CEL rule for one field —
+`!(has(self.baremetal) && has(self.hostForwards))`. The rule that shipped
+rejects a machine carrying `spec.baremetal` alongside any of `image`, `cpu`,
+`memory`, `disk`, `dataDisk` or `hostForwards`, and `cmd/tinq/crd_test.go`
+holds the CRD to what the Go code reads from it.
+
+"Unused" is a silent discard, and a manifest carrying both shapes then reads as
+configuration that is in effect when none of it is — an operator who writes
+`disk: 500Gi` on a hardware machine has said something about the install that
+nothing anywhere honours. The six are one class, so refusing only
+`hostForwards` would have left the other five discarded silently. The price is
+paid on migration: converting a VM manifest to a hardware one means DELETING
+those fields, not merely adding `spec.baremetal`. One explicit edit, against a
+discard that never announces itself.
+
 ### D4 — `adopt`, and four verbs that refuse
 
 `tinq adopt <machine.yaml>` requires `spec.baremetal`. `apply`, `up`, `stop`
@@ -204,7 +228,13 @@ virtio-blk device rather than a CDROM, and so does the squashfs loop device. A
 table that only flagged CDROM would show the boot medium as an ordinary
 candidate disk.
 
-**Measured on a live node, 2026-08-02** (v1.13.7, maintenance mode, five disks):
+**Measured on a live node, 2026-08-02** (v1.13.7, maintenance mode, five
+disks), on the risk-1 rehearsal VM at `127.0.0.1:50002` — `disk: 10Gi`,
+`dataDisk: 20Gi`, which is why `vda` reads 11 GB here and 22 GB in the README's
+sample. That table is a different machine: the adopt rehearsal, built from
+`examples/adopt-machine.yaml` at `disk: 20Gi`, `dataDisk: 20Gi`. Both are
+single real runs; `PrettySize` is `humanize.Bytes`, so 10 GiB renders 11 GB and
+20 GiB renders 22 GB.
 
 ```
   DEVICE   SERIAL         MODEL          SIZE     NOTES
