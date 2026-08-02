@@ -2050,3 +2050,122 @@ spec:
 		t.Errorf("the refusal does not quote the endpoint it rejected: %v", err)
 	}
 }
+
+// THE CONTROLLER REACHES Destroy WITH NO SUBSTRATE CHECK IN FRONT OF IT.
+// refuseWrongSubstrate guards the CLI verbs only, and driverkit's reconcile
+// handles a deletion timestamp before it Observes — so `kubectl delete
+// talosmachine bm0`, on the machine the docs tell you to register after adopt,
+// lands here directly. Sweeping the state dir there deletes the sole
+// talosconfig for a node that left maintenance mode when it was adopted and
+// can never be adopted again: the machine survives, the key to it does not.
+//
+// Both halves matter. The QEMU subtest is the regression guard — this is the
+// method the controller calls on every delete tick, and a guard that also
+// stops sweeping VMs has traded one leak for another.
+func TestDestroyForgetsHardwareAndStillSweepsAVM(t *testing.T) {
+	// seed builds a state dir with one file in it and returns both paths.
+	seed := func(t *testing.T, h *hvf, m *unstructured.Unstructured, name string) (string, string) {
+		t.Helper()
+		dir := h.dir(m)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		f := filepath.Join(dir, name)
+		if err := os.WriteFile(f, []byte("not a secret, a fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return dir, f
+	}
+
+	t.Run("baremetal", func(t *testing.T) {
+		h := &hvf{stateRoot: t.TempDir(), imageRoot: t.TempDir(),
+			detect: func() (*platform.Platform, error) {
+				t.Error("forgetting a machine must not probe the host")
+				return nil, fmt.Errorf("no accelerator")
+			}}
+		m := baremetalMachine()
+		m.SetUID("bm0-uid")
+		dir, cfg := seed(t, h, m, "talosconfig")
+
+		if err := h.Destroy(context.Background(), m); err != nil {
+			t.Fatalf("Destroy of a baremetal machine = %v, want nil\n"+
+				"  reason: an error here BLOCKS deletion and wedges the finalizer forever", err)
+		}
+		if _, err := os.Stat(cfg); err != nil {
+			t.Fatalf("Destroy deleted %s: %v\n"+
+				"  reason: that is the ONLY credential that reaches a node this tool "+
+				"cannot destroy and cannot re-adopt", cfg, err)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("Destroy removed the state dir of a machine it does not own: %v", err)
+		}
+	})
+
+	t.Run("qemu", func(t *testing.T) {
+		h := &hvf{stateRoot: t.TempDir(), imageRoot: t.TempDir()}
+		m := &unstructured.Unstructured{Object: map[string]interface{}{
+			"metadata": map[string]interface{}{"name": "vm0"},
+			"spec":     map[string]interface{}{"site": "lab", "image": "talos.iso"},
+		}}
+		m.SetUID("vm0-uid")
+		dir, _ := seed(t, h, m, "system.qcow2")
+
+		if err := h.Destroy(context.Background(), m); err != nil {
+			t.Fatalf("Destroy of a VM = %v, want nil", err)
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("Destroy left the state dir of a VM behind (stat: %v)\n"+
+				"  reason: the baremetal guard must not cost the QEMU path its sweep", err)
+		}
+	})
+}
+
+// Observe must not call hardware Absent or Stopped: both are answers about
+// system.qcow2, both read as "not up yet", and plan() turns either into a
+// Create against a machine on a desk on the very next tick.
+func TestObserveDoesNotCallHardwareAbsent(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir(), imageRoot: t.TempDir()}
+	m := baremetalMachine()
+	m.SetUID("bm0-uid")
+
+	state, status, err := h.Observe(context.Background(), m)
+	if err != nil {
+		t.Fatalf("Observe of a baremetal machine = %v, want nil", err)
+	}
+	if state != driverkit.Running {
+		t.Fatalf("Observe reported %v for hardware, want Running\n"+
+			"  reason: Absent and Stopped both make plan() ask Create to build a "+
+			"machine that already exists", state)
+	}
+	if got := status["apiEndpoint"]; got != "192.168.1.50:50000" {
+		t.Errorf("status apiEndpoint = %v, want the node's own address\n"+
+			"  reason: Running here is not a liveness claim, so status has to carry "+
+			"the address that can actually answer one", got)
+	}
+	if _, ok := status["pid"]; ok {
+		t.Error("status carries a pid for a process this host never started")
+	}
+}
+
+// Create and Stop must return nil, not an error. The controller retries a
+// failed verb on every tick and this one could never clear — a permanent error
+// spin is noise that teaches an operator to stop reading the log.
+func TestCreateAndStopDoNotSpinOnHardware(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir(), imageRoot: t.TempDir(),
+		detect: func() (*platform.Platform, error) {
+			t.Error("a refusal must not probe the host")
+			return nil, fmt.Errorf("no accelerator")
+		}}
+	m := baremetalMachine()
+	m.SetUID("bm0-uid")
+
+	if err := h.Create(context.Background(), m); err != nil {
+		t.Errorf("Create on hardware = %v, want nil", err)
+	}
+	if err := h.Stop(context.Background(), m); err != nil {
+		t.Errorf("Stop on hardware = %v, want nil", err)
+	}
+	if entries, err := os.ReadDir(h.stateRoot); err != nil || len(entries) != 0 {
+		t.Errorf("state root holds %v (err %v) after a refusal, want nothing", entries, err)
+	}
+}
