@@ -8,11 +8,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/coglative/talos-in-qemu/driverkit"
 	"github.com/coglative/talos-in-qemu/platform"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
 )
 
@@ -614,20 +618,27 @@ func TestObserveReportsTheSameEndpointUpUses(t *testing.T) {
 			m := &unstructured.Unstructured{Object: obj}
 			m.SetUID("bootstrap-default-cp0")
 
-			// A live pid, or Observe reports absent and asserts nothing. This
-			// process is the most reliable live pid a test has.
+			// Running demands DISKS and a VERIFIED process, so this needs both
+			// or Observe reports Absent and every assertion below passes for
+			// the wrong reason. The test binary's own pid no longer qualifies:
+			// it does not carry the state dir in its argv, which is exactly
+			// what ProcessMatches is for.
 			dir := h.dir(m)
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				t.Fatal(err)
 			}
+			if err := os.WriteFile(filepath.Join(dir, "system.qcow2"), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			pid := startDecoy(t, dir)
 			if err := os.WriteFile(filepath.Join(dir, "qemu.pid"),
-				[]byte(fmt.Sprint(os.Getpid())), 0o644); err != nil {
+				[]byte(fmt.Sprint(pid)), 0o644); err != nil {
 				t.Fatal(err)
 			}
 
-			exists, status, err := h.Observe(context.Background(), m)
-			if err != nil || !exists {
-				t.Fatalf("Observe = (%v, %v), want a live machine", exists, err)
+			state, status, err := h.Observe(context.Background(), m)
+			if err != nil || state != driverkit.Running {
+				t.Fatalf("Observe = (%v, %v), want a running machine", state, err)
 			}
 
 			if got := status["apiEndpoint"]; got != tc.want {
@@ -637,7 +648,7 @@ func TestObserveReportsTheSameEndpointUpUses(t *testing.T) {
 			// The pin. Both being independently right is not enough: they must
 			// be the SAME answer, or `tinq -apply` prints an address `tinq -up`
 			// does not use.
-			opts, err := upOptions(h, m, true, status)
+			opts, err := upOptions(h, m, driverkit.Running, status)
 			if err != nil {
 				t.Fatalf("upOptions: %v", err)
 			}
@@ -694,7 +705,7 @@ func TestUpOptions(t *testing.T) {
 	m := &unstructured.Unstructured{Object: obj}
 	m.SetUID("bootstrap-default-cp0")
 
-	opts, err := upOptions(d, m, false, nil)
+	opts, err := upOptions(d, m, driverkit.Absent, nil)
 	if err != nil {
 		t.Fatalf("upOptions: %v", err)
 	}
@@ -749,7 +760,7 @@ func TestUpOptionsAdoptsAnAlreadyRunningVM(t *testing.T) {
 	m := &unstructured.Unstructured{Object: obj}
 	m.SetUID("bootstrap-default-cp0")
 
-	opts, err := upOptions(d, m, true, map[string]interface{}{"pid": int64(4242)})
+	opts, err := upOptions(d, m, driverkit.Running, map[string]interface{}{"pid": int64(4242)})
 	if err != nil {
 		t.Fatalf("upOptions: %v", err)
 	}
@@ -762,6 +773,52 @@ func TestUpOptionsAdoptsAnAlreadyRunningVM(t *testing.T) {
 	}
 	if pid != 4242 {
 		t.Errorf("Boot returned pid %d, want the running VM's 4242", pid)
+	}
+}
+
+// A STOPPED machine must NOT be adopted, and this is the sharp edge of the
+// tri-state change.
+//
+// The adopt test is `state == Running`, and the tempting widening —
+// `state != Absent` — is a hang, not a misprint. A stopped machine has disks
+// and no process, so Observe's status is {stateDir} with no pid at all:
+// toInt(nil) is 0, Boot would hand cluster.Up a VM whose process does not
+// exist, qemu would never be started, and the bring-up would sit out its whole
+// maintenance budget against an address nothing is listening on before failing
+// with a timeout that blames the node.
+//
+// Detect fails here on purpose. It is the cheapest observable proof that Boot
+// took the create() branch rather than the adopt one: an error means it tried
+// to start a VM, nil would mean it adopted a pid that is not there.
+func TestUpOptionsDoesNotAdoptAStoppedVM(t *testing.T) {
+	imageRoot := t.TempDir()
+	writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
+	d := &hvf{
+		stateRoot: t.TempDir(),
+		imageRoot: imageRoot,
+		detect: func() (*platform.Platform, error) {
+			return nil, fmt.Errorf("no accelerator on this host")
+		},
+	}
+
+	var obj map[string]interface{}
+	if err := yaml.Unmarshal([]byte(machineDoc), &obj); err != nil {
+		t.Fatal(err)
+	}
+	m := &unstructured.Unstructured{Object: obj}
+	m.SetUID("bootstrap-default-cp0")
+
+	// Exactly what Observe returns for Stopped: a state dir and NO pid.
+	opts, err := upOptions(d, m, driverkit.Stopped, map[string]interface{}{"stateDir": d.dir(m)})
+	if err != nil {
+		t.Fatalf("upOptions: %v", err)
+	}
+
+	pid, err := opts.Boot()
+	if err == nil {
+		t.Fatalf("Boot on a STOPPED machine returned pid %d and no error: it adopted a "+
+			"process that does not exist instead of starting qemu, and the bring-up "+
+			"below it would wait out its whole maintenance budget", pid)
 	}
 }
 
@@ -846,31 +903,26 @@ func TestUpRefusesAnUnresolvableImage(t *testing.T) {
 func TestDestroyNeedsNoAcceleratorAndNoNode(t *testing.T) {
 	d, path := upFixture(t, machineDoc)
 
-	// A LIVE process standing in for qemu, so this is the real teardown path
-	// and not the trivially-absent one. It is killed by Destroy; the sleep is
-	// only long enough that it cannot exit on its own first.
-	vm := exec.Command("sleep", "60")
-	if err := vm.Start(); err != nil {
-		t.Skipf("cannot start a stand-in process: %v", err)
-	}
-	// Reaped in the background: qemu is daemonized and is nobody's child, but
-	// this stand-in IS ours, and an unreaped zombie still answers kill(pid, 0)
-	// — which would make destroy's liveness loop spend its whole five seconds
-	// waiting for a process that already died.
-	reaped := make(chan struct{})
-	go func() { _, _ = vm.Process.Wait(); close(reaped) }()
-	t.Cleanup(func() { _ = vm.Process.Kill(); <-reaped })
-
 	dir := filepath.Join(d.stateRoot, "testsite", "bootstrap-default-cp0")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A LIVE process standing in for qemu, so this is the real teardown path
+	// and not the trivially-absent one. It has to be a DECOY carrying the
+	// state dir in its argv, not any old `sleep`: destroy signals nothing it
+	// cannot prove is this machine's qemu, so an unrelated process would be
+	// left alone and the ladder would never be entered.
+	pid := startDecoy(t, dir)
+
 	// The bring-up artifacts. They live in the state dir precisely so teardown
 	// sweeps them and the cluster's secrets do not outlive the cluster.
-	for _, name := range []string{"qemu.pid", "talosconfig", "kubeconfig", "secrets.yaml", "controlplane.yaml"} {
+	// system.qcow2 is among them because Observe keys Absent on it: without a
+	// disk this machine reads as already gone and `destroy` returns before
+	// touching anything.
+	for _, name := range []string{"qemu.pid", "system.qcow2", "talosconfig", "kubeconfig", "secrets.yaml", "controlplane.yaml"} {
 		body := "secret"
 		if name == "qemu.pid" {
-			body = fmt.Sprint(vm.Process.Pid)
+			body = fmt.Sprint(pid)
 		}
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
@@ -878,9 +930,12 @@ func TestDestroyNeedsNoAcceleratorAndNoNode(t *testing.T) {
 	}
 
 	if err := standalone(context.Background(), d, path, "destroy"); err != nil {
-		t.Fatalf("-destroy must work with no accelerator and no reachable node: %v", err)
+		t.Fatalf("destroy must work with no accelerator and no reachable node: %v", err)
 	}
 
+	if platform.ProcessMatches(pid, dir) {
+		t.Errorf("process %d survived destroy", pid)
+	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("the state dir survived -destroy (%v)\n"+
 			"  reason: the generated talosconfig, kubeconfig and secrets bundle live in it, and "+
@@ -899,5 +954,429 @@ func TestEnsureEFIVarsMissingTemplate(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "absent.fd") {
 		t.Errorf("error must name the template, got: %v", err)
+	}
+}
+
+// ── power state: Absent, Stopped, Running ───────────────────────────────────
+
+// testMachine builds the minimum CR that dir() keys on: site and UID are the
+// two path components, so a machine missing either would collide with another.
+func testMachine(t *testing.T, site, uid string) *unstructured.Unstructured {
+	t.Helper()
+	m := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "machine.hvf.fleet.io/v1alpha1",
+		"kind":       "TalosMachine",
+		"metadata":   map[string]interface{}{"name": "t", "namespace": "default"},
+		"spec":       map[string]interface{}{"site": site},
+	}}
+	m.SetUID(types.UID(uid))
+	return m
+}
+
+func TestObserveReportsAbsentWithoutSystemDisk(t *testing.T) {
+	dir := t.TempDir()
+	h := &hvf{stateRoot: dir}
+	m := testMachine(t, "site-a", "uid-1")
+
+	state, _, err := h.Observe(context.Background(), m)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if state != driverkit.Absent {
+		t.Fatalf("Observe = %v, want Absent when system.qcow2 is missing", state)
+	}
+}
+
+func TestObserveReportsAbsentWhenDirExistsButDiskDoesNot(t *testing.T) {
+	// A create that died before qemu-img leaves the dir and no disk. Keying
+	// Absent on the dir would read Stopped here and Create would never retry.
+	root := t.TempDir()
+	h := &hvf{stateRoot: root}
+	m := testMachine(t, "site-a", "uid-1")
+	if err := os.MkdirAll(h.dir(m), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := h.Observe(context.Background(), m)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if state != driverkit.Absent {
+		t.Fatalf("Observe = %v, want Absent: dir exists but system.qcow2 does not", state)
+	}
+}
+
+func TestObserveReportsStoppedWhenDisksExistButNoProcess(t *testing.T) {
+	root := t.TempDir()
+	h := &hvf{stateRoot: root}
+	m := testMachine(t, "site-a", "uid-1")
+
+	dir := h.dir(m)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "system.qcow2"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A pidfile naming a pid that is alive but is NOT our qemu: this test binary.
+	// Before ProcessMatches this reported Running, which is the bug.
+	if err := os.WriteFile(filepath.Join(dir, "qemu.pid"),
+		[]byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, _, err := h.Observe(context.Background(), m)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if state != driverkit.Stopped {
+		t.Fatalf("Observe = %v, want Stopped: the live pid is not this machine's qemu", state)
+	}
+}
+
+// destroy must not signal a pid it has not proven is this machine's qemu. The
+// pidfile below names THIS TEST BINARY — alive and signalable, like the
+// low-numbered stranger a reallocated pid hands you after a host reboot. An
+// ungated SIGTERM therefore kills the test run outright rather than reporting a
+// failure, which is the honest blast radius: on a real host it is another
+// machine's qemu that dies.
+func TestDestroyDoesNotSignalAPidItCannotProveIsOurs(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "site-a", "uid-1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "qemu.pid"),
+		[]byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := destroy(dir); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	// Still idempotent: an unkillable pid must not stop the sweep.
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("state dir must be gone, stat = %v", err)
+	}
+}
+
+func TestStopIsIdempotentOnAnAbsentMachine(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir()}
+	m := testMachine(t, "site-a", "uid-1")
+	if err := h.Stop(context.Background(), m); err != nil {
+		t.Fatalf("Stop on an absent machine = %v, want nil (idempotent)", err)
+	}
+}
+
+func TestStopIsIdempotentOnAStoppedMachine(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir()}
+	m := testMachine(t, "site-a", "uid-1")
+	dir := h.dir(m)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "system.qcow2"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Stop(context.Background(), m); err != nil {
+		t.Fatalf("Stop on a stopped machine = %v, want nil (idempotent)", err)
+	}
+}
+
+// startDecoy launches a live process whose argv carries dir, so
+// platform.ProcessMatches accepts it as this machine's qemu.
+//
+// That is the only way to reach Stop's signal ladder without a hypervisor:
+// Observe reports Running solely on a VERIFIED process, so a fabricated pidfile
+// naming some unrelated pid reads Stopped and the ladder is never entered.
+//
+// The `while` loop is not decoration. `sh -c 'sleep 30' X` is a single simple
+// command, which every real sh optimises into an exec: the shell replaces itself
+// with sleep and the dir token disappears from argv. ProcessMatches would then
+// report false and the caller would silently test nothing.
+//
+// The argv carries a path UNDER dir rather than the bare dir, because that is
+// what qemu carries (-pidfile <dir>/qemu.pid) and ProcessMatches matches at the
+// path boundary. A bare dir would no longer match, and every test resting on
+// this decoy would pass vacuously by never entering the ladder at all.
+func startDecoy(t *testing.T, dir string) int {
+	t.Helper()
+	return startDecoyRunning(t, dir, "while :; do sleep 1; done")
+}
+
+// startDecoyRunning is startDecoy with the shell script under the caller's
+// control, so a test can make the decoy IGNORE SIGTERM. Args after the script
+// are the shell's $0, $1, ...; the state-dir path goes last, where it is inert.
+func startDecoyRunning(t *testing.T, dir, script string, extra ...string) int {
+	t.Helper()
+	args := append([]string{"-c", script, "qemu-decoy"}, extra...)
+	args = append(args, "-pidfile", filepath.Join(dir, "qemu.pid"))
+	cmd := exec.Command("sh", args...)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Reap it however the test ends. A decoy that outlives a failing test is a
+	// stray process on someone's laptop, spinning until they notice.
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	// Wait for the argv to become VISIBLE, which is not the same as the process
+	// existing. cmd.Start returns once exec has succeeded, but the kernel
+	// publishes the new mm's arg_start/arg_end a moment later, so
+	// /proc/<pid>/cmdline reads EMPTY for a short window and ProcessMatches
+	// reports false for a live process that is genuinely ours. Observed here as
+	// a ~1-in-4 flake before this loop existed.
+	//
+	// This is synchronisation, not a workaround: the decoy stands in for a qemu
+	// that has been up for a while, and a half-exec'd process is not that.
+	//
+	// The window is real, and closing it in ProcessMatches is DEFERRED, not
+	// impossible — the difference matters, because "impossible" would stop
+	// anyone from trying. A fresh exec and a ZOMBIE are indistinguishable on
+	// the command line (measured: both give a zero-length cmdline with a nil
+	// error), but not on process state: /proc/<pid>/stat field 3 reads R for
+	// the one and Z for the other, and darwin's `ps -o state=` draws the same
+	// line. What blocks the fix is semantics, not capability. Reading an empty
+	// cmdline as "gone" is exactly what stops destroy's wait from burning its
+	// full deadline and then SIGKILLing a corpse, so teaching ProcessMatches
+	// about process state changes the answer that wait loop depends on. That
+	// is a design decision, not a patch, and it is left to whoever needs it.
+	pid := cmd.Process.Pid
+	deadline := time.Now().Add(2 * time.Second)
+	for !platform.ProcessMatches(pid, dir) {
+		if time.Now().After(deadline) {
+			t.Fatalf("decoy %d never carried %q in its argv, so nothing below is exercised", pid, dir)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return pid
+}
+
+// startStubbornDecoy is startDecoy that REFUSES to die on SIGTERM, and records
+// having received it by touching marker.
+//
+// An ordinary decoy dies on either signal, which makes the rungs of the ladder
+// mutually redundant: delete the SIGKILL and SIGTERM still ends it, delete the
+// SIGTERM and SIGKILL still ends it, shrink the budget to a nanosecond and it
+// still ends. Four independent mutations all left the suite green. Only a
+// process that SIGTERM cannot kill separates the rungs, and only the marker
+// proves the first rung was ever climbed rather than skipped.
+//
+// The trap fires after the running `sleep` returns, so the marker appears
+// within about a second — an order of magnitude inside the 5s budget, which is
+// what keeps this an assertion rather than a race.
+//
+// Waiting for argv to become visible is NOT enough here, and the difference is
+// a real race that was observed, not anticipated: the kernel publishes argv at
+// exec, which is before the shell has parsed and run `trap`. A SIGTERM landing
+// in that window takes the default action and the decoy dies on the first rung
+// — the test then reports "halt skipped SIGTERM" for a halt that did send it.
+// So the script announces the installed trap by touching a ready file, and the
+// helper blocks on that. Observable readiness, not a sleep.
+func startStubbornDecoy(t *testing.T, dir, marker string) int {
+	t.Helper()
+	ready := marker + ".ready"
+	pid := startDecoyRunning(t, dir,
+		`trap 'touch "$2"' TERM; touch "$1"; while :; do sleep 1; done`, ready, marker)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			return pid
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("decoy %d never installed its SIGTERM trap; it would die on the first rung "+
+				"and the escalation below would never be exercised", pid)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// The escalation ladder itself: SIGTERM first, the full budget, then SIGKILL.
+//
+// Every assertion below pins a rung a mutation was observed to survive:
+//   - the marker pins that SIGTERM is SENT (delete it and SIGKILL still works)
+//   - the elapsed floor pins the BUDGET (set sigtermTimeout to 1ns and the
+//     process still dies, just instantly)
+//   - the nil error and the identity check pin SIGKILL (delete it and a
+//     SIGTERM-proof process is never stopped at all)
+//
+// Parallel with the destroy case below so the two 5s waits overlap: the ladder
+// costs the suite one budget, not two.
+func TestHaltEscalatesToSIGKILLWhenSIGTERMIsIgnored(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "sigterm-received")
+	pid := startStubbornDecoy(t, dir, marker)
+
+	start := time.Now()
+	err := halt(pid, dir)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("halt = %v, want nil: SIGKILL must end a process SIGTERM cannot", err)
+	}
+
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Errorf("the decoy never received SIGTERM (%v): halt skipped the graceful rung "+
+			"and went straight to SIGKILL, which is the silent-hard-kill this ladder exists to avoid", statErr)
+	}
+	if elapsed < sigtermTimeout {
+		t.Errorf("halt returned after %v, inside the %v SIGTERM budget: it escalated without "+
+			"giving the process its time to exit cleanly", elapsed, sigtermTimeout)
+	}
+	if platform.ProcessMatches(pid, dir) {
+		t.Errorf("process %d is still this machine's qemu after %v: the ladder never reached SIGKILL",
+			pid, elapsed)
+	}
+}
+
+// destroy climbs the SAME ladder. Pinned separately because the two used to be
+// two copies of it — one gated on ProcessMatches, one not — and that
+// divergence is exactly how an ungated first signal survives review. If a
+// future edit re-inlines a private loop here, this fails.
+//
+// The marker lives OUTSIDE the state dir on purpose: destroy deletes the dir,
+// so a marker inside it would be swept before it could be read.
+func TestDestroyEscalatesToSIGKILLAndStillSweepsTheState(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	marker := filepath.Join(root, "sigterm-received")
+	dir := filepath.Join(root, "site-a", "uid-1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pid := startStubbornDecoy(t, dir, marker)
+	if err := os.WriteFile(filepath.Join(dir, "qemu.pid"),
+		[]byte(strconv.Itoa(pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if err := destroy(dir); err != nil {
+		t.Fatalf("destroy = %v, want nil", err)
+	}
+	elapsed := time.Since(start)
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the decoy never received SIGTERM (%v): destroy skipped the first rung", err)
+	}
+	if elapsed < sigtermTimeout {
+		t.Errorf("destroy returned after %v, inside the %v SIGTERM budget", elapsed, sigtermTimeout)
+	}
+	if platform.ProcessMatches(pid, dir) {
+		t.Errorf("process %d survived destroy: the ladder never reached SIGKILL", pid)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("state dir must be gone, stat = %v", err)
+	}
+}
+
+// The ladder with a real process on the end of it, and the property that is the
+// entire reason Stop is not Destroy: the disks survive.
+//
+// The two idempotence tests above return before signalling anything, so without
+// this one every line of the escalation is unexecuted code.
+func TestStopHaltsAVerifiedProcessAndKeepsTheDisks(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir()}
+	m := testMachine(t, "site-a", "uid-1")
+	dir := h.dir(m)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(dir, "system.qcow2")
+	if err := os.WriteFile(disk, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pid := startDecoy(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, "qemu.pid"),
+		[]byte(strconv.Itoa(pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A precondition, not a restatement: if this is not Running then Stop takes
+	// its early return and every assertion below passes for the wrong reason.
+	if state, _, err := h.Observe(context.Background(), m); err != nil || state != driverkit.Running {
+		t.Fatalf("Observe = %v, %v before Stop; want Running or the ladder is never entered", state, err)
+	}
+
+	if err := h.Stop(context.Background(), m); err != nil {
+		t.Fatalf("Stop = %v, want nil", err)
+	}
+	if platform.ProcessMatches(pid, dir) {
+		t.Errorf("process %d is still this machine's qemu; Stop did not halt it", pid)
+	}
+	if _, err := os.Stat(disk); err != nil {
+		t.Errorf("Stop must KEEP the disks — that is what separates it from Destroy: %v", err)
+	}
+	// Stopped, not Absent: the machine is still there, it is just not running.
+	// This is the state the controller holds a powerState: Stopped machine in.
+	state, _, err := h.Observe(context.Background(), m)
+	if err != nil {
+		t.Fatalf("Observe after Stop: %v", err)
+	}
+	if state != driverkit.Stopped {
+		t.Fatalf("Observe after Stop = %v, want Stopped", state)
+	}
+}
+
+// kill(0, sig) is NOT a no-op: POSIX sends the signal to every process in the
+// CALLER's process group. readPid returns 0 for a pidfile that has vanished —
+// which a concurrent destroy causes, since it removes the whole state dir — so
+// an ungated ladder would SIGTERM and then SIGKILL tinq and everything sharing
+// its group.
+//
+// There is no assertion for that beyond survival, and the blast radius is
+// wider than one process: drop the guard and kill(0, sig) takes the whole
+// PROCESS GROUP — this test binary, the `go test` that spawned it, and
+// anything else sharing that group — mid-run. That is strictly wider than
+// TestDestroyDoesNotSignalAPidItCannotProveIsOurs above, which names a single
+// pid and so kills exactly one process. Recorded here because the symptom is a
+// CI job that dies without a failing test to explain it, and this file is
+// where someone bisecting that will end up.
+func TestHaltRefusesToSignalPidZero(t *testing.T) {
+	if err := halt(0, t.TempDir()); err != nil {
+		t.Fatalf("halt(0, dir) = %v, want nil", err)
+	}
+}
+
+// halt's FIRST signal must be gated too, not just the escalation.
+//
+// The pid below is live, signalable, and not ours — the low-numbered stranger a
+// recycled pid hands you after a host reboot, and on a real host plausibly
+// another machine's qemu. Stop reaches here with a pid it re-read from the
+// pidfile rather than the one Observe verified, and the likeliest graceful
+// failure is an error CAUSED by the guest going away, so this is the ordinary
+// path, not a corner.
+//
+// Measured against the ungated version: halt returned nil in ~10µs having
+// SIGTERMed the stranger — and reported SUCCESS, because waitGone read the
+// non-match as "gone". A caller could not have noticed.
+//
+// Liveness is read from Wait, not kill(pid,0): the stranger is our child, so a
+// dead one lingers as a ZOMBIE that kill(pid,0) calls alive. Wait is the only
+// reading that tells "still running" from "we just killed it".
+func TestHaltRefusesToSignalAPidItCannotProveIsOurs(t *testing.T) {
+	dir := t.TempDir() // nothing anywhere carries this token
+
+	stranger := exec.Command("sh", "-c", "while :; do sleep 1; done")
+	if err := stranger.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := stranger.Process.Pid
+	defer func() { _ = stranger.Process.Kill() }()
+
+	died := make(chan struct{})
+	go func() { _ = stranger.Wait(); close(died) }()
+
+	// Guard against a vacuous pass: if the stranger already matched, halt would
+	// be right to signal it and the assertion below would prove nothing.
+	if platform.ProcessMatches(pid, dir) {
+		t.Fatalf("fixture is wrong: stranger %d matches %q", pid, dir)
+	}
+
+	if err := halt(pid, dir); err != nil {
+		t.Fatalf("halt on an unprovable pid = %v, want nil", err)
+	}
+	select {
+	case <-died:
+		t.Fatalf("halt signalled pid %d, which it never proved was this machine's qemu", pid)
+	case <-time.After(300 * time.Millisecond):
 	}
 }

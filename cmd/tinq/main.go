@@ -123,9 +123,10 @@ func newRootCmd() *cobra.Command {
 			detect: sync.OnceValues(platform.Detect)}, nil
 	}
 
-	// The three standalone verbs are the SAME code path with a different word:
-	// standalone() decides, and it runs the identical Observe/Create/Destroy the
-	// controller loop uses. Two ways to build a machine would drift.
+	// The standalone verbs are the SAME code path with a different word:
+	// standalone() decides, and it runs the identical
+	// Observe/Create/Stop/Destroy the controller loop uses. Two ways to build a
+	// machine would drift.
 	runVerb := func(verb string) func(*cobra.Command, []string) error {
 		return func(cmd *cobra.Command, args []string) error {
 			d, err := newDriver()
@@ -152,7 +153,10 @@ func newRootCmd() *cobra.Command {
 		Use:   "destroy <machine.yaml>",
 		Short: "Destroy the VM and its whole state directory, then exit",
 		Long: "Takes the entire SCC: the qemu process and everything in the state\n" +
-			"directory. Idempotent — already-gone is success. Works with no usable\n" +
+			"directory. NOT RECOVERABLE — the installed OS and any PVCs go with it;\n" +
+			"`tinq stop` is the verb that keeps them.\n\n" +
+			"Idempotent — already-gone is success, and a merely stopped machine is\n" +
+			"destroyed too, since it still has disks to sweep. Works with no usable\n" +
 			"accelerator and no reachable node: teardown must not require a live\n" +
 			"hypervisor.",
 		Args: cobra.ExactArgs(1),
@@ -197,13 +201,23 @@ func newRootCmd() *cobra.Command {
 }
 
 // standalone runs one CR through the Driver with no control plane. It is
-// deliberately thin: decode, Observe, then Create or Destroy. Every decision
-// about WHAT a machine is stays in the driver, so bootstrap and steady state
-// cannot disagree.
+// deliberately thin: decode, Observe, then Create, Stop or Destroy. Every
+// decision about WHAT a machine is stays in the driver, so bootstrap and steady
+// state cannot disagree.
 //
-// Create is skipped when Observe reports present, which is the same
-// already-exists rule the controller applies — so re-running is safe and does
-// not start a second qemu against the same state dir.
+// Create is skipped only when Observe reports Running, so re-running is safe
+// and does not start a second qemu against the same state dir. Stopped falls
+// through to Create, because there is no live process to collide with and
+// Create reuses the disks.
+//
+// That is NOT the controller's rule, and the difference is user-visible:
+// standalone always drives toward Running and NEVER READS spec.powerState. A
+// manifest carrying powerState: Stopped boots here — a valid value, silently
+// ignored — whereas the controller feeds it to plan and converges on it.
+// Deliberate: this is the bootstrap path, run before any control plane exists
+// to hold the desired state, and its one job is to get a node up. Once the
+// controller owns the resource it reconciles powerState normally. `tinq stop`
+// is the verb that halts a machine on this path.
 func standalone(ctx context.Context, d *hvf, path, verb string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -222,22 +236,25 @@ func standalone(ctx context.Context, d *hvf, path, verb string) error {
 		m.SetUID(types.UID(fmt.Sprintf("bootstrap-%s-%s", m.GetNamespace(), m.GetName())))
 	}
 
-	exists, status, err := d.Observe(ctx, m)
+	state, status, err := d.Observe(ctx, m)
 	if err != nil {
 		return fmt.Errorf("observe: %w", err)
 	}
 
 	switch verb {
 	case "destroy":
-		if !exists {
+		// Stopped is destroyed along with Running: a machine that is merely
+		// stopped still has disks and a state dir to sweep, and skipping it is
+		// exactly the residue the SCC rule forbids.
+		if state == driverkit.Absent {
 			log.Printf("already gone: %s", d.dir(m))
 			return nil
 		}
 		return d.Destroy(ctx, m)
 	case "up":
-		return bringUp(ctx, d, m, exists, status)
+		return bringUp(ctx, d, m, state, status)
 	default:
-		if exists {
+		if state == driverkit.Running {
 			log.Printf("already running: %v", status)
 			return nil
 		}
@@ -300,9 +317,9 @@ func kubeEndpoint(m *unstructured.Unstructured) string {
 
 // bringUp is the -up verb: create (or adopt) the VM, then hand everything after
 // that to cluster.Up, which owns all ten steps and every line of output.
-func bringUp(ctx context.Context, d *hvf, m *unstructured.Unstructured, exists bool,
+func bringUp(ctx context.Context, d *hvf, m *unstructured.Unstructured, state driverkit.State,
 	status map[string]interface{}) error {
-	opts, err := upOptions(d, m, exists, status)
+	opts, err := upOptions(d, m, state, status)
 	if err != nil {
 		return err
 	}
@@ -321,7 +338,7 @@ func bringUp(ctx context.Context, d *hvf, m *unstructured.Unstructured, exists b
 // second way to build a machine. What is HERE is only the translation, and
 // package main is the only place that can do it — the serials, the qemu
 // forwards and the profile resolution are all its.
-func upOptions(d *hvf, m *unstructured.Unstructured, exists bool,
+func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 	status map[string]interface{}) (cluster.UpOptions, error) {
 	spec, _, _ := unstructured.NestedMap(m.Object, "spec")
 
@@ -346,11 +363,19 @@ func upOptions(d *hvf, m *unstructured.Unstructured, exists bool,
 		DataDiskSerial:   dataDiskSerial(spec),
 		Detect:           d.detect,
 		Boot: func() (int, error) {
-			// The same already-exists rule -apply applies, and it is what
-			// makes `-apply` then `-up` work: a VM already sitting in
+			// The same already-running rule `apply` applies, and it is what
+			// makes `apply` then `up` work: a VM already sitting in
 			// maintenance mode is ADOPTED, not duplicated. Starting a second
 			// qemu against one state dir would corrupt the disk it shares.
-			if exists {
+			//
+			// RUNNING, not "not Absent". Stopped MUST fall through to create:
+			// it has disks and no process, so there is no pid to adopt —
+			// status is the {stateDir} map Observe returns for a stopped
+			// machine, toInt(nil) is 0, and cluster.Up would report a VM whose
+			// process does not exist and then wait out the whole maintenance
+			// budget against an address nothing is listening on. Widening this
+			// test is a hang, not a misprint.
+			if state == driverkit.Running {
 				return toInt(status["pid"]), nil
 			}
 			return d.create(m, dir)
@@ -367,22 +392,45 @@ func (h *hvf) dir(m *unstructured.Unstructured) string {
 	return filepath.Join(h.stateRoot, driverkit.Str(m, "spec", "site"), string(m.GetUID()))
 }
 
-// Observe reads the pidfile the hypervisor itself wrote and checks LIVENESS.
-// Never trust a state file alone: talosctl's `cluster show` deserialises
-// state.yaml and reports a long-dead cluster as present.
-func (h *hvf) Observe(ctx context.Context, m *unstructured.Unstructured) (bool, map[string]interface{}, error) {
+// Observe reports what the HOST says, in three states.
+//
+// Absent is keyed on system.qcow2 rather than on the state dir, because that
+// file is exactly what create() would reuse. Both partial-failure paths then
+// land correctly with no special case: a create that died before ensureQcow2
+// leaves a dir with no disk and reads Absent, so Create retries; disks made but
+// qemu never launched reads Stopped, so Create re-execs.
+//
+// Running demands a VERIFIED process, not a live pid. Never trust a state file
+// alone — talosctl's `cluster show` deserialises state.yaml and reports a
+// long-dead cluster as present — and a pidfile is a state file too: after a
+// host reboot it can name a live stranger. Reading disk here only ever tells
+// Absent from Stopped, and neither claims the machine is usable.
+//
+// This function is READ-ONLY. Unlinking a stale pidfile here would be tidy and
+// is refused: an observer with side effects is how a status call quietly
+// becomes a mutation. qemu's -pidfile truncates on next start anyway.
+func (h *hvf) Observe(ctx context.Context, m *unstructured.Unstructured) (driverkit.State, map[string]interface{}, error) {
 	dir := h.dir(m)
-	pid := readPid(dir)
-	if pid <= 0 || !processAlive(pid) {
-		return false, nil, nil
+
+	if _, err := os.Stat(filepath.Join(dir, "system.qcow2")); err != nil {
+		if os.IsNotExist(err) {
+			return driverkit.Absent, nil, nil
+		}
+		return driverkit.Absent, nil, err
 	}
+
+	pid := readPid(dir)
+	if pid <= 0 || !platform.ProcessMatches(pid, dir) {
+		return driverkit.Stopped, map[string]interface{}{"stateDir": dir}, nil
+	}
+
 	// talosEndpoint, not a second hand-rolled scan of hostForwards: status's
 	// apiEndpoint and the endpoint -up hands cluster.Up are two answers to one
 	// question, and nothing but this shared call keeps them equal. The
 	// hand-rolled loop also reported "127.0.0.1:0" for an entry with a
 	// guestPort and no hostPort — an address, printed as status, that cannot
 	// answer.
-	return true, map[string]interface{}{
+	return driverkit.Running, map[string]interface{}{
 		"pid": int64(pid), "stateDir": dir, "apiEndpoint": talosEndpoint(m),
 	}, nil
 }
@@ -412,6 +460,129 @@ func (h *hvf) Create(ctx context.Context, m *unstructured.Unstructured) error {
 	}
 
 	return nil
+}
+
+// Stop halts the VM and leaves every artifact in place.
+//
+// The ladder is deliberate and it escalates LOUDLY. A stop that silently
+// SIGKILLs after announcing a graceful shutdown is how you find out months
+// later that none of your stops were ever clean.
+func (h *hvf) Stop(ctx context.Context, m *unstructured.Unstructured) error {
+	state, _, err := h.Observe(ctx, m)
+	if err != nil {
+		return err
+	}
+	if state != driverkit.Running {
+		return nil // already stopped, or never existed
+	}
+
+	dir := h.dir(m)
+	pid := readPid(dir)
+
+	if err := h.shutdownGuest(ctx, m); err != nil {
+		log.Printf("graceful shutdown unavailable (%v); falling back to signals", err)
+	} else if waitGone(pid, dir, gracefulStopTimeout) {
+		return nil
+	} else {
+		log.Printf("guest did not power off within %s; escalating to SIGTERM", gracefulStopTimeout)
+	}
+	return halt(pid, dir)
+}
+
+const (
+	gracefulStopTimeout = 60 * time.Second
+	sigtermTimeout      = 5 * time.Second
+)
+
+// shutdownGuest asks the GUEST to power itself off.
+//
+// DEFERRED, not blocked. It needs an authenticated Talos client, and the
+// cluster package now has one — so this is a follow-up that can be written,
+// not a hole waiting on a dependency. It is left a stub here so that change
+// arrives on its own: wiring a Talos client into Stop is a different review
+// from moving the lifecycle onto this base, and mixing them makes both harder
+// to judge. Until it lands, Stop is honest about escalating straight to
+// signals rather than pretending the guest was ever asked.
+//
+// A machine in maintenance mode will never get a graceful stop even then: it
+// cannot satisfy the mutual TLS that Shutdown requires. That is safe rather
+// than a compromise — a maintenance node is a booted ISO with no applied config
+// and nothing persistent to corrupt.
+func (h *hvf) shutdownGuest(ctx context.Context, m *unstructured.Unstructured) error {
+	return fmt.Errorf("not implemented on this branch")
+}
+
+// halt escalates signals at pid until it is no longer this machine's qemu.
+//
+// EVERY signal is gated on ProcessMatches, THE FIRST ONE INCLUDED. A pidfile
+// that outlived its qemu names a pid the kernel is free to hand to someone
+// else — after a reboot, to a low-numbered stranger, plausibly another
+// machine's qemu — and an ungated opening SIGTERM would take that process down.
+// Gating only the later rungs is not a weaker version of this rule, it is the
+// absence of it: the first signal is the one that lands.
+//
+// The window is not hypothetical even though Observe already verified the pid.
+// Stop RE-READS the pidfile rather than reusing what Observe proved, so these
+// are two different reads with a graceful-shutdown attempt in between; and the
+// most likely outcome of that attempt is an error CAUSED by the guest going
+// away (the RPC drops mid-power-off), which logs "graceful shutdown
+// unavailable" and arrives here with a pid that has just exited. That is the
+// recycled-pid case exactly, reached by the ordinary success path.
+//
+// Measured against the ungated version: halt(strangerPid, dir) returned nil in
+// ~10µs having SIGTERMed a live unrelated process — and reported success,
+// because waitGone read the non-match as "gone".
+//
+// The pid gate is not redundant with it. kill(0, sig) is NOT a no-op: POSIX
+// sends the signal to every process in OUR OWN process group. readPid reports 0
+// for a pidfile that has gone — which a concurrent destroy causes, since it
+// removes the whole state dir — so the pid can become 0 between reads and an
+// ungated ladder would SIGTERM and then SIGKILL tinq itself.
+//
+// The gate is <= 0, not == 0, and the negative half earns its place: readPid
+// runs the pidfile through strconv.Atoi, so a corrupt or partially written one
+// reading "-1" yields a NEGATIVE pid rather than a parse failure. kill(-1, sig)
+// is strictly worse than kill(0, sig) — it signals every process the caller has
+// permission to signal, not merely its own process group. ProcessMatches covers
+// both cases, but it does not EXPLAIN them, and a future reader deleting the
+// comparison as dead code is the failure this paragraph prevents.
+func halt(pid int, dir string) error {
+	if pid <= 0 || !platform.ProcessMatches(pid, dir) {
+		return nil
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	if waitGone(pid, dir, sigtermTimeout) {
+		return nil
+	}
+	log.Printf("process %d survived SIGTERM after %s; escalating to SIGKILL", pid, sigtermTimeout)
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+
+	if !waitGone(pid, dir, sigtermTimeout) {
+		return fmt.Errorf("process %d survived SIGKILL", pid)
+	}
+	return nil
+}
+
+// waitGone polls until the process is no longer OUR qemu, or the deadline
+// passes. It re-checks identity rather than mere liveness, so a pid recycled
+// mid-wait cannot read as "still running".
+//
+// Identity is also what gets this right for a ZOMBIE, which kill(pid, 0) calls
+// alive: a zombie's command line is empty, so it matches nothing and the wait
+// ends at once instead of burning the full deadline and then SIGKILLing a
+// corpse. That trade is paid knowingly, and destroy pays it too now that it
+// shares this loop: on darwin ProcessMatches forks `ps`, ten times a second
+// for as long as the wait runs — up to 51 forks across a full 5s deadline,
+// where a plain liveness check was a single syscall.
+func waitGone(pid int, dir string, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if !platform.ProcessMatches(pid, dir) {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return !platform.ProcessMatches(pid, dir)
 }
 
 // Destroy takes the WHOLE SCC: the process (which sweeps everything inside the
@@ -674,16 +845,27 @@ func ensureQcow2(path, size string) error {
 
 // destroy is idempotent — it is called on every delete tick until it succeeds.
 func destroy(dir string) error {
-	if b, err := os.ReadFile(filepath.Join(dir, "qemu.pid")); err == nil {
-		if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
-			_ = syscall.Kill(pid, syscall.SIGTERM)
-			for i := 0; i < 50 && processAlive(pid); i++ {
-				time.Sleep(100 * time.Millisecond)
-			}
-			if processAlive(pid) {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
+	// Destroy does NOT ask the guest to shut down, and that is deliberate: the
+	// disks are deleted immediately below, so a clean shutdown buys nothing and
+	// costs up to a minute. The asymmetry with Stop is the entire point of
+	// having both — an unexplained asymmetry reads as an oversight, so this
+	// says it out loud.
+	//
+	// The ladder is halt's, not a second copy of it.
+	//
+	// This used to be an inline 50 x 100ms loop over a bare kill(pid, 0) — the
+	// same 5s semantics halt spells out, written a second time — and the two
+	// copies DIVERGED exactly where it hurts: this one signalled whatever the
+	// pidfile named, gating nothing. The rule that every signal is gated on
+	// ProcessMatches, THE FIRST ONE INCLUDED, is stated on halt now and kept
+	// where the signals are, so no caller can route around it and no second
+	// copy can drift away from it again.
+	if err := halt(readPid(dir), dir); err != nil {
+		// Not fatal, and the asymmetry is the point: destroy is called on every
+		// delete tick until it succeeds, so a process we could not kill must
+		// not stop the sweep. Leaving the disks behind forever is the worse
+		// outcome, and the escalation already logged why it got here.
+		log.Printf("destroy: %v; removing state anyway", err)
 	}
 	if err := os.RemoveAll(dir); err != nil {
 		return err
