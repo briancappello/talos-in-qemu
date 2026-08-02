@@ -153,9 +153,13 @@ func newRootCmd() *cobra.Command {
 		Use:   "stop <machine.yaml>",
 		Short: "Halt the VM but KEEP its disks, then exit",
 		Long: "A shutdown, not a teardown. The installed OS and any PVCs survive, and\n" +
-			"`tinq apply` starts the machine again from the same disks — that\n" +
-			"distinction is the only reason this exists beside `destroy`. Idempotent:\n" +
-			"already stopped, or never created, is success.\n\n" +
+			"`tinq up` starts the machine again from the same disks — that distinction\n" +
+			"is the only reason this exists beside `destroy`. Idempotent: already\n" +
+			"stopped, or never created, is success.\n\n" +
+			"`up` is the verb that brings a stopped machine back to a Ready cluster: it\n" +
+			"is idempotent, and it skips the steps this machine has already passed\n" +
+			"rather than sending it back through maintenance mode, which the installed\n" +
+			"system never re-enters. (`tinq apply` starts the VM too, and stops there.)\n\n" +
 			"A bootstrapped machine is asked to power itself off over the Talos API,\n" +
 			"so its filesystem is quiesced. A machine still in maintenance mode has no\n" +
 			"talosconfig to ask with, and QEMU is signalled instead (SIGTERM, then\n" +
@@ -186,7 +190,10 @@ func newRootCmd() *cobra.Command {
 		Long: "apply, plus the Talos side: machine config, install, bootstrap,\n" +
 			"kubeconfig, and storage — one command from a TalosMachine to a Ready\n" +
 			"node.\n\nThe VM half is byte-for-byte what `apply` builds; this adds the\n" +
-			"cluster on top.",
+			"cluster on top.\n\nIdempotent, and safe to re-run: a machine that has\n" +
+			"already been configured skips config generation and apply-config, and a\n" +
+			"bootstrap the node refuses because etcd exists is a success. That is also\n" +
+			"how you restart a machine halted with `tinq stop`.",
 		Args: cobra.ExactArgs(1),
 		RunE: runVerb("up"),
 	}

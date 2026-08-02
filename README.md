@@ -171,6 +171,7 @@ Four ways to reconcile it:
 # BOOTSTRAP: one machine from a file, no control plane needed
 tinq apply   machine.yaml    # a booted VM in maintenance mode, nothing more
 tinq up      machine.yaml    # apply, then all the way to a Kubernetes cluster
+                             # idempotent: also how you restart a stopped machine
 tinq stop    machine.yaml    # halt the VM, KEEP its disks
 tinq destroy machine.yaml    # halt the VM, DELETE its disks
 
@@ -179,8 +180,9 @@ kubectl apply -f crd/talosmachine.yaml
 tinq controller --kubeconfig ~/.kube/config
 ```
 
-`stop` is a shutdown: the installed OS and any PVCs survive, and the machine
-starts again from the same disks under `apply`. `destroy` is **not
+`stop` is a shutdown: the installed OS and any PVCs survive, and **`tinq up`
+starts the machine again** from the same disks — back to a `Ready` cluster,
+not just a booted VM. `destroy` is **not
 recoverable** — it takes the state directory, and the PVCs inside it, with it.
 That distinction is the only reason both exist; if you want the node back
 tomorrow, `stop` is the one. A machine that is merely stopped is still
@@ -222,6 +224,30 @@ Anything else would be two ways to build a machine, and they would drift.
 layout — with the Talos side driven afterwards. A VM already sitting in
 maintenance mode is *adopted*, not duplicated, so `apply` then `up` works.
 `destroy` keeps working with no hypervisor and no reachable node.
+
+`up` is also **idempotent and safe to re-run**, which is what makes `stop` then
+`up` work. It brings a machine to a running cluster from wherever it already
+is, and both questions it asks are put to the *node*, never to a file this tool
+wrote:
+
+- **Has this machine been configured?** A machine with a `talosconfig` in its
+  state directory skips config generation and `apply-config` and waits for the
+  **authenticated** API instead of the maintenance one. That file is a
+  *credential*, not a status: it is what makes the authenticated call possible
+  at all, and the answer still comes from whether the node completes the mutual
+  TLS handshake — which a node in maintenance mode cannot. Regenerating instead
+  would mint a fresh secrets bundle whose CA the installed node has never seen.
+- **Does etcd already exist?** `bootstrap` is *attempted*, and Talos's refusal
+  (`AlreadyExists`, "etcd data directory is not empty") counts as success. It is
+  asked rather than probed because there is a window — config applied, node
+  rebooted, etcd not yet bootstrapped — where the authenticated API answers and
+  etcd does not exist, and skipping bootstrap there waits forever for a node
+  that can never report `Ready`.
+
+Steps a resumed run skips are still **announced, under their own numbers**, with
+the reason. The numbering never closes up: a transcript that jumped from `4/10`
+to `8/10` would read as a bring-up that lost three steps rather than one that
+had already passed them.
 
 Once the first node is bootstrapped it can host the CRD and TinQ itself, and
 every machine after that arrives the normal way.
@@ -330,10 +356,13 @@ kubectl get nodes
 ```
 
 `up` is **bootstrap only**. It creates a cluster; it never upgrades, scales or
-reconciles one. It is also **not resumable** — a failure part way through leaves
-a running VM and a state dir, and re-running `up` waits out the maintenance
-timeout against a node that has already left maintenance mode. Recovery is
-`destroy` and try again, which is what the error tells you.
+reconciles one. It *is* **idempotent** — re-running it after a failure part way
+through is the first thing to try, and it resumes from whatever the machine
+already reached. The one failure a retry cannot repair is a config written to
+the state directory but never accepted by the node: the state dir then says
+configured while the node is still in maintenance mode, and the authenticated
+wait can only time out. That one is `tinq destroy` and try again, which is what
+the error tells you.
 
 Three probes that look right and are not, and all three shape the code above: a
 TCP connect to a forwarded port succeeds even when nothing listens in the guest
@@ -630,9 +659,12 @@ Not done yet — stated plainly rather than implied:
   against a decoy process, not a live Talos guest, and neither `tinq stop` nor
   the `Absent -> Running -> Stopped` convergence has been run against a real VM.
   Treat them as expected-to-work, not proven.
-- **`up` is bootstrap only, and not resumable.** It creates a cluster; it
-  never upgrades, scales or reconciles one, and a failure part way through is
-  recovered with `destroy` and a retry rather than by re-running `up`.
+- **`up` is bootstrap only.** It creates a cluster; it never upgrades, scales
+  or reconciles one. It is idempotent — re-running it resumes from wherever the
+  machine already is, which is how a machine halted with `stop` comes back —
+  but that idempotence is **unit-tested against the hook seam, not exercised
+  against a real stopped node**. The `stop` -> `up` round trip has never been
+  run end to end on hardware.
 - **One stderr line still interleaves with the transcript.** client-go relays
   the API server's `restricted:latest` PodSecurity *warning* during step 10,
   which reads like a failure and is not — the namespace is labelled
