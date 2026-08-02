@@ -387,6 +387,16 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		return cluster.UpOptions{}, err
 	}
 
+	// Host facts resolved HERE, because this is the layer that owns QEMU. The
+	// three values below are the node facts they imply, and the implication is
+	// only valid for a guest: the README requires the image architecture to
+	// match the host, which is what makes the host's console argument the
+	// guest's console argument. Nothing outside this function may assume it.
+	host, err := d.detect()
+	if err != nil {
+		return cluster.UpOptions{}, err
+	}
+
 	// The MACHINE's state dir, never the state root: the artifacts carry the
 	// identity they belong to, which is the property that makes -destroy sweep
 	// them. Written one level up they would outlive the cluster whose keys
@@ -395,13 +405,24 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 
 	return cluster.UpOptions{
 		ClusterName:      m.GetName(),
-		ImagePath:        image,
 		StateDir:         dir,
 		TalosEndpoint:    talosEndpoint(m),
 		KubeEndpoint:     kubeEndpoint(m),
 		SystemDiskSerial: DiskSerialSystem,
 		DataDiskSerial:   dataDiskSerial(spec),
-		Detect:           d.detect,
+
+		TalosVersion:  platform.InspectImageVersion(image),
+		VersionSource: fmt.Sprintf("%s (ISO volume id)", filepath.Base(image)),
+		Substrate:     fmt.Sprintf("%s/%s, %s, %s", host.OS, host.ImageArch, host.Accel, host.QEMUBinary),
+		ConsoleArg:    host.ConsoleArg,
+		// KEXEC IS DISABLED ON macOS/arm64 ONLY. Talos kexecs straight into the
+		// kernel it just installed; under QEMU on macOS that path dies in the
+		// guest on arm64 and the node never boots what it installed. Elsewhere
+		// it works and it is FASTER, so disabling it more widely is a tax paid
+		// for another platform's bug. Upstream gates its own workaround on the
+		// target ARCHITECTURE, so an Intel Mac has nothing to work around.
+		DisableKexec: host.OS == "darwin" && host.ImageArch == "arm64",
+
 		Boot: func() (int, error) {
 			// The same already-running rule `apply` applies, and it is what
 			// makes `apply` then `up` work: a VM already sitting in

@@ -685,16 +685,56 @@ func TestDataDiskSerial(t *testing.T) {
 	}
 }
 
+// writeISO writes the smallest file InspectImageVersion will classify: an
+// ISO9660 primary volume descriptor at sector 16 carrying Talos's volume id,
+// space-padded as the format requires.
+//
+// A junk file reads as "", and "" is also what a TalosVersion that was never
+// resolved looks like — so a fixture built from one cannot tell the version
+// being read from the field being left empty, and that field is what pins the
+// installer tag written to the node's disk.
+func writeISO(t *testing.T, path, volumeID string) {
+	t.Helper()
+	const sector = 2048
+	iso := make([]byte, 17*sector)
+	pvd := iso[16*sector:]
+	pvd[0] = 1 // primary, not just any descriptor
+	copy(pvd[1:6], "CD001")
+	for i := 40; i < 72; i++ {
+		pvd[i] = ' '
+	}
+	copy(pvd[40:72], volumeID)
+	if err := os.WriteFile(path, iso, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// fakeHost is what detect resolved. NONE of these values may be the ones this
+// test binary's own host would produce, and none of them may be equal to each
+// other: step 1's line is four host facts in a fixed order, and four values
+// that are all plausible strings is exactly the shape a swap survives.
+func fakeHost() *platform.Platform {
+	return &platform.Platform{
+		OS:         "linux",
+		QEMUBinary: "qemu-system-fake",
+		Machine:    "q35",
+		Accel:      "kvm",
+		CPU:        "host",
+		ConsoleArg: "console=ttyFAKE0",
+		ImageArch:  "amd64",
+	}
+}
+
 // Every field cluster.Up is handed, asserted without a hypervisor. Each is a
 // value that compiles just as happily wrong and is only visibly wrong minutes
 // into a bring-up.
 func TestUpOptions(t *testing.T) {
 	imageRoot := t.TempDir()
-	writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
+	writeISO(t, filepath.Join(imageRoot, "talos.iso"), "TALOS_V1_12_3")
 	root := t.TempDir()
 	d := &hvf{
 		stateRoot: root, imageRoot: imageRoot,
-		detect: func() (*platform.Platform, error) { return &platform.Platform{}, nil },
+		detect: func() (*platform.Platform, error) { return fakeHost(), nil },
 	}
 
 	var obj map[string]interface{}
@@ -716,8 +756,33 @@ func TestUpOptions(t *testing.T) {
 	if want := filepath.Join(root, "testsite", "bootstrap-default-cp0"); opts.StateDir != want {
 		t.Errorf("StateDir = %q, want %q", opts.StateDir, want)
 	}
-	if want := filepath.Join(imageRoot, "talos.iso"); opts.ImagePath != want {
-		t.Errorf("ImagePath = %q, want %q", opts.ImagePath, want)
+	// The installer tag is pinned to THIS, and it is read from the image rather
+	// than defaulted: left unset Talos substitutes the config generator's own
+	// version and a fresh install silently becomes a cross-version upgrade.
+	if opts.TalosVersion != "v1.12.3" {
+		t.Errorf("TalosVersion = %q, want the ISO volume id's v1.12.3\n"+
+			"  reason: this is written to the node's disk as the installer tag, and an empty "+
+			"one is a version Talos fills in for us", opts.TalosVersion)
+	}
+	// The version SOURCE names the image, because cluster.Up no longer has the
+	// path to name it with — and the name is the only thing in the transcript
+	// that says which of several ISOs a bring-up actually read.
+	if want := "talos.iso (ISO volume id)"; opts.VersionSource != want {
+		t.Errorf("VersionSource = %q, want %q\n"+
+			"  reason: step 2 prints this verbatim, and a bring-up that does not name its image "+
+			"cannot be told from one that read a different one", opts.VersionSource, want)
+	}
+	// Step 1's line, and it is assembled HERE because cluster.Up must not know
+	// what an accelerator is. Four host facts in a fixed order: swapped, the
+	// transcript describes a host that does not exist.
+	if want := "linux/amd64, kvm, qemu-system-fake"; opts.Substrate != want {
+		t.Errorf("Substrate = %q, want %q", opts.Substrate, want)
+	}
+	// The console arg is the HOST's, and it is a guest fact only because the
+	// README requires the image arch to match. A literal here would read
+	// correctly on amd64 and put an arm64 node's console on a UART it has not got.
+	if opts.ConsoleArg != "console=ttyFAKE0" {
+		t.Errorf("ConsoleArg = %q, want the detected host's console=ttyFAKE0", opts.ConsoleArg)
 	}
 	if opts.TalosEndpoint != "127.0.0.1:50000" {
 		t.Errorf("TalosEndpoint = %q, want 127.0.0.1:50000", opts.TalosEndpoint)
@@ -733,8 +798,58 @@ func TestUpOptions(t *testing.T) {
 	if opts.ClusterName != "cp0" {
 		t.Errorf("ClusterName = %q, want the machine's name cp0", opts.ClusterName)
 	}
-	if opts.Detect == nil || opts.Boot == nil {
-		t.Fatal("Detect and Boot must both be supplied; cluster.Up has no fallback for either")
+	if opts.Boot == nil {
+		t.Fatal("Boot must be supplied; cluster.Up has no fallback for it")
+	}
+}
+
+// The kexec workaround is a fact about the HOST, so this is where it is decided
+// — and both halves of the gate are load-bearing. Each case names the host it
+// is about rather than inheriting the one running the tests, which is the only
+// way a workaround for someone else's machine is provable from this one.
+func TestUpOptionsDisablesKexecOnAppleSiliconOnly(t *testing.T) {
+	for _, tc := range []struct {
+		os, arch string
+		want     bool
+		reason   string
+	}{
+		{"linux", "arm64", false,
+			"kexec works under KVM and skips a firmware boot; disabling it there is a tax paid for a macOS bug"},
+		{"darwin", "amd64", false,
+			"the bug is arm64's — upstream gates on TargetArch == arm64 — so an Intel Mac pays a firmware boot for nothing"},
+		{"darwin", "arm64", true,
+			"Talos kexecs into the kernel it just installed, and under QEMU on macOS that path dies in the guest on arm64"},
+	} {
+		t.Run(tc.os+"/"+tc.arch, func(t *testing.T) {
+			imageRoot := t.TempDir()
+			writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
+			d := &hvf{
+				stateRoot: t.TempDir(), imageRoot: imageRoot,
+				detect: func() (*platform.Platform, error) {
+					p := fakeHost()
+					p.OS, p.ImageArch = tc.os, tc.arch
+
+					return p, nil
+				},
+			}
+
+			var obj map[string]interface{}
+			if err := yaml.Unmarshal([]byte(machineDoc), &obj); err != nil {
+				t.Fatal(err)
+			}
+			m := &unstructured.Unstructured{Object: obj}
+			m.SetUID("bootstrap-default-cp0")
+
+			opts, err := upOptions(d, m, driverkit.Absent, nil)
+			if err != nil {
+				t.Fatalf("upOptions: %v", err)
+			}
+
+			if opts.DisableKexec != tc.want {
+				t.Errorf("DisableKexec = %v on %s/%s, want %v\n  reason: %s",
+					opts.DisableKexec, tc.os, tc.arch, tc.want, tc.reason)
+			}
+		})
 	}
 }
 
@@ -744,13 +859,14 @@ func TestUpOptions(t *testing.T) {
 func TestUpOptionsAdoptsAnAlreadyRunningVM(t *testing.T) {
 	imageRoot := t.TempDir()
 	writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
+	// The host IS probed, even for a VM already running: step 1 of the
+	// transcript is this host's facts, and cluster.Up cannot resolve them any
+	// more. What adoption forbids is STARTING a second qemu, and Boot below is
+	// what proves that — detect returning a platform is not a create().
 	d := &hvf{
 		stateRoot: t.TempDir(),
 		imageRoot: imageRoot,
-		detect: func() (*platform.Platform, error) {
-			t.Error("adopting a running VM must not probe the host or start qemu")
-			return nil, fmt.Errorf("no accelerator on this host")
-		},
+		detect:    func() (*platform.Platform, error) { return fakeHost(), nil },
 	}
 
 	var obj map[string]interface{}
@@ -787,9 +903,12 @@ func TestUpOptionsAdoptsAnAlreadyRunningVM(t *testing.T) {
 // maintenance budget against an address nothing is listening on before failing
 // with a timeout that blames the node.
 //
-// Detect fails here on purpose. It is the cheapest observable proof that Boot
-// took the create() branch rather than the adopt one: an error means it tried
-// to start a VM, nil would mean it adopted a pid that is not there.
+// create() fails here on purpose, and its failure is the cheapest observable
+// proof that Boot took the create() branch rather than the adopt one: an error
+// means it tried to start a VM, nil would mean it adopted a pid that is not
+// there. Detect can no longer be the thing that fails — upOptions needs the
+// host facts for step 1 before Boot is ever called — so the firmware template
+// is what is missing instead.
 func TestUpOptionsDoesNotAdoptAStoppedVM(t *testing.T) {
 	imageRoot := t.TempDir()
 	writeSized(t, filepath.Join(imageRoot, "talos.iso"), 4096, 'I')
@@ -797,7 +916,10 @@ func TestUpOptionsDoesNotAdoptAStoppedVM(t *testing.T) {
 		stateRoot: t.TempDir(),
 		imageRoot: imageRoot,
 		detect: func() (*platform.Platform, error) {
-			return nil, fmt.Errorf("no accelerator on this host")
+			p := fakeHost()
+			p.FirmwareVars = filepath.Join(t.TempDir(), "absent-nvram-template.fd")
+
+			return p, nil
 		},
 	}
 
@@ -837,9 +959,12 @@ func TestResolveImageRequiresAProfile(t *testing.T) {
 
 // upFixture writes a CR to disk and returns a driver whose Detect FAILS.
 //
-// That is the assertion, not the setup: every refusal below has to happen
-// before any host probing, because a machine that cannot be reached is a
-// machine that should never have been created.
+// That is the assertion, not the setup: teardown and an unresolvable image
+// profile must both be settled before any host probing, because a machine that
+// was never going to be created should not need a working hypervisor to say so.
+//
+// The endpoint refusals are the one exception and they override this — see
+// TestUpRefusesAMachineWithNoForwardedEndpoint for why.
 func upFixture(t *testing.T, doc string) (*hvf, string) {
 	t.Helper()
 	imageRoot := t.TempDir()
@@ -872,6 +997,12 @@ func TestUpRefusesAMachineWithNoForwardedEndpoint(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, path := upFixture(t, tc.doc)
+			// The endpoint refusal is cluster.Up's, and cluster.Up is reached
+			// only once UpOptions is built — which now needs this host's facts
+			// for step 1's line. So this one refusal lands AFTER the probe,
+			// and upFixture's failing detect would report the wrong problem.
+			d.detect = func() (*platform.Platform, error) { return fakeHost(), nil }
+
 			err := standalone(context.Background(), d, path, "up")
 			if err == nil {
 				t.Fatal("-up ran against a machine with no forwarded endpoint")

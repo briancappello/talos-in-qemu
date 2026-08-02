@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coglative/talos-in-qemu/platform"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -61,10 +60,9 @@ const (
 // recorder captures what Up asked its hooks to do, so a test can assert on
 // "storage was never installed" as well as on what got printed.
 type recorder struct {
-	imageVersion string
-	generateErr  error
-	failAt       string
-	err          error
+	generateErr error
+	failAt      string
+	err         error
 
 	called []string
 	input  ConfigInput
@@ -109,7 +107,6 @@ func (r *recorder) did(name string) bool {
 
 func (r *recorder) hooks() *upHooks {
 	return &upHooks{
-		detectVersion: func(string) string { return r.imageVersion },
 		generateConfig: func(in ConfigInput) (*Generated, error) {
 			r.input = in
 
@@ -166,25 +163,18 @@ func (r *recorder) hooks() *upHooks {
 	}
 }
 
-// fakePlatform is the host facts Detect would return. NONE of these values may
-// be the ones the test binary's own host would produce: a console arg of
-// "console=ttyS0" or an OS read from runtime.GOOS would let a hardcoded host
-// fact in up.go pass on the developer's machine and fail nowhere.
+// The three fixture strings the CALLER resolved. NONE of them may be a value
+// this test binary's own host would produce: a console arg of "console=ttyS0",
+// or an emulator binary that really exists, would let a host fact leaking back
+// into up.go pass on the developer's machine and fail nowhere.
 //
-// OS is pinned to "linux" for exactly that reason, and it is the field that
-// caught the leak — up.go printed runtime.GOOS, so the transcript said
-// "darwin/amd64" on a Mac while every other value on the line was injected.
-func fakePlatform() *platform.Platform {
-	return &platform.Platform{
-		OS:         "linux",
-		QEMUBinary: "qemu-system-fake",
-		Machine:    "q35",
-		Accel:      "kvm",
-		CPU:        "host",
-		ConsoleArg: "console=ttyFAKE0",
-		ImageArch:  "amd64",
-	}
-}
+// The substrate reads like a QEMU one because that is the caller this suite
+// stands in for, but "qemu-system-fake" is deliberately a binary no host has.
+const (
+	fakeSubstrate     = "linux/amd64, kvm, qemu-system-fake"
+	fakeConsoleArg    = "console=ttyFAKE0"
+	fakeVersionSource = "talos-" + imageTalosVersion + "-amd64.iso (ISO volume id)"
+)
 
 // upFixture builds an UpOptions wired to a recorder, a temp state dir and a
 // buffer, plus the booted flag so "the guard ran before the VM was created"
@@ -202,20 +192,22 @@ func newFixture(t *testing.T) *upFixture {
 	t.Helper()
 
 	f := &upFixture{
-		rec: &recorder{imageVersion: imageTalosVersion},
+		rec: &recorder{},
 		out: &strings.Builder{},
 		dir: t.TempDir(),
 	}
 
 	f.opts = UpOptions{
 		ClusterName:      "probe",
-		ImagePath:        filepath.Join(t.TempDir(), "talos-"+imageTalosVersion+"-amd64.iso"),
 		StateDir:         f.dir,
 		TalosEndpoint:    "127.0.0.1:50000",
 		KubeEndpoint:     "https://127.0.0.1:6443",
 		SystemDiskSerial: "talos-system",
 		DataDiskSerial:   "talos-data",
-		Detect:           func() (*platform.Platform, error) { return fakePlatform(), nil },
+		TalosVersion:     imageTalosVersion,
+		VersionSource:    fakeVersionSource,
+		Substrate:        fakeSubstrate,
+		ConsoleArg:       fakeConsoleArg,
 		Boot: func() (int, error) {
 			f.booted++
 
@@ -262,7 +254,7 @@ func wants(t *testing.T, transcript string, fragments ...string) {
 // close up and describe a sequence that did not run.
 var announcedSteps = []string{
 	"[ 1/10] platform",
-	"[ 2/10] image",
+	"[ 2/10] version",
 	"[ 3/10] version guard",
 	"[ 4/10] boot",
 	"[ 5/10] maintenance",
@@ -321,13 +313,36 @@ func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
 
 	// The operation each step performed, not just its name.
 	wants(t, transcript,
-		"linux/amd64", "qemu-system-fake", "kvm",
-		"talos-"+imageTalosVersion+"-amd64.iso -> "+imageTalosVersion+" (ISO volume id)",
+		fakeSubstrate,
+		fakeVersionSource+" -> "+imageTalosVersion,
 		"machinery "+GeneratorVersion()+" >= image "+imageTalosVersion,
 		"pid 163166", "api 127.0.0.1:50000",
 		"controlplane.yaml", "talosconfig",
 		"local-path-provisioner "+LocalPathVersion,
 	)
+}
+
+// Step 1 and step 2 are the caller's lines now. This package cannot assemble
+// either one: an accelerator and an emulator binary describe a QEMU guest, and
+// an ISO volume id is not where a running node's version comes from.
+func TestUpRendersSubstrateAndVersionFromOptions(t *testing.T) {
+	f := newFixture(t)
+	f.opts.Substrate = "baremetal, 192.168.1.50"
+	f.opts.TalosVersion = imageTalosVersion
+	f.opts.VersionSource = "the node's maintenance API"
+
+	out := f.mustRun(t)
+
+	if !strings.Contains(out, "baremetal, 192.168.1.50") {
+		t.Errorf("step 1 did not print the caller's substrate line\n"+
+			"  reason: cluster/ no longer knows what a hypervisor is, so an "+
+			"accelerator and an emulator binary cannot come from here\n%s", redact(out))
+	}
+
+	if !strings.Contains(out, "the node's maintenance API -> "+imageTalosVersion) {
+		t.Errorf("step 2 did not print the caller's version source\n"+
+			"  reason: a baremetal node has no ISO to read a volume id from\n%s", redact(out))
+	}
 }
 
 // CARRIED REQUIREMENT 1. CheckVersion returns (checked, err) and `checked` is
@@ -342,7 +357,7 @@ func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
 // failure the ISO's volume id already proved.
 func TestUpRefusesAnImageItCouldNotIdentifyBeforeBooting(t *testing.T) {
 	f := newFixture(t)
-	f.rec.imageVersion = ""
+	f.opts.TalosVersion = ""
 
 	err := f.run(t)
 	if err == nil {
@@ -400,7 +415,7 @@ func TestUpDoesNotAnnounceASkippedGuardForAKnownImage(t *testing.T) {
 // failure that cost nothing to see coming.
 func TestUpRefusesAnImageNewerThanTheGeneratorBeforeBooting(t *testing.T) {
 	f := newFixture(t)
-	f.rec.imageVersion = "v1.99.0"
+	f.opts.TalosVersion = "v1.99.0"
 
 	err := f.run(t)
 	if err == nil {
@@ -845,30 +860,51 @@ func TestAPIAddressIsTheHostPartOfTheEndpoint(t *testing.T) {
 
 // Both defaults in Up are invisible to every test above, because every test
 // above supplies both — and their absence is not a wrong answer, it is a nil
-// dereference in production only. This drives a bring-up with NEITHER supplied
-// and stops it at step 3, which is now the last point before anything needs a
-// node: the image does not exist, the REAL detectVersion reads it as unknown,
-// and the version guard refuses.
+// dereference in production only.
 //
-// Reaching that refusal is what proves both defaults: hooks nil resolved to
-// realHooks (or hooks.detectVersion would have panicked) and Out nil resolved
-// to os.Stdout (or p.step would have).
+// The version is a FIELD now rather than something a hook reads off an ISO, so
+// nothing before step 5 touches a hook at all and the only way to prove the
+// hooks default is to REACH one. The context is cancelled before the call, so
+// the real waitMaintenance gives up on its first probe instead of spending its
+// five-minute budget on an address nothing is listening on.
+//
+// Both proofs are structural rather than textual: Boot running means steps 1 to
+// 4 printed, so Out nil resolved to os.Stdout (a nil writer panics in p.step),
+// and an ERROR back from step 5 means the real wait ran, so hooks nil resolved
+// to realHooks (a nil hooks panics, it does not fail).
 func TestUpDefaultsToStdoutAndTheRealOperations(t *testing.T) {
-	err := Up(context.Background(), UpOptions{
-		ClusterName:      "probe",
-		ImagePath:        filepath.Join(t.TempDir(), "absent.iso"),
-		StateDir:         t.TempDir(),
-		TalosEndpoint:    "127.0.0.1:50000",
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	booted := false
+
+	err := Up(ctx, UpOptions{
+		ClusterName: "probe",
+		StateDir:    t.TempDir(),
+		// Nothing is listening here and nothing needs to be.
+		TalosEndpoint:    "127.0.0.1:1",
 		KubeEndpoint:     "https://127.0.0.1:6443",
 		SystemDiskSerial: "talos-system",
-		Detect:           func() (*platform.Platform, error) { return fakePlatform(), nil },
-		// Must never run: step 3 refuses an unidentifiable image before
-		// anything is created.
-		Boot: func() (int, error) { return 0, errors.New("Boot was reached for an image the guard refused") },
+		TalosVersion:     imageTalosVersion,
+		VersionSource:    fakeVersionSource,
+		Substrate:        fakeSubstrate,
+		ConsoleArg:       fakeConsoleArg,
+		Boot: func() (int, error) {
+			booted = true
+
+			return 163166, nil
+		},
 		// Out and hooks are deliberately left nil.
 	})
-	if err == nil || !strings.Contains(err.Error(), "could not determine the Talos version") {
-		t.Fatalf("Up did not refuse the unidentifiable image with its own defaults: %s", redactErr(err))
+
+	if !booted {
+		t.Fatal("Up never reached step 4 with Out left nil\n" +
+			"  reason: a nil io.Writer is a panic in p.step, not a quiet no-op")
+	}
+
+	if err == nil {
+		t.Fatal("step 5 succeeded against an address nothing is listening on\n" +
+			"  reason: only the REAL waitMaintenance can fail here; a nil hooks panics")
 	}
 }
 
@@ -945,22 +981,10 @@ func TestUpReportsAFailureToWriteAnArtifact(t *testing.T) {
 }
 
 // Boot failing is the one error that is NOT mid-flight residue in the sense the
-// note describes — but Detect failing before it is not either, and both have to
-// come back as errors rather than a transcript that stops silently.
-func TestUpReportsAFailureToDetectTheHost(t *testing.T) {
-	f := newFixture(t)
-	f.opts.Detect = func() (*platform.Platform, error) { return nil, errors.New("no accelerator on this host") }
-
-	err := f.run(t)
-	if err == nil {
-		t.Fatal("Up continued with no host platform")
-	}
-
-	if !strings.Contains(err.Error(), "no accelerator") {
-		t.Errorf("the detect failure was replaced rather than reported: %s", redactErr(err))
-	}
-}
-
+// note describes, and it still has to come back as an error rather than a
+// transcript that stops silently. Host detection is no longer among the things
+// that can fail here at all: the caller resolves its own facts and hands over
+// the results, so a host with no accelerator fails before Up is ever called.
 func TestUpReportsAFailureToBoot(t *testing.T) {
 	f := newFixture(t)
 	f.opts.Boot = func() (int, error) { return 0, errors.New("qemu: exit status 1") }
@@ -1062,7 +1086,7 @@ func orderReason(op string) string {
 // message — that message is where the remedy is.
 func TestUpKeepsTheVersionGuardsExplanation(t *testing.T) {
 	f := newFixture(t)
-	f.rec.imageVersion = "v1.99.0"
+	f.opts.TalosVersion = "v1.99.0"
 
 	err := f.run(t)
 	if err == nil {
@@ -1329,78 +1353,46 @@ func TestAlreadyBootstrappedMatchesTheGRPCCodeNotTheMessage(t *testing.T) {
 	}
 }
 
-// ── the kexec workaround is macOS/arm64-ONLY ────────────────────────────────
+// ── the kexec workaround is the CALLER's decision, carried faithfully ───────
 //
-// Two host facts gate it, and each one is asserted on a platform the test binary
-// is not running on. That is the whole reason OS and ImageArch are resolved onto
-// Platform instead of read from runtime: a workaround for someone else's host
-// has to be provable from this one.
+// WHICH hosts need it is a fact about the host, so the gate lives in cmd/tinq
+// (see TestUpOptionsDisablesKexecOnAppleSiliconOnly). What this package owes is
+// that the answer it is handed is the answer it asks for and the answer it
+// announces — a field silently dropped between UpOptions and ConfigInput is a
+// node that kexecs into a kernel it cannot boot, with a transcript that says
+// nothing at all.
 
-// hostPlatform returns the fixture platform with OS and guest arch overridden,
-// so each case below states the host it is about instead of inheriting it.
-func hostPlatform(os, arch string) func() (*platform.Platform, error) {
-	return func() (*platform.Platform, error) {
-		p := fakePlatform()
-		p.OS = os
-		p.ImageArch = arch
-
-		return p, nil
-	}
-}
-
-// The fixture's platform says linux, so this asserts the Linux behaviour while
-// running on a Mac — which is the only way this assertion means anything.
-func TestUpLeavesKexecAloneOnLinux(t *testing.T) {
+func TestUpLeavesKexecAloneUnlessTheCallerAsks(t *testing.T) {
 	f := newFixture(t)
-	f.opts.Detect = hostPlatform("linux", "arm64")
+	f.opts.DisableKexec = false
 
 	transcript := f.mustRun(t)
 
 	if f.rec.input.DisableKexec {
-		t.Error("kexec was disabled on a linux host\n" +
-			"  reason: kexec works under KVM and skips a firmware boot; disabling it there is a\n" +
-			"  tax paid for a macOS bug")
+		t.Error("kexec was disabled although the caller did not ask\n" +
+			"  reason: kexec skips a firmware boot and is FASTER; disabling it where the\n" +
+			"  workaround does not apply is a tax paid for another substrate's bug")
 	}
 
 	if strings.Contains(transcript, "kexec_load_disabled") {
-		t.Errorf("transcript announces the workaround on linux\n%s", redact(transcript))
+		t.Errorf("transcript announces a workaround that was not requested\n%s", redact(transcript))
 	}
 }
 
-// An INTEL Mac has nothing to work around: the guest bug is arm64's, and
-// upstream gates its own workaround on the architecture too. Disabling kexec
-// here would cost a firmware boot for a bug that is not present.
-func TestUpLeavesKexecAloneOnAnIntelMac(t *testing.T) {
+// The sysctl must be requested, and the transcript must say so: a bring-up that
+// silently changed the node's reboot behaviour is one nobody can account for
+// later.
+func TestUpDisablesKexecWhenTheCallerAsks(t *testing.T) {
 	f := newFixture(t)
-	f.opts.Detect = hostPlatform("darwin", "amd64")
-
-	transcript := f.mustRun(t)
-
-	if f.rec.input.DisableKexec {
-		t.Error("kexec was disabled on darwin/amd64\n" +
-			"  reason: the kexec bug is arm64's — upstream gates on TargetArch == arm64. An\n" +
-			"  Intel Mac pays a firmware boot for nothing")
-	}
-
-	if strings.Contains(transcript, "kexec_load_disabled") {
-		t.Errorf("transcript announces the workaround on darwin/amd64\n%s", redact(transcript))
-	}
-}
-
-// On macOS/arm64 the sysctl must be requested, and the transcript must say so: a
-// bring-up that silently changed the node's reboot behaviour is one nobody can
-// account for later.
-func TestUpDisablesKexecOnAppleSilicon(t *testing.T) {
-	f := newFixture(t)
-	f.opts.Detect = hostPlatform("darwin", "arm64")
+	f.opts.DisableKexec = true
 
 	transcript := f.mustRun(t)
 
 	if !f.rec.input.DisableKexec {
-		t.Error("kexec was left enabled on darwin/arm64\n" +
+		t.Error("kexec was left enabled although the caller asked for it to be disabled\n" +
 			"  reason: Talos kexecs into the installed kernel, and under QEMU on macOS that\n" +
 			"  path dies in the guest — the node never boots what it just installed")
 	}
 
-	wants(t, transcript, "kexec_load_disabled=1", "darwin/arm64 host", "MAINTENANCE")
+	wants(t, transcript, "kexec_load_disabled=1", "MAINTENANCE")
 }

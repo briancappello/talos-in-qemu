@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/coglative/talos-in-qemu/platform"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"google.golang.org/grpc/codes"
@@ -29,7 +28,7 @@ import (
 //	config generator's, and a fresh install silently becomes a cross-version
 //	upgrade that either gets rejected or hangs at /sbin/init.
 //
-//	console arg for THIS host — the installed system writes its own kernel
+//	console arg for THE NODE — the installed system writes its own kernel
 //	cmdline and inherits nothing from the ISO, so serial goes dead at exactly
 //	the boot you need to watch, and the argument is arch-specific.
 //
@@ -71,15 +70,12 @@ const (
 // UpOptions is everything a bring-up depends on that this package cannot know
 // for itself.
 //
-// The serials, the endpoints and the image path all come from package main,
-// which owns the qemu invocation. Copying any of them into this package would
-// compile, read correctly, and drift the first time main.go changed one.
+// The serials, the endpoints and the node's own facts all come from package
+// main, which owns the qemu invocation. Copying any of them into this package
+// would compile, read correctly, and drift the first time main.go changed one.
 type UpOptions struct {
 	// ClusterName names the cluster and the talosconfig context.
 	ClusterName string
-	// ImagePath is the resolved boot ISO. Step 2 reads its Talos version from
-	// the ISO volume id.
-	ImagePath string
 	// StateDir is the machine's existing state directory. The four artifacts
 	// are written into it so -destroy sweeps them with everything else and the
 	// secrets do not outlive the cluster.
@@ -96,10 +92,32 @@ type UpOptions struct {
 	// field.
 	DataDiskSerial string
 
-	// Detect resolves this host's facts (platform.Detect). It is a function
-	// rather than a value so the probe stays inside the operation that
-	// announces it.
-	Detect func() (*platform.Platform, error)
+	// TalosVersion is the node's Talos version, e.g. "v1.13.7". RESOLVED BY THE
+	// CALLER, and that is what lets one sequence serve two substrates: a QEMU
+	// bring-up reads it from the ISO's volume id before booting anything, and
+	// an adopted node is asked directly because it is already running. Empty is
+	// a real state and step 3 refuses it — see errUnknownTalosVersion.
+	TalosVersion string
+	// VersionSource says WHERE TalosVersion came from, for the transcript only.
+	// "talos-v1.13.7-amd64.iso (ISO volume id)", or "the node's maintenance API".
+	VersionSource string
+	// Substrate is step 1's line, rendered by the caller. This package no
+	// longer knows what a hypervisor is, and an accelerator or an emulator
+	// binary is meaningless for a machine that is a machine.
+	Substrate string
+	// ConsoleArg is the console kernel argument for the NODE, or "" for none.
+	//
+	// It was derived from the HOST's architecture, which is sound only because
+	// QEMU makes host arch and guest arch the same by construction. Driving a
+	// node from a different machine breaks that identity, and nothing in the
+	// type system noticed.
+	ConsoleArg string
+	// DisableKexec asks the node not to kexec on reboot. It exists for ONE
+	// substrate — QEMU on macOS/arm64 — and the caller decides, because whether
+	// the workaround applies is a fact about the host, which this package no
+	// longer holds.
+	DisableKexec bool
+
 	// Boot starts the VM, or adopts one already running, and returns its pid.
 	// Owned by package main: this package knows nothing about qemu.
 	Boot func() (int, error)
@@ -117,7 +135,6 @@ type UpOptions struct {
 // anything. Every entry is one round trip to a node or a cluster; nothing that
 // merely formats a line is in here, because that is the part under test.
 type upHooks struct {
-	detectVersion      func(imagePath string) string
 	generateConfig     func(ConfigInput) (*Generated, error)
 	waitMaintenance    func(ctx context.Context, endpoint string, timeout time.Duration) error
 	applyConfig        func(ctx context.Context, endpoint string, config []byte) error
@@ -130,7 +147,6 @@ type upHooks struct {
 
 func realHooks() *upHooks {
 	return &upHooks{
-		detectVersion:      platform.InspectImageVersion,
 		generateConfig:     GenerateConfig,
 		waitMaintenance:    WaitMaintenance,
 		applyConfig:        applyConfiguration,
@@ -187,28 +203,23 @@ func Up(ctx context.Context, opts UpOptions) error {
 	p := &printer{w: out}
 
 	// ── 1/10 platform ───────────────────────────────────────────────────────
-	host, err := opts.Detect()
-	if err != nil {
-		return err
-	}
+	//
+	// Rendered by the CALLER. This package no longer resolves host facts, and
+	// the line differs by substrate: a hypervisor, an accelerator and an
+	// emulator binary describe a QEMU guest and describe nothing at all about a
+	// machine on a desk.
+	p.step("platform", "%s", opts.Substrate)
 
-	// host.OS, not runtime.GOOS: every other value on this line comes from the
-	// injected platform, and one that does not cannot be tested against any
-	// host but the test binary's own.
-	p.step("platform", "%s/%s, %s, %s", host.OS, host.ImageArch, host.Accel, host.QEMUBinary)
-
-	// ── 2/10 image ──────────────────────────────────────────────────────────
-	// InspectImageVersion never errors: an image it cannot classify reads as
-	// "", which is a real state and has to be printed as one rather than as an
-	// empty version.
-	imageVersion := hooks.detectVersion(opts.ImagePath)
-
-	shown := imageVersion
+	// ── 2/10 version ────────────────────────────────────────────────────────
+	// Empty is a real state — an unclassifiable ISO and a node that reports no
+	// tag both produce it — and it has to be printed as one rather than as an
+	// empty version. Step 3 is what refuses it.
+	shown := opts.TalosVersion
 	if shown == "" {
 		shown = "UNKNOWN"
 	}
 
-	p.step("image", "%s -> %s (ISO volume id)", filepath.Base(opts.ImagePath), shown)
+	p.step("version", "%s -> %s", opts.VersionSource, shown)
 
 	// ── 3/10 version guard ──────────────────────────────────────────────────
 	//
@@ -220,15 +231,15 @@ func Up(ctx context.Context, opts UpOptions) error {
 	// guard is silently disabled for exactly the images most likely to break
 	// config generation. `_, err :=` here would re-open that hole with nothing
 	// visible to show for it.
-	checked, err := CheckVersion(imageVersion)
+	checked, err := CheckVersion(opts.TalosVersion)
 
 	switch {
 	case err != nil:
-		p.step("version guard", "REFUSED: image %s is newer than machinery %s", imageVersion, GeneratorVersion())
+		p.step("version guard", "REFUSED: image %s is newer than machinery %s", opts.TalosVersion, GeneratorVersion())
 
 		return err
 	case checked:
-		p.step("version guard", "machinery %s >= image %s  ok", GeneratorVersion(), imageVersion)
+		p.step("version guard", "machinery %s >= image %s  ok", GeneratorVersion(), opts.TalosVersion)
 	default:
 		// REFUSED, not a note, and refused HERE rather than four steps later.
 		// GenerateConfig rejects an unidentified image unconditionally —
@@ -341,7 +352,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 
 		p.step("maintenance", "reachable after %s", took(started))
 
-		if talosconfig, err = configure(ctx, hooks, opts, p, host, imageVersion); err != nil {
+		if talosconfig, err = configure(ctx, hooks, opts, p); err != nil {
 			return fail(err)
 		}
 	}
@@ -439,26 +450,13 @@ func Up(ctx context.Context, opts UpOptions) error {
 // that has already been configured must not repeat. Everything in it is what Up
 // ran inline before, in the same order, and its errors are returned bare
 // because the caller is what knows they leave a VM behind.
-func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer,
-	host *platform.Platform, imageVersion string) ([]byte, error) {
+func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer) ([]byte, error) {
 	// ── 6/10 config ─────────────────────────────────────────────────────────
 	//
-	// KEXEC IS DISABLED ON macOS/arm64 ONLY. Talos kexecs straight into the
-	// kernel it just installed, skipping a firmware boot. Under QEMU on macOS
-	// that path dies in the guest on arm64 and the node never boots what it
-	// installed; elsewhere it works, and it is FASTER, so disabling it more
-	// widely would be a tax paid for another platform's bug.
-	//
-	// BOTH halves are load-bearing. The bug is arm64's — upstream gates its own
-	// workaround on the target ARCHITECTURE (`TargetArch == "arm64"` in
-	// talosctl, `GOARCH == "arm64"` in machined) — so an Intel Mac has nothing
-	// to work around and should keep the firmware boot it saves.
-	//
-	// host.OS and host.ImageArch rather than runtime.GOOS/GOARCH: the platform
-	// is already resolved and injected, and this is the decision that most
-	// needs to be provable on a host other than the one running the tests.
-	disableKexec := host.OS == "darwin" && host.ImageArch == "arm64"
-
+	// WHETHER kexec is disabled is the CALLER's decision, and the reason is
+	// that it is a fact about the host rather than about the node: the one
+	// substrate it applies to is QEMU on macOS/arm64. See UpOptions.DisableKexec
+	// and, for the gate itself, cmd/tinq's upOptions.
 	addr, err := apiAddress(opts.TalosEndpoint)
 	if err != nil {
 		return nil, err
@@ -468,11 +466,11 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer,
 		ClusterName:      opts.ClusterName,
 		Endpoint:         opts.KubeEndpoint,
 		APIAddress:       addr,
-		TalosVersion:     imageVersion,
-		ConsoleArg:       host.ConsoleArg,
+		TalosVersion:     opts.TalosVersion,
+		ConsoleArg:       opts.ConsoleArg,
 		SystemDiskSerial: opts.SystemDiskSerial,
 		DataDiskSerial:   opts.DataDiskSerial,
-		DisableKexec:     disableKexec,
+		DisableKexec:     opts.DisableKexec,
 	})
 	if err != nil {
 		return nil, err
@@ -492,19 +490,19 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer,
 	p.detail("diskSelector: serial %s", opts.SystemDiskSerial)
 	p.detail("  a size matcher is a coin flip once there are two large disks, and losing")
 	p.detail("  it installs the OS over your PVCs")
-	// imageVersion is non-empty by construction: step 3 refuses an
+	// opts.TalosVersion is non-empty by construction: step 3 refuses an
 	// unidentified image and returns, so this line cannot print
 	// "installer: ghcr.io/siderolabs/installer: (pinned to YOUR image)" —
 	// a claim about a tag that is not there.
-	p.detail("installer: ghcr.io/siderolabs/installer:%s (pinned to YOUR image)", imageVersion)
+	p.detail("installer: ghcr.io/siderolabs/installer:%s (pinned to YOUR image)", opts.TalosVersion)
 	p.detail("  left unset Talos substitutes THIS binary's version, and a fresh install")
 	p.detail("  silently becomes a cross-version upgrade")
-	p.detail("extraKernelArgs: %s (this host's serial)", host.ConsoleArg)
+	p.detail("extraKernelArgs: %s (this host's serial)", opts.ConsoleArg)
 	p.detail("  the installed system writes its own cmdline and inherits nothing from the")
 	p.detail("  ISO, so serial goes dead at exactly the boot you need to watch")
 
-	if disableKexec {
-		p.detail("sysctls: kernel.kexec_load_disabled=1 (%s/%s host)", host.OS, host.ImageArch)
+	if opts.DisableKexec {
+		p.detail("sysctls: kernel.kexec_load_disabled=1")
 		p.detail("  Talos kexecs into the kernel it just installed instead of rebooting through")
 		p.detail("  firmware. Under QEMU on macOS that path dies in the guest on arm64 and the")
 		p.detail("  node never boots what it installed. Applied in MAINTENANCE mode, so it")
