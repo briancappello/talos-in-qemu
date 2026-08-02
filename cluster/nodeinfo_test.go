@@ -1,16 +1,137 @@
 package cluster
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	blockres "github.com/siderolabs/talos/pkg/machinery/resources/block"
 )
 
 func testDisks() []Disk {
 	return []Disk{
 		{ID: "sda", Serial: "S1", Model: "Samsung SSD", Size: "500 GB", Transport: "sata"},
 		{ID: "sdb", Serial: "", Model: "SanDisk Cruzer", Size: "32 GB", Transport: "usb", Readonly: true},
+	}
+}
+
+// newDiskResource builds the machinery resource ListDisks would have been
+// handed by COSI. Three lines, no node, no network — which is the whole point
+// of toDisks being a function of its own.
+func newDiskResource(id string, mutate func(*blockres.DiskSpec)) *blockres.Disk {
+	d := blockres.NewDisk(blockres.NamespaceName, id)
+	if mutate != nil {
+		mutate(d.TypedSpec())
+	}
+
+	return d
+}
+
+// Every value below is DISTINCT from every other, because the failure this
+// pins is a swapped pair in the composite literal — and a fixture where two
+// fields share a value proves nothing about which one the reader got. A table
+// whose SERIAL column shows models compiles, passes a shape check, and is the
+// one thing a human cannot act on.
+func TestToDisksPutsEveryFieldInItsOwnColumn(t *testing.T) {
+	got := toDisks([]*blockres.Disk{
+		newDiskResource("vdb", func(s *blockres.DiskSpec) {
+			// FIRST: SetSize recomputes PrettySize from the byte count, so a
+			// literal PrettySize assigned before it is silently overwritten.
+			s.SetSize(4096)
+
+			s.Serial = "serial-value"
+			s.Model = "model-value"
+			s.PrettySize = "pretty-size-value"
+			s.Transport = "transport-value"
+			s.WWID = "wwid-value"
+			// Never rendered, and named so that reaching for one by mistake
+			// shows up in the diff rather than passing as an empty string.
+			s.DevPath = "dev-path-value"
+			s.UUID = "uuid-value"
+			s.BusPath = "bus-path-value"
+			s.SubSystem = "sub-system-value"
+			s.Modalias = "modalias-value"
+		}),
+	})
+
+	want := Disk{
+		ID: "vdb", Serial: "serial-value", Model: "model-value",
+		Size: "pretty-size-value", Transport: "transport-value", WWID: "wwid-value",
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("toDisks returned %d disks for one input: %+v", len(got), got)
+	}
+
+	if got[0] != want {
+		t.Errorf("toDisks mapped the spec wrongly\n  got:  %+v\n  want: %+v\n"+
+			"  reason: Size is PrettySize, not Size; ID is the resource's metadata, not a "+
+			"spec field. A pair swapped here still renders a table — one nobody can act on",
+			got[0], want)
+	}
+}
+
+// The three flags separately, because all-true cannot tell them apart and each
+// one drives a different note in the table.
+func TestToDisksPutsEachFlagInItsOwnField(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*blockres.DiskSpec)
+		want Disk
+	}{
+		{"rotational", func(s *blockres.DiskSpec) { s.Rotational = true }, Disk{ID: "vdb", Rotational: true}},
+		{"readonly", func(s *blockres.DiskSpec) { s.Readonly = true }, Disk{ID: "vdb", Readonly: true}},
+		{"cdrom", func(s *blockres.DiskSpec) { s.CDROM = true }, Disk{ID: "vdb", CDROM: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := toDisks([]*blockres.Disk{newDiskResource("vdb", tc.set)})
+			if len(got) != 1 || got[0] != tc.want {
+				t.Errorf("toDisks(%s) = %+v, want [%+v]\n"+
+					"  reason: readonly is how the boot medium is recognised; swapped with "+
+					"another flag it stops flagging the one disk that must not be installed to",
+					tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// Ordering is a binding constraint, not a side effect: the table is read by a
+// human copying a serial out of it, and COSI promises no order. Inputs are
+// supplied out of order so that returning them untouched fails.
+func TestToDisksOrdersByID(t *testing.T) {
+	got := toDisks([]*blockres.Disk{
+		newDiskResource("vdc", nil),
+		newDiskResource("vda", nil),
+		newDiskResource("sdb", nil),
+		newDiskResource("vdb", nil),
+	})
+
+	ids := make([]string, 0, len(got))
+	for _, d := range got {
+		ids = append(ids, d.ID)
+	}
+
+	if want := []string{"sdb", "vda", "vdb", "vdc"}; !slices.Equal(ids, want) {
+		t.Errorf("toDisks returned %v, want %v\n"+
+			"  reason: a table that reshuffles between two runs of adopt has to be "+
+			"re-read from the top every time", ids, want)
+	}
+}
+
+func TestToDisksOnANodeWithNoDisks(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []*blockres.Disk
+	}{
+		{"a nil list", nil},
+		{"an empty list", []*blockres.Disk{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := toDisks(tc.in); len(got) != 0 {
+				t.Errorf("toDisks(%s) = %+v, want nothing", tc.name, got)
+			}
+		})
 	}
 }
 
@@ -46,6 +167,89 @@ func TestRequireDiskRefusesAnUnmatchedSerialAsATypo(t *testing.T) {
 func TestRequireDiskAcceptsAMatch(t *testing.T) {
 	if err := RequireDisk(testDisks(), "S1", "install target"); err != nil {
 		t.Fatalf("RequireDisk rejected a serial that matches: %s", err)
+	}
+}
+
+// A node reporting no disks at all is a different problem with a different
+// remedy, and the two refusals below it both end by telling the reader to pick
+// a serial out of the table — which here is a header over nothing.
+func TestRequireDiskSaysWhenTheNodeHasNoDisksAtAll(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		serial string
+	}{
+		{"with no serial given", ""},
+		{"with a serial that cannot possibly match", "S1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := RequireDisk(nil, tc.serial, "install target")
+			if err == nil {
+				t.Fatal("RequireDisk accepted a node with no disks")
+			}
+
+			if !strings.Contains(err.Error(), "no disks at all") {
+				t.Errorf("the refusal does not say the node reports no disks:\n%s", err)
+			}
+
+			if strings.Contains(err.Error(), "put one of those serials") {
+				t.Errorf("the refusal tells the reader to pick a serial out of an empty table:\n%s\n"+
+					"  reason: there is nothing to pick — the remedy is a drive the kernel can see",
+					err)
+			}
+		})
+	}
+}
+
+// The notes column, branch by branch. The WWID fallback matters most: it is
+// what a disk with NO serial is identified by, which is exactly the disk a
+// human has the least other way to recognise.
+func TestFormatDisksNotesEveryDistinguishingFact(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		disk    Disk
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "a cdrom",
+			disk: Disk{ID: "sr0", Serial: "S3", CDROM: true},
+			want: []string{"cdrom"},
+		},
+		{
+			name: "a spinning disk",
+			disk: Disk{ID: "sda", Serial: "S4", Rotational: true},
+			want: []string{"rotational"},
+		},
+		{
+			name:    "no serial, but a wwid to name it by",
+			disk:    Disk{ID: "vda", WWID: "naa.5000c500a1b2c3d4"},
+			want:    []string{"(none)", "no serial; wwid naa.5000c500a1b2c3d4"},
+			notWant: []string{"readonly", "cdrom", "rotational"},
+		},
+		{
+			name:    "neither a serial nor a wwid",
+			disk:    Disk{ID: "vda", Model: "QEMU HARDDISK"},
+			want:    []string{"(none)", "QEMU HARDDISK"},
+			notWant: []string{"wwid"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := FormatDisks([]Disk{tc.disk})
+
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("the table does not show %q:\n%s\n"+
+						"  reason: this column is the only way a human learns which disk is "+
+						"which without talosctl", want, out)
+				}
+			}
+
+			for _, notWant := range tc.notWant {
+				if strings.Contains(out, notWant) {
+					t.Errorf("the table claims %q about a disk that is not:\n%s", notWant, out)
+				}
+			}
+		})
 	}
 }
 

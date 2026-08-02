@@ -902,30 +902,28 @@ func TestAgainstARealNode(t *testing.T) {
 
 	defer c.Close() //nolint:errcheck
 
-	// Nothing here is generated material, so it is logged unredacted: this is
-	// the evidence. It is gathered through the exported ListDisks so that the
-	// function adopt refuses on is the one hardware exercises.
-	found, err := ListDisks(ctx, endpoint)
-	if err != nil {
-		t.Fatalf("ListDisks: %s", redactErr(err))
-	}
-
-	if len(found) == 0 {
-		t.Fatal("the node reports no disks at all")
-	}
-
-	t.Logf("disks:\n%s", FormatDisks(found))
-
 	// The branch's one openly-unverified assumption: config.go selects both the
 	// install target and the user volume by disk.serial, and nothing had ever
 	// read a serial off a real qemu virtio disk.
 	//
-	// The raw resources are still listed because the CEL fallback below
-	// converts each one to proto; ListDisks returns our own reduced struct.
+	// ONE list, for every question below. The raw resources are what the CEL
+	// fallback needs — it converts each one to proto — and toDisks is the same
+	// reduction ListDisks performs, so the table logged below is the one adopt
+	// refuses on. Calling ListDisks here instead would open a second
+	// maintenance connection and gather a SECOND list, leaving the emptiness
+	// check guarding something other than what CEL is then evaluated against.
 	disks, err := safe.StateListAll[*block.Disk](ctx, c.COSI)
 	if err != nil {
 		t.Fatalf("listing disks over COSI: %s", redactErr(err))
 	}
+
+	if disks.Len() == 0 {
+		t.Fatal("the node reports no disks at all")
+	}
+
+	// Nothing here is generated material, so it is logged unredacted: this is
+	// the evidence.
+	t.Logf("disks:\n%s", FormatDisks(toDisks(slices.Collect(disks.All()))))
 
 	in := testInput()
 

@@ -3,7 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/cosi-project/runtime/pkg/safe"
@@ -11,9 +11,11 @@ import (
 	blockres "github.com/siderolabs/talos/pkg/machinery/resources/block"
 )
 
-// NODE FACTS, NOT PROBES. Everything in this file asks a maintenance-mode node
-// a QUESTION and returns the answer. Nothing here decides whether a node is
-// ready, and nothing here may be used to.
+// NODE FACTS, NOT PROBES. This file asks a maintenance-mode node QUESTIONS,
+// renders the answers for a human, and refuses on them. Nothing here decides
+// whether a node is READY, and nothing here may be used to — a fact about a
+// node is not a verdict on it, and the refusals below are over facts already
+// gathered, never over a node's state.
 //
 // That distinction is why this file exists at all rather than living in
 // client.go, whose header rule (2) forbids any probe from comparing, returning
@@ -97,9 +99,22 @@ func ListDisks(ctx context.Context, endpoint string) ([]Disk, error) {
 		return nil, fmt.Errorf("listing the node's disks: %w", err)
 	}
 
-	out := make([]Disk, 0, list.Len())
+	return toDisks(slices.Collect(list.All())), nil
+}
 
-	for d := range list.All() {
+// toDisks reduces machinery's disk resources to the fields the table renders,
+// in a deterministic order.
+//
+// It is split out of ListDisks for the same reason versionTag is split out of
+// NodeVersion: reaching it through ListDisks takes a node, so left inline the
+// only half of that function with any decisions in it would be asserted by
+// nothing. A swapped pair in the literal below still compiles and still prints
+// a table — one whose SERIAL column shows models, which is precisely the table
+// a human cannot act on that this whole chain exists to prevent.
+func toDisks(ds []*blockres.Disk) []Disk {
+	out := make([]Disk, 0, len(ds))
+
+	for _, d := range ds {
 		s := d.TypedSpec()
 		out = append(out, Disk{
 			ID: d.Metadata().ID(), Serial: s.Serial, Model: s.Model,
@@ -108,10 +123,18 @@ func ListDisks(ctx context.Context, endpoint string) ([]Disk, error) {
 		})
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	// COSI's list order is not a promise. The table is read by a human copying
+	// a serial out of it, and a table that reshuffles between two runs of adopt
+	// is one they have to re-read from the top every time.
+	slices.SortFunc(out, func(a, b Disk) int { return strings.Compare(a.ID, b.ID) })
 
-	return out, nil
+	return out
 }
+
+// diskRow is shared by the header and the rows beneath it because they are one
+// table: widen a column in only one of them and the header slides off its
+// values with nothing to fail.
+const diskRow = "  %-8s %-24s %-22s %-10s %s\n"
 
 // FormatDisks renders the table that is the REMEDY for both refusals below.
 // Without talosctl there is no other way to learn a serial, so this is not
@@ -119,7 +142,7 @@ func ListDisks(ctx context.Context, endpoint string) ([]Disk, error) {
 func FormatDisks(disks []Disk) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "  %-8s %-24s %-22s %-10s %s\n", "DEVICE", "SERIAL", "MODEL", "SIZE", "NOTES")
+	fmt.Fprintf(&b, diskRow, "DEVICE", "SERIAL", "MODEL", "SIZE", "NOTES")
 
 	for _, d := range disks {
 		var notes []string
@@ -150,7 +173,7 @@ func FormatDisks(disks []Disk) string {
 			serial = "(none)"
 		}
 
-		fmt.Fprintf(&b, "  %-8s %-24s %-22s %-10s %s\n",
+		fmt.Fprintf(&b, diskRow,
 			d.ID, serial, d.Model, d.Size, strings.Join(notes, ", "))
 	}
 
@@ -159,16 +182,28 @@ func FormatDisks(disks []Disk) string {
 
 // RequireDisk refuses unless serial names a disk this node actually has.
 //
-// TWO refusals, ONE table, because they are the same remedy. The empty case is
-// a first run. The unmatched case is a TYPO, which is the realistic failure and
-// the expensive one: Talos with a selector matching nothing installs nowhere
-// and reports it as a hang, with nothing pointing at a mistyped serial.
+// TWO refusals share ONE table, because they are the same remedy. The empty
+// case is a first run. The unmatched case is a TYPO, which is the realistic
+// failure and the expensive one: Talos with a selector matching nothing
+// installs nowhere and reports it as a hang, with nothing pointing at a
+// mistyped serial. A node with no disks at all is the third refusal and does
+// NOT share that remedy — see below.
 //
 // Auto-selecting by size was rejected — config.go already calls that "a coin
 // flip once there are two large disks", and on hardware the losing side
 // overwrites a disk that may hold data, which is the one failure here that
 // re-running cannot repair.
 func RequireDisk(disks []Disk, serial, what string) error {
+	// Before either refusal, because both of them end by telling the reader to
+	// pick a serial out of the table — and with no disks the table is a header
+	// over nothing. The remedy is not "choose one", it is "this node has
+	// nothing to install onto".
+	if len(disks) == 0 {
+		return fmt.Errorf("the node reports no disks at all, so no %s can be chosen\n\n"+
+			"  a serial cannot be picked from an empty list. Check that this machine has a\n"+
+			"  drive its kernel can see, then run adopt again", what)
+	}
+
 	if serial == "" {
 		return fmt.Errorf("no serial given for the %s, and one cannot be guessed\n\n"+
 			"this node's disks:\n\n%s\n"+
