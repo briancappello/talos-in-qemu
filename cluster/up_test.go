@@ -795,7 +795,7 @@ func TestUpStopsAtTheFirstFailedStep(t *testing.T) {
 // side of a forward for a VM, the node's own address for adopted hardware. A
 // missing one is not discovered until a wait spends its whole budget on an
 // address that is not there.
-func TestUpRefusesWithoutTheForwardedEndpoints(t *testing.T) {
+func TestUpRefusesWithoutTheAPIEndpoints(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		clear func(*UpOptions)
