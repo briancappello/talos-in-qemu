@@ -165,18 +165,39 @@ machine config's control-plane endpoint and the kubeconfig, so it has to be an
 address *the host* can reach. `up` refuses up front when either is missing
 rather than spending a wait's whole budget on an address that was never there.
 
-Three ways to reconcile it:
+Four ways to reconcile it:
 
 ```sh
 # BOOTSTRAP: one machine from a file, no control plane needed
 tinq apply   machine.yaml    # a booted VM in maintenance mode, nothing more
 tinq up      machine.yaml    # apply, then all the way to a Kubernetes cluster
-tinq destroy machine.yaml
+tinq stop    machine.yaml    # halt the VM, KEEP its disks
+tinq destroy machine.yaml    # halt the VM, DELETE its disks
 
 # CONTROLLER: watch TalosMachine resources in a cluster
 kubectl apply -f crd/talosmachine.yaml
 tinq controller --kubeconfig ~/.kube/config
 ```
+
+`stop` is a shutdown: the installed OS and any PVCs survive, and the machine
+starts again from the same disks under `apply`. `destroy` is **not
+recoverable** — it takes the state directory, and the PVCs inside it, with it.
+That distinction is the only reason both exist; if you want the node back
+tomorrow, `stop` is the one. A machine that is merely stopped is still
+destroyable: it has disks to sweep, and leaving them is exactly the residue
+`destroy` exists to prevent.
+
+Verbs, not flags, and that is what makes the pair safe. `tinq stop a.yaml
+destroy b.yaml` is rejected by the parser (`accepts 1 arg(s), received 3`)
+rather than silently resolving to one of them: there is no precedence rule to
+learn because a contradictory command line is no longer expressible.
+
+Today `stop` signals QEMU (SIGTERM, then SIGKILL) rather than asking Talos to
+power itself off — the graceful rung needs an authenticated Talos client, which
+is written but not yet wired in here (see Status). It escalates loudly in the
+log rather than claiming a clean shutdown it did not perform. That is a power
+cut the guest never learns about: the filesystem is never quiesced, so whatever
+a workload had in flight is the exposure.
 
 `apply` exists because of a chicken-and-egg: a controller needs a control plane
 to read resources from, and on a fresh laptop the control plane is the thing you
@@ -195,6 +216,48 @@ maintenance mode is *adopted*, not duplicated, so `apply` then `up` works.
 
 Once the first node is bootstrapped it can host the CRD and TinQ itself, and
 every machine after that arrives the normal way.
+
+### `spec.powerState`, and the one place it is ignored
+
+In controller mode, power is *declared* rather than commanded:
+
+```yaml
+spec:
+  powerState: Stopped     # or Running, the default
+```
+
+The controller stops a running machine to converge on `Stopped`, and starts a
+stopped one to converge on `Running` — reusing the existing disks, so `Create`
+is as much *start* as create. Two behaviours surprise people, and both are
+deliberate.
+
+**The standalone verbs do not read `spec.powerState`.** A manifest carrying
+`powerState: Stopped` **boots anyway** under `tinq apply` or `tinq up` — a
+perfectly valid value, silently ignored. Those are the bootstrap paths: they
+run before any control plane exists to hold desired state, and their one job is
+to get a node up. Only the controller reconciles `powerState`. So on this path,
+editing the file does nothing — `tinq stop` is the verb that halts a machine.
+
+**A machine that does not exist yet converges on `Stopped` by booting first.**
+That looks like a bug and is not. Talos cannot be installed without booting, so
+"exists but never booted" is empty disks impersonating a machine. Converging
+costs one wasted boot in an uncommon case; refusing would leave the resource
+permanently un-converged, which is not how a controller should behave.
+
+**You will not watch that happen in `kubectl get tm`.** The acting ticks publish
+no status at all — a create or stop tick returns and lets the *next* tick observe
+the result, rather than reporting the pre-action state as converged — and
+`status.powerState` has no default. So the `Power` column stays empty from
+creation right through the boot and the halt, and only fills in once the machine
+settles: `<none> -> <none> -> <none> -> Stopped`. The wasted boot is visible in
+tinq's own log (`created`, then `stopped`) and in the VM actually running, not in
+`kubectl`.
+
+The `Synced` column is what tells the two ways of reaching `Stopped` apart:
+`Synced=True, Ready=False` is a machine stopped *because that is what was asked
+for*, `Synced=False` is one that failed. `Ready` tracks usability, which a
+stopped machine does not have — without that split the deliberate case and the
+incident print identical rows.
 
 ## One command to a cluster
 
@@ -440,22 +503,33 @@ them yet (see Status).
 
 ## How it works
 
-`driverkit` (174 lines) is the whole controller contract — three verbs:
+`driverkit` is the whole controller contract — four verbs:
 
 ```go
 type Driver interface {
-    Observe(ctx, *unstructured.Unstructured) (exists bool, status map[string]any, err error)
+    Observe(ctx, *unstructured.Unstructured) (state State, status map[string]any, err error)
     Create (ctx, *unstructured.Unstructured) error
+    Stop   (ctx, *unstructured.Unstructured) error
     Destroy(ctx, *unstructured.Unstructured) error
 }
 ```
 
-`Observe` must ask the **external system**, never a local state file. TinQ reads
-the pidfile QEMU itself wrote and checks liveness, because a state file happily
-reports a long-dead VM as present — that is the bug the signature exists to
-prevent.
+`Observe` reports one of three states — `Absent`, `Stopped`, `Running` — because
+"the disks exist but nothing is running" is a real condition and must not be
+confused with "never created". It asks the **external system**: TinQ verifies
+that a live process is *this machine's* QEMU, not merely that some process holds
+the pid a state file claims. A state file happily reports a long-dead VM as
+present, and that is the bug the signature exists to prevent.
 
-To support another hypervisor or cloud, implement those three verbs. Everything
+Reading disk only ever tells `Absent` from `Stopped`, and neither claims the
+machine is usable. The invariant is narrower than "never read a file" and
+stronger for it: never report a dead thing as `Ready`.
+
+`Create` brings a machine to `Running` from either `Absent` or `Stopped`, so it
+is as much start as create. `Stop` halts it and **keeps its disks**; only
+`Destroy` deletes them.
+
+To support another hypervisor or cloud, implement those four verbs. Everything
 else — the finalizer, the reconcile loop, status publication, delete ordering —
 is `driverkit`'s.
 
@@ -486,7 +560,7 @@ idempotently.
 
 Working and exercised:
 
-- `apply` / `destroy`, including re-apply (`Observe` reports present, so it
+- `apply` / `destroy`, including re-apply (`Observe` reports `Running`, so it
   will not start a second QEMU against the same state directory)
 - Talos boots on KVM (Linux/amd64, `q35` + `-cpu host` + distro OVMF); Talos
   API via `hostForwards`
@@ -532,6 +606,21 @@ Working and exercised:
 
 Not done yet — stated plainly rather than implied:
 
+- **No graceful guest shutdown.** `stop` escalates straight to SIGTERM/SIGKILL
+  on the QEMU process. Asking Talos to power itself off needs an authenticated
+  client — `cluster.AuthenticatedClient` is exactly that and already exists,
+  so this is a wiring job rather than a missing capability, and it is left to
+  its own change. Disks survive either way; a power-off is simply not the same
+  as a clean one. A node still in maintenance mode will never get the graceful
+  rung regardless: it cannot satisfy the mutual TLS, which is safe rather than
+  a compromise, since it holds no applied config and nothing persistent to
+  corrupt.
+- **`tinq stop` and `spec.powerState` reconciliation are unit-tested, not
+  hardware-exercised.** The transition table, the `Synced`/`Ready` split and
+  the SIGTERM/SIGKILL escalation have tests — but the escalation is exercised
+  against a decoy process, not a live Talos guest, and neither `tinq stop` nor
+  the `Absent -> Running -> Stopped` convergence has been run against a real VM.
+  Treat them as expected-to-work, not proven.
 - **`up` is bootstrap only, and not resumable.** It creates a cluster; it
   never upgrades, scales or reconciles one, and a failure part way through is
   recovered with `destroy` and a retry rather than by re-running `up`.
