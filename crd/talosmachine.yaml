@@ -69,7 +69,17 @@ spec:
           properties:
             spec:
               type: object
-              required: [site, role, image, cpu, memory, disk]
+              required: [site, role]
+              x-kubernetes-validations:
+                - rule: "has(self.baremetal) || (has(self.image) && has(self.cpu) && has(self.memory) && has(self.disk))"
+                  message: >-
+                    a TalosMachine is either hardware (spec.baremetal) or a VM to build
+                    (image, cpu, memory, disk). Relaxing `required` is what allows the
+                    first; this rule is what stops it also allowing a VM with no disk.
+                - rule: "!(has(self.baremetal) && has(self.hostForwards))"
+                  message: >-
+                    spec.hostForwards describes a qemu user-mode port forward and has no
+                    meaning for hardware, which serves apid on its own address.
               properties:
                 site:
                   type: string
@@ -103,6 +113,44 @@ spec:
                     (talos-data), never by size — with two large disks a size
                     matcher becomes a coin flip between the OS target and this.
                     Omit for a single-disk machine with no StorageClass.
+                baremetal:
+                  type: object
+                  required: [endpoint]
+                  description: >-
+                    Present when this machine is HARDWARE that already exists. Its
+                    presence is the discriminator: apply/up/stop/destroy refuse a
+                    machine that has it, and `tinq adopt` requires it. Nothing here
+                    powers a node on — it must already be in maintenance mode.
+                  properties:
+                    endpoint:
+                      type: string
+                      description: >-
+                        The node's address, no port. Talos's own defaults are used
+                        (50000 for apid, 6443 for kube-apiserver) because there is no
+                        forward to describe. This value goes into apid's certificate.
+                    systemDiskSerial:
+                      type: string
+                      description: >-
+                        Serial of the install target. Omit on the first run and `adopt`
+                        prints the node's disks and refuses — a size matcher is a coin
+                        flip, and losing it overwrites a disk that may hold data.
+                    dataDiskSerial:
+                      type: string
+                      description: >-
+                        Serial of the PVC disk. Absent means no user volume AND no
+                        StorageClass; one field gates both halves so they cannot
+                        disagree.
+                    consoleArg:
+                      type: string
+                      description: >-
+                        Console kernel argument for the installed system. DEFAULT NONE —
+                        hardware has a firmware-configured console, and a guessed one is
+                        silent at exactly the boot you would need it for.
+                    talosVersion:
+                      type: string
+                      description: >-
+                        Override for the version `adopt` reads from the node. Only needed
+                        if a maintenance-mode node reports no version tag.
                 powerState:
                   type: string
                   enum: [Running, Stopped]
