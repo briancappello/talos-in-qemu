@@ -199,10 +199,32 @@ applies to `dataDiskSerial` when present.
 
 The table shows serial, model, pretty size, transport and rotational, and flags
 CDROM and readonly. The boot medium WILL appear in it, and `readonly` — not
-`cdrom` — is the flag that identifies it: `client_test.go:929-935` records that
-a Talos ISO presents as a read-only virtio-blk device rather than a CDROM, and
-so does the squashfs loop device. A table that only flagged CDROM would show
-the boot medium as an ordinary candidate disk.
+`cdrom` — is the flag that identifies it: a Talos ISO presents as a read-only
+virtio-blk device rather than a CDROM, and so does the squashfs loop device. A
+table that only flagged CDROM would show the boot medium as an ordinary
+candidate disk.
+
+**Measured on a live node, 2026-08-02** (v1.13.7, maintenance mode, five disks):
+
+```
+  DEVICE   SERIAL         MODEL          SIZE     NOTES
+  loop0    (none)                        84 MB    readonly — probably the medium you booted from
+  sr0      (none)         QEMU DVD-ROM   0 B      readonly — …, cdrom, sata
+  vda      talos-system                  11 GB    rotational, virtio
+  vdb      (none)                        336 MB   readonly — …, rotational, virtio
+  vdc      talos-data                    22 GB    rotational, virtio
+```
+
+`vdb` is the Talos ISO attached as virtio-blk: **readonly, and NOT cdrom**. Only
+`sr0` carries the cdrom flag, and it is the empty q35 DVD device, not the boot
+medium. The same run reproduced why selection is by serial and not by
+elimination: `disk.serial == "talos-data"` matched exactly `[vdc]`, while
+`!system_disk && !disk.cdrom` matched `[loop0 vdb vdc]` — three disks, two of
+them wrong.
+
+Note also that every disk without a serial renders `(none)` and is therefore
+structurally unselectable: `RequireDisk` compares `d.Serial == serial` and
+refuses an empty serial up front, so no install can target the boot medium.
 
 Nothing is filtered out of the table. The safety property here is not
 exclusion, it is that no install can proceed until a human has written a serial
@@ -240,13 +262,18 @@ can show: a real NIC taking a DHCP lease, and real disk serials.
 
 ## Risks and unverified assumptions
 
-1. **The maintenance-mode version tag may be empty.** `WaitMaintenance` already
-   calls `c.Version(ctx)` as its probe (`client.go:169`), so the call certainly
-   works; what is unverified is whether the response carries a populated tag
-   before a config is applied. Fallback: an optional
-   `spec.baremetal.talosVersion` override. The step-3 guard already refuses an
-   unknown version loudly rather than guessing, so the failure mode is a clear
-   refusal, not a bad install.
+1. ~~**The maintenance-mode version tag may be empty.**~~ **RESOLVED
+   EXPERIMENTALLY, 2026-08-02.** A Talos v1.13.7 node booted from ISO and left in
+   maintenance mode — no config applied — reports `v1.13.7` from
+   `NodeVersion`. Measured against a live QEMU/KVM node at `127.0.0.1:50002`
+   via `TINQ_NODE=… go test ./cluster -run TestAgainstARealNode`:
+   `the node reports Talos v1.13.7`, 18.1s after boot.
+
+   `spec.baremetal.talosVersion` therefore stays an OPTIONAL override rather
+   than becoming required. It is kept because a future Talos could change the
+   maintenance-mode response, and because the step-3 guard refuses an unknown
+   version loudly rather than guessing — so the failure mode was always a clear
+   refusal, never a bad install.
 2. **Real disk serials may be blank** on some consumer NVMe. WWID is then the
    fallback selector; the discovery table shows it, so this surfaces before
    anything is installed rather than after.
