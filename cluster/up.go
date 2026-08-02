@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -458,9 +459,15 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer,
 	// needs to be provable on a host other than the one running the tests.
 	disableKexec := host.OS == "darwin" && host.ImageArch == "arm64"
 
+	addr, err := apiAddress(opts.TalosEndpoint)
+	if err != nil {
+		return nil, err
+	}
+
 	generated, err := hooks.generateConfig(ConfigInput{
 		ClusterName:      opts.ClusterName,
 		Endpoint:         opts.KubeEndpoint,
+		APIAddress:       addr,
 		TalosVersion:     imageVersion,
 		ConsoleArg:       host.ConsoleArg,
 		SystemDiskSerial: opts.SystemDiskSerial,
@@ -595,6 +602,28 @@ func (p *printer) summary(stateDir string, storage bool) {
 // are measured in tens of seconds against an installing node; sub-second
 // precision here would be noise in the one place the transcript is read.
 func took(started time.Time) time.Duration { return time.Since(started).Round(time.Second) }
+
+// apiAddress is the host part of a host:port endpoint.
+//
+// This is the ONE place the certificate's subject alt name is decided, and it
+// is decided BY the endpoint rather than beside it: apid's cert has to name
+// whatever a client dials, and TalosEndpoint is what a client dials. A second
+// configurable field would compile, read correctly, and be settable to
+// something the client never contacts — which surfaces as a TLS failure on
+// every authenticated call, minutes into a bring-up.
+func apiAddress(endpoint string) (string, error) {
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("the Talos endpoint %q is not host:port: %w", endpoint, err)
+	}
+
+	if host == "" {
+		return "", fmt.Errorf("the Talos endpoint %q has no host part, so apid's certificate "+
+			"would name nothing", endpoint)
+	}
+
+	return host, nil
+}
 
 // writeArtifacts writes generated material into the machine's state directory
 // at 0600.

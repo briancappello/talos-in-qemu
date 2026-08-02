@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -33,6 +34,20 @@ type ConfigInput struct {
 	ClusterName string
 	// Endpoint is the Kubernetes API endpoint, e.g. https://127.0.0.1:6443.
 	Endpoint string
+	// APIAddress is the address a CLIENT DIALS to reach this machine, with no
+	// port — it becomes both the apid certificate's subject alt name and the
+	// talosconfig's endpoint.
+	//
+	// It is DERIVED from the Talos endpoint by the caller (see up.go's
+	// apiAddress) rather than configured beside it. The certificate must name
+	// what the client dials, and the endpoint IS what the client dials; two
+	// independent fields could be set to disagree, and the failure is a TLS
+	// handshake error that says nothing about the config that caused it.
+	//
+	// Under QEMU this is the loopback host side of a port forward. On hardware
+	// it is the node's own address. The generated config is identical either
+	// way, which is the whole point.
+	APIAddress string
 	// TalosVersion is the version read off the ISO. It is REQUIRED:
 	// InspectImageVersion renders an unclassifiable image as "", and
 	// GenerateConfig refuses that rather than substituting its own version,
@@ -71,11 +86,6 @@ type Generated struct {
 // filesystem is read-only, so the manifest's stock /opt path cannot work; the
 // two must agree, and this constant is the agreement.
 const userVolumeName = "local-path-provisioner"
-
-// loopback is where the QEMU port forwards land. Both the Talos API and the
-// Kubernetes API are reached through them, so it is a property of the forward
-// rather than of ConfigInput.Endpoint.
-const loopback = "127.0.0.1"
 
 // errUnknownTalosVersion is the refusal for an image whose Talos version could
 // not be determined.
@@ -117,6 +127,16 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 	// the pin below exists to override.
 	if version == "" {
 		return nil, errUnknownTalosVersion()
+	}
+
+	// Refused here rather than at the handshake. An empty SAN list produces a
+	// certificate that names nothing; the node installs, boots, serves apid,
+	// and every authenticated call then fails minutes later with an error
+	// about certificates and nothing pointing at this field.
+	if in.APIAddress == "" {
+		return nil, errors.New("no API address: this is the address a client dials to reach " +
+			"the node, and it must be in apid's certificate or no authenticated call can " +
+			"ever succeed")
 	}
 
 	// checked is deliberately discarded, and there are TWO ways it comes back
@@ -162,10 +182,11 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 		// A topology correction, not a security weakening: with the
 		// control-plane taint in place a single-node cluster schedules nothing.
 		generate.WithAllowSchedulingOnControlPlanes(true),
-		// apid serves on the guest but is dialled at the forwarded loopback
-		// address, which must therefore be in its certificate.
-		generate.WithAdditionalSubjectAltNames([]string{loopback}),
-		generate.WithEndpointList([]string{loopback}),
+		// apid is dialled at THIS address, which must therefore be in its
+		// certificate. Derived from the endpoint by the caller so the two
+		// cannot disagree.
+		generate.WithAdditionalSubjectAltNames([]string{in.APIAddress}),
+		generate.WithEndpointList([]string{in.APIAddress}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("preparing config generation: %w", err)

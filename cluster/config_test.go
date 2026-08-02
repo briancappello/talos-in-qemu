@@ -86,6 +86,7 @@ func testInput() ConfigInput {
 	return ConfigInput{
 		ClusterName:      "probe",
 		Endpoint:         "https://127.0.0.1:6443",
+		APIAddress:       "127.0.0.1",
 		TalosVersion:     "v1.13.7",
 		ConsoleArg:       "console=ttyS0",
 		SystemDiskSerial: "talos-system",
@@ -382,18 +383,43 @@ func TestGenerateConfigSchedulesOnTheControlPlane(t *testing.T) {
 	}
 }
 
-func TestGenerateConfigAddsLoopbackToMachineCertSANs(t *testing.T) {
-	cfg, err := configloader.NewFromBytes(mustGenerateDefault(t).ControlPlane)
-	if err != nil {
-		t.Fatalf("generated config does not parse: %s", redactErr(err))
-	}
+func TestCertSANComesFromAPIAddress(t *testing.T) {
+	// Both arms matter. 127.0.0.1 is the QEMU regression — the generated config
+	// must not change. 192.168.1.50 is the one that was IMPOSSIBLE before this
+	// task and is the whole reason for it.
+	//
+	// mustGenerate rather than mustGenerateDefault: a non-default input cannot
+	// use the shared CA set, so this pays for two full generations. That is the
+	// price of proving the address is threaded rather than hardcoded.
+	for _, addr := range []string{"127.0.0.1", "192.168.1.50"} {
+		in := testInput()
+		in.APIAddress = addr
 
-	// Asserted through the typed API on purpose: `- 127.0.0.1` also appears
-	// under apiServer.certSANs, where the endpoint puts it for free, so a
-	// substring match would pass with the machine SAN missing entirely.
-	if sans := cfg.Machine().Security().CertSANs(); !slices.Contains(sans, "127.0.0.1") {
-		t.Errorf("machine certSANs = %v, want 127.0.0.1\n"+
-			"  reason: the Talos API is reached over a host port forward, so apid's cert must name the loopback or TLS fails", sans)
+		cfg, err := configloader.NewFromBytes(mustGenerate(t, in).ControlPlane)
+		if err != nil {
+			t.Fatalf("generated config does not parse: %s", redactErr(err))
+		}
+
+		// Asserted through the TYPED API on purpose, exactly as the test this
+		// replaces did: the address also appears under apiServer.certSANs,
+		// where the endpoint puts it for free, so a substring match would pass
+		// with the machine SAN missing entirely.
+		if sans := cfg.Machine().Security().CertSANs(); !slices.Contains(sans, addr) {
+			t.Errorf("machine certSANs = %v, want %s\n"+
+				"  reason: the cert must name the address the CLIENT DIALS, or every "+
+				"authenticated call fails the TLS handshake", sans, addr)
+		}
+	}
+}
+
+func TestGenerateConfigRefusesAnEmptyAPIAddress(t *testing.T) {
+	in := testInput()
+	in.APIAddress = ""
+
+	if _, err := GenerateConfig(in); err == nil {
+		t.Error("GenerateConfig accepted an empty APIAddress\n" +
+			"  reason: an empty SAN list yields a cert naming nothing, which fails at " +
+			"the handshake minutes later rather than here")
 	}
 }
 

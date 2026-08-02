@@ -794,6 +794,43 @@ func TestUpRefusesWithoutTheForwardedEndpoints(t *testing.T) {
 	}
 }
 
+// apiAddress decides the ONE value apid's certificate is issued for, so each of
+// its refusals is the difference between an error here and a TLS handshake
+// failure minutes into a bring-up. The empty-host case is the one worth a test
+// of its own: ":50000" splits WITHOUT an error, host just comes back "", and
+// without the guard that generates a certificate naming nothing.
+func TestAPIAddressIsTheHostPartOfTheEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		endpoint string
+		want     string
+	}{
+		{"127.0.0.1:50000", "127.0.0.1"},
+		{"192.168.1.50:50000", "192.168.1.50"},
+		{"[fd00::1]:50000", "fd00::1"},
+	} {
+		got, err := apiAddress(tc.endpoint)
+		if err != nil {
+			t.Errorf("apiAddress(%q): %s", tc.endpoint, err)
+			continue
+		}
+
+		if got != tc.want {
+			t.Errorf("apiAddress(%q) = %q, want %q\n"+
+				"  reason: this is what apid's certificate is issued for, and it must be what the client dials",
+				tc.endpoint, got, tc.want)
+		}
+	}
+
+	for _, endpoint := range []string{"", "192.168.1.50", ":50000"} {
+		if got, err := apiAddress(endpoint); err == nil {
+			t.Errorf("apiAddress(%q) = %q, want a refusal\n"+
+				"  reason: a certificate issued for %q names nothing a client can dial, and that "+
+				"surfaces as a handshake failure with nothing pointing at the endpoint",
+				endpoint, got, got)
+		}
+	}
+}
+
 // Both defaults in Up are invisible to every test above, because every test
 // above supplies both — and their absence is not a wrong answer, it is a nil
 // dereference in production only. This drives a bring-up with NEITHER supplied
