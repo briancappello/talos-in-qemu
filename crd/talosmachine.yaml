@@ -45,9 +45,21 @@ spec:
       additionalPrinterColumns:
         - { name: Site,  type: string, jsonPath: .spec.site }
         - { name: Role,  type: string, jsonPath: .spec.role }
+        - { name: Power, type: string, jsonPath: .status.powerState }
         - name: Ready
           type: string
           jsonPath: ".status.conditions[?(@.type=='Ready')].status"
+        # SYNCED EARNS A COLUMN, because without one the condition split buys
+        # nothing at the only place anyone looks. A machine stopped on purpose
+        # and a machine whose Create just failed BOTH print Power=Stopped and
+        # Ready=False — byte-identical rows, and one of them is an incident.
+        # Synced is the single character that tells them apart, and a condition
+        # nobody sees might as well not be published. Ordered after Ready to
+        # match Crossplane's READY/SYNCED convention, since these resources sit
+        # beside provider-managed ones in the same kubectl output.
+        - name: Synced
+          type: string
+          jsonPath: ".status.conditions[?(@.type=='Synced')].status"
         - { name: PID,   type: integer, jsonPath: .status.pid }
         - { name: API,   type: string, jsonPath: .status.apiEndpoint }
         - { name: Age,   type: date,   jsonPath: .metadata.creationTimestamp }
@@ -91,6 +103,17 @@ spec:
                     (talos-data), never by size — with two large disks a size
                     matcher becomes a coin flip between the OS target and this.
                     Omit for a single-disk machine with no StorageClass.
+                powerState:
+                  type: string
+                  enum: [Running, Stopped]
+                  default: Running
+                  description: >-
+                    Desired power. Stopped halts the VM and KEEPS its disks —
+                    the installed OS and any PVCs survive. Deleting the resource
+                    is what destroys them. Defaults to Running so existing
+                    manifests keep their meaning. Read by the CONTROLLER only:
+                    the standalone verbs always drive toward Running, and
+                    `tinq stop` is what halts a machine on that path.
                 machineConfigSecretRef:
                   type: object
                   description: >-
@@ -134,6 +157,7 @@ spec:
               type: object
               properties:
                 pid: { type: integer }
+                powerState: { type: string, description: Observed power state; may lag spec. }
                 stateDir: { type: string, description: Per-machine state root — removed on delete. }
                 apiEndpoint: { type: string }
                 observedGeneration: { type: integer }
