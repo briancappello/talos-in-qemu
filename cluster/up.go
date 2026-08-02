@@ -580,12 +580,12 @@ func (p *printer) summary(stateDir string, storage bool) {
 	if storage {
 		p.line("  storage              local-path-provisioner %s is the default StorageClass, so a", LocalPathVersion)
 		p.line("                       PVC with no storageClassName binds. Its data lives on the")
-		p.line("                       data disk inside this VM and does not survive -destroy.")
+		p.line("                       data disk inside this VM and does not survive `tinq destroy`.")
 	} else {
 		p.line("  storage              no StorageClass is installed, because spec.dataDisk is not")
 		p.line("                       set. A PVC with no storageClassName stays Pending. Set")
-		p.line("                       spec.dataDisk (with a unit) and -destroy/-up again — and")
-		p.line("                       note that PVC data does not survive -destroy either way.")
+		p.line("                       spec.dataDisk (with a unit), then `tinq destroy` and `tinq up`")
+		p.line("                       again — and note that PVC data does not survive either way.")
 	}
 
 	p.line("")
