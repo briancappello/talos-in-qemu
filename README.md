@@ -611,6 +611,18 @@ There is no `forget` verb yet, so clearing an adopted node's state directory is
   but it reads oddly.
 - **DHCP is assumed.** A node that comes up without a lease is unreachable, and
   TinQ cannot tell that apart from a node that never booted.
+- **The apply is unverified — trust the path to the node.** A node in
+  maintenance mode has no cluster PKI yet, so its certificate cannot be checked
+  against anything and TinQ does not try (`talosctl apply-config --insecure`
+  makes the same trade for the same reason). The machine config that crosses
+  that connection is the cluster's **five certificate authorities and its
+  machine token**. Whoever answers at `<endpoint>:50000` receives them, and
+  whoever sits in the middle can read them and edit the config the node
+  installs — neither is detectable from this side. Adopting across a
+  directly-attached segment or a trusted lab LAN is the intended case; adopting
+  across a network carrying hosts you would not hand the cluster's CA to is
+  not. The window closes as soon as the config lands: every call after it is
+  mutually authenticated.
 
 ## Unprivileged by construction
 

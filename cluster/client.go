@@ -93,10 +93,30 @@ func errNoEndpoint() error {
 // serves a self-signed certificate for CN=maintenance-service.talos.dev,
 // generated on the node at boot, and it asks for no client certificate: there
 // is no CA anywhere that could sign it, because the CA is in the config we
-// have not sent yet. The exposure is bounded by what maintenance mode is —
-// a node holding no secrets, reached over a loopback forward — and it ends the
-// moment ApplyConfiguration lands, after which AuthenticatedClient verifies
-// properly.
+// have not sent yet. `talosctl apply-config --insecure` is the same trade for
+// the same reason, and there is no trust anchor to substitute before the
+// config lands.
+//
+// TWO OF THE THREE BOUNDS STILL HOLD, AND THE THIRD NO LONGER DOES. The node
+// still holds no secrets while it is in maintenance mode, and the window still
+// closes the moment ApplyConfiguration lands, after which AuthenticatedClient
+// verifies properly. What is gone is loopback-by-construction: `adopt` dials
+// spec.baremetal.endpoint, the node's own LAN address, and `up` dials
+// hostForwards[].hostAddr, which the README documents as a way to publish on a
+// LAN. The channel is whatever network segment lies between.
+//
+// So the exposure is not "nothing", it is bounded by WHO CAN SIT IN THAT PATH,
+// and it has to be: applyConfiguration sends the machine config over this
+// client, and that config is five certificate authorities and the machine
+// token. An attacker able to answer at <endpoint>:50000 impersonates the node
+// and is handed the cluster's CA private keys; one able to sit in the middle
+// reads them and edits the config the real node installs. Neither is detected,
+// because there is nothing here to detect it with.
+//
+// The operator's decision, therefore: trust the path to the node for the
+// duration of an adopt. A directly-attached segment or a trusted lab LAN is
+// the case this is built for; a network with hosts you would not hand the
+// cluster's CA to is not, and no flag here changes that.
 //
 // The caller owns the returned client and must Close it.
 func MaintenanceClient(ctx context.Context, endpoint string) (*client.Client, error) {

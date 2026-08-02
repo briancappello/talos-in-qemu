@@ -279,6 +279,24 @@ can show: a real NIC taking a DHCP lease, and real disk serials.
    anything is installed rather than after.
 3. **DHCP is assumed.** A node that comes up without a lease is unreachable and
    this tool cannot tell that apart from a node that did not boot.
+4. **The maintenance-mode apply is UNVERIFIED AND UNPINNED, and is no longer
+   loopback-only.** `MaintenanceClient` sets `InsecureSkipVerify: true`
+   (`client.go`), which was structurally bounded before this branch: the
+   endpoint was always the host side of a loopback forward. D2 and D3 make it
+   the node's own LAN address for `adopt`, and `hostForwards[].hostAddr` can
+   publish `up`'s forward on a LAN too. What crosses that channel is
+   `applyConfiguration`'s payload — five certificate authorities and the
+   machine token. An attacker who can answer at `<endpoint>:50000` is handed
+   the cluster's CA private keys; one in the middle can read them and edit the
+   config the node installs.
+
+   No fix is proposed and none is available: this is exactly what `talosctl
+   apply-config --insecure` does, and before the config lands there is no trust
+   anchor to verify against. TOFU pinning would pin a certificate the node
+   generates fresh at every boot. The mitigation is operational — adopt over a
+   directly-attached segment or a trusted lab LAN — and the risk is recorded
+   here, in `client.go`'s comment and in the README's rough edges rather than
+   left implicit in a `//nolint:gosec`.
 
 ## Out of scope — the next branch
 
