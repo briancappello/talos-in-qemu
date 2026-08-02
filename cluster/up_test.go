@@ -1396,3 +1396,42 @@ func TestUpDisablesKexecWhenTheCallerAsks(t *testing.T) {
 
 	wants(t, transcript, "kexec_load_disabled=1", "MAINTENANCE")
 }
+
+// "" IS A REAL ANSWER for ConsoleArg, and adopt is the caller that gives it:
+// hardware has a firmware-configured console, and this host's architecture says
+// nothing about a machine that is not this host. Printed unconditionally the
+// line announced a BLANK value, and credited it to "this host's serial" — a
+// claim about the wrong machine, made on the one substrate where it is wrong.
+func TestStep6SaysNothingAboutAKernelArgItWasNotGiven(t *testing.T) {
+	f := newFixture(t)
+	f.opts.ConsoleArg = ""
+
+	transcript := f.mustRun(t)
+
+	if strings.Contains(transcript, "extraKernelArgs") {
+		t.Errorf("step 6 announced an extraKernelArgs it was never given\n"+
+			"  reason: the value is blank, so the line names a setting that is not in "+
+			"the config\n%s", redact(transcript))
+	}
+
+	if strings.Contains(transcript, "serial goes dead") {
+		t.Errorf("step 6 kept the reason for a line it did not print\n"+
+			"  reason: a justification with nothing above it reads as a step of its "+
+			"own\n%s", redact(transcript))
+	}
+}
+
+// The argument configures THE NODE. On QEMU the node happens to be a guest of
+// this host, which is what made "this host's serial" survive; on hardware the
+// node is somewhere else entirely and the credit is simply false.
+func TestStep6CreditsTheKernelArgToTheNode(t *testing.T) {
+	transcript := newFixture(t).mustRun(t)
+
+	wants(t, transcript, "extraKernelArgs: "+fakeConsoleArg+" (the node's serial console)")
+
+	if strings.Contains(transcript, "this host's serial") {
+		t.Errorf("step 6 credits the console arg to THIS host\n"+
+			"  reason: adopt drives a node that is not this host, and the transcript "+
+			"is what an operator learns Talos from\n%s", redact(transcript))
+	}
+}

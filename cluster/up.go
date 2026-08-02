@@ -497,9 +497,16 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer) 
 	p.detail("installer: ghcr.io/siderolabs/installer:%s (pinned to YOUR image)", opts.TalosVersion)
 	p.detail("  left unset Talos substitutes THIS binary's version, and a fresh install")
 	p.detail("  silently becomes a cross-version upgrade")
-	p.detail("extraKernelArgs: %s (this host's serial)", opts.ConsoleArg)
-	p.detail("  the installed system writes its own cmdline and inherits nothing from the")
-	p.detail("  ISO, so serial goes dead at exactly the boot you need to watch")
+	// GATED, because "" is a real answer and adopt is the caller that gives it.
+	// Ungated this announced a BLANK value and credited it to "this host" — on
+	// a machine that is not this host, and with nothing of the sort in the
+	// config. THE NODE's console, not the host's: the two are the same only
+	// under QEMU, where the guest is a guest of the machine that derived it.
+	if opts.ConsoleArg != "" {
+		p.detail("extraKernelArgs: %s (the node's serial console)", opts.ConsoleArg)
+		p.detail("  the installed system writes its own cmdline and inherits nothing from the")
+		p.detail("  ISO, so serial goes dead at exactly the boot you need to watch")
+	}
 
 	if opts.DisableKexec {
 		p.detail("sysctls: kernel.kexec_load_disabled=1")
