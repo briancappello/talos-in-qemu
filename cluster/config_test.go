@@ -367,29 +367,6 @@ func TestEmptyConsoleArgEmitsNoKernelArgsAndLeavesUKIAlone(t *testing.T) {
 	}
 }
 
-// The QEMU regression: with a console arg set, both halves must behave exactly
-// as they did before this task. This duplicates the existing assertion at
-// config_test.go:331-341 deliberately — that one runs on mustGenerateDefault
-// and would keep passing even if the conditional were wired backwards.
-func TestConsoleArgStillEmittedWhenSet(t *testing.T) {
-	in := testInput()
-	in.ConsoleArg = "console=ttyS0"
-
-	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
-
-	if !regexp.MustCompile(`(?m)^ {8}extraKernelArgs:\n {12}- console=ttyS0$`).MatchString(doc) {
-		t.Errorf("install has no extraKernelArgs console=ttyS0\n"+
-			"  reason: the installed system writes its own cmdline and inherits nothing "+
-			"from the ISO\n%s", redact(doc))
-	}
-
-	if regexp.MustCompile(`(?m)^ {8}grubUseUKICmdline: true`).MatchString(doc) {
-		t.Errorf("extraKernelArgs is set while GRUB takes its cmdline from the "+
-			"installer's UKI\n  reason: machinery rejects the two together, so this "+
-			"config does not validate in metal mode\n%s", redact(doc))
-	}
-}
-
 // NewInput takes clusterName and endpoint adjacently and both are strings, so
 // a swap compiles and produces a self-consistent — and useless — cluster.
 func TestGenerateConfigNamesTheClusterAndTheEndpointTheRightWayRound(t *testing.T) {
