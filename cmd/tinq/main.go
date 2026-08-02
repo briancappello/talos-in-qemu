@@ -359,27 +359,41 @@ const (
 	kubeAPIGuestPort  = 6443
 )
 
-// hostForward reports the HOST port forwarded to guestPort, or 0 when the
-// machine forwards nothing there.
+// defaultHostAddr is the bind address a forward gets when it names none.
+//
+// It is read in exactly TWO places — the qemu argument builder that BINDS the
+// forward, and hostForward below that DIALS it — and it is a constant so those
+// two can never drift apart. A dialled address that disagrees with the bound
+// one is not a wrong string, it is a five-minute timeout.
+const defaultHostAddr = "127.0.0.1"
+
+// hostForward reports the HOST address and port forwarded to guestPort, or
+// ("", 0) when the machine forwards nothing there.
 //
 // Everything reachable from the host goes through a qemu user-mode forward, so
 // a missing entry is not a slow path — it is an address that will never answer.
 // cluster.Up refuses an empty endpoint up front rather than spending a wait's
 // whole budget discovering that.
-func hostForward(m *unstructured.Unstructured, guestPort int) int {
+//
+// THE ADDRESS IS RETURNED, not assumed. qemu binds each forward to its own
+// hostAddr and binds it EXCLUSIVELY: with hostAddr set to a LAN address,
+// nothing is listening on loopback at all. Returning a hardcoded 127.0.0.1
+// here sent every wait to an address that could never answer, and the symptom
+// was a full maintenance timeout rather than a connection refusal.
+func hostForward(m *unstructured.Unstructured, guestPort int) (string, int) {
 	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
 		h, _ := hf.(map[string]interface{})
 		if toInt(h["guestPort"]) == guestPort {
-			return toInt(h["hostPort"])
+			return str(h["hostAddr"], defaultHostAddr), toInt(h["hostPort"])
 		}
 	}
-	return 0
+	return "", 0
 }
 
 // talosEndpoint is the host side of the Talos API forward, host:port, or "".
 func talosEndpoint(m *unstructured.Unstructured) string {
-	if p := hostForward(m, talosAPIGuestPort); p > 0 {
-		return fmt.Sprintf("127.0.0.1:%d", p)
+	if a, p := hostForward(m, talosAPIGuestPort); p > 0 {
+		return fmt.Sprintf("%s:%d", a, p)
 	}
 	return ""
 }
@@ -390,8 +404,8 @@ func talosEndpoint(m *unstructured.Unstructured) string {
 // into the kubeconfig, so it has to be the address the HOST can reach — the
 // guest's own is unroutable from here without a bridge.
 func kubeEndpoint(m *unstructured.Unstructured) string {
-	if p := hostForward(m, kubeAPIGuestPort); p > 0 {
-		return fmt.Sprintf("https://127.0.0.1:%d", p)
+	if a, p := hostForward(m, kubeAPIGuestPort); p > 0 {
+		return fmt.Sprintf("https://%s:%d", a, p)
 	}
 	return ""
 }
@@ -955,7 +969,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		// difference between "runs on my machine" and "runs in a demo". Set
 		// hostAddr to 0.0.0.0 (or a specific interface address) to publish it.
 		// That is a deliberate, per-port exposure decision, not a global switch.
-		addr := str(h["hostAddr"], "127.0.0.1")
+		addr := str(h["hostAddr"], defaultHostAddr)
 		switch strings.ToLower(str(h["protocol"], "tcp")) {
 		case "udp":
 			netdev += fmt.Sprintf(",hostfwd=udp:%s:%d-:%d", addr, hp, gp)

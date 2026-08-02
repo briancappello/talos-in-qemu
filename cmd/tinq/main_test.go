@@ -1860,3 +1860,40 @@ func TestHaltRefusesToSignalAPidItCannotProveIsOurs(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 }
+
+func TestEndpointsHonourHostAddr(t *testing.T) {
+	m := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"hostForwards": []interface{}{
+			map[string]interface{}{"hostPort": int64(50000), "guestPort": int64(50000),
+				"hostAddr": "192.168.1.165"},
+			map[string]interface{}{"hostPort": int64(6443), "guestPort": int64(6443),
+				"hostAddr": "192.168.1.165"},
+		}},
+	}}
+
+	if got := talosEndpoint(m); got != "192.168.1.165:50000" {
+		t.Errorf("talosEndpoint = %q, want 192.168.1.165:50000\n"+
+			"  reason: qemu binds the forward to hostAddr ONLY, so dialling loopback "+
+			"reaches nothing and spends the whole maintenance budget proving it", got)
+	}
+
+	if got := kubeEndpoint(m); got != "https://192.168.1.165:6443" {
+		t.Errorf("kubeEndpoint = %q, want https://192.168.1.165:6443\n"+
+			"  reason: this address is written into the kubeconfig AND becomes the "+
+			"cert SAN, so a wrong one fails every kubectl call", got)
+	}
+}
+
+// The default is the regression that matters: an entry with no hostAddr must
+// still produce loopback, because that is what every existing machine file has.
+func TestEndpointsDefaultToLoopbackWithoutHostAddr(t *testing.T) {
+	m := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"hostForwards": []interface{}{
+			map[string]interface{}{"hostPort": int64(50000), "guestPort": int64(50000)},
+		}},
+	}}
+
+	if got := talosEndpoint(m); got != "127.0.0.1:50000" {
+		t.Errorf("talosEndpoint = %q, want 127.0.0.1:50000", got)
+	}
+}
