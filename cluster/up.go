@@ -186,18 +186,28 @@ func Up(ctx context.Context, opts UpOptions) error {
 
 	// Both endpoints are checked BEFORE anything is created, for the same
 	// reason create() resolves host facts first: failing here costs nothing,
-	// and failing later costs a VM nobody asked to keep. A missing forward is
+	// and failing later costs a VM nobody asked to keep. A missing endpoint is
 	// otherwise discovered by a wait spending its entire budget on an address
 	// that was never there.
+	//
+	// Both messages describe what the endpoint IS and prescribe no field to
+	// fix it in. There are two origins and they have nothing in common: a VM's
+	// endpoint is the host side of a forward, from spec.hostForwards, and an
+	// adopted node's is derived from spec.baremetal.endpoint, which the CRD
+	// forbids alongside hostForwards. A message naming one of them is wrong
+	// for the other half of its readers, and naming hostForwards to an adopt
+	// would prescribe the exact field the CRD rejects.
 	if opts.TalosEndpoint == "" {
-		return errors.New("no Talos API endpoint: this is the host side of the qemu forward to " +
-			"guest port 50000, so spec.hostForwards needs an entry for it")
+		return errors.New("no Talos API endpoint: this is the address a client dials to reach " +
+			"this node's Talos API, as host:port — apid's port 50000 at the machine's own " +
+			"address, or the host side of a forward to it")
 	}
 
 	if opts.KubeEndpoint == "" {
-		return errors.New("no Kubernetes API endpoint: this is the host side of the qemu forward to " +
-			"guest port 6443, so spec.hostForwards needs an entry for it — a kubeconfig pointing " +
-			"anywhere else cannot be used from this host")
+		return errors.New("no Kubernetes API endpoint: this is the URL a client dials to reach " +
+			"this node's kube-apiserver — port 6443 at the machine's own address, or the host " +
+			"side of a forward to it; a kubeconfig pointing anywhere else cannot be used from " +
+			"this host")
 	}
 
 	p := &printer{w: out}

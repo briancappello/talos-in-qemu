@@ -787,9 +787,10 @@ func TestUpStopsAtTheFirstFailedStep(t *testing.T) {
 	}
 }
 
-// Both endpoints are the HOST side of a qemu forward, and both come from
-// spec.hostForwards. A missing one is not discovered until a wait spends its
-// whole budget on an address that is not there.
+// Both endpoints are the address a client dials to reach this node — the host
+// side of a forward for a VM, the node's own address for adopted hardware. A
+// missing one is not discovered until a wait spends its whole budget on an
+// address that is not there.
 func TestUpRefusesWithoutTheForwardedEndpoints(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -809,8 +810,9 @@ func TestUpRefusesWithoutTheForwardedEndpoints(t *testing.T) {
 			}
 
 			if !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("the refusal does not name the guest port %s: %s\n"+
-					"  reason: the fix is a spec.hostForwards entry, and the message is the only thing that says which",
+				t.Errorf("the refusal does not name the API's port %s: %s\n"+
+					"  reason: the port is what tells the two endpoints apart, and the message is the "+
+					"only thing that says which one is missing",
 					tc.want, redactErr(err))
 			}
 

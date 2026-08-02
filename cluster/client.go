@@ -81,9 +81,16 @@ func errSecretParse(what string) error {
 
 // errNoEndpoint refuses an empty endpoint up front rather than spending the
 // caller's whole timeout discovering that "" is not an address.
+//
+// It says what the endpoint IS and names no remedy, because the remedy differs
+// by substrate and this package no longer knows which one it is looking at: a
+// VM's endpoint is the host side of a port forward, an adopted node's is the
+// node's own address, where there is no forward to add. A message naming one
+// of the two sends half its readers to a field that does not apply to them.
 func errNoEndpoint() error {
-	return errors.New("no Talos API endpoint given (want host:port, e.g. 127.0.0.1:50000 — " +
-		"the host side of the qemu forward)")
+	return errors.New("no Talos API endpoint given: this is the address a client dials to reach " +
+		"this node's Talos API, as host:port — e.g. 127.0.0.1:50000 for a forwarded VM, " +
+		"192.168.1.50:50000 for a node reached at its own address")
 }
 
 // MaintenanceClient dials a node running in MAINTENANCE mode: booted from the
