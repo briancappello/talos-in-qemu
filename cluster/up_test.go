@@ -495,6 +495,11 @@ func TestUpAnnouncesTheReasonForEveryNonObviousDecision(t *testing.T) {
 // correctly on amd64 and put an arm64 node's console on a UART it does not have.
 func TestUpCarriesTheHostsConsoleArgIntoTheConfig(t *testing.T) {
 	f := newFixture(t)
+	// NOT the fixture's loopback endpoint. APIAddress is asserted below, and
+	// against 127.0.0.1:50000 a hardcoded "127.0.0.1" written beside the
+	// endpoint in up.go is indistinguishable from deriving it — which is the
+	// exact defect the derivation exists to remove.
+	f.opts.TalosEndpoint = "192.168.1.50:50000"
 	f.mustRun(t)
 
 	if f.rec.input.ConsoleArg != "console=ttyFAKE0" {
@@ -516,6 +521,13 @@ func TestUpCarriesTheHostsConsoleArgIntoTheConfig(t *testing.T) {
 
 	if f.rec.input.Endpoint != "https://127.0.0.1:6443" {
 		t.Errorf("GenerateConfig got Endpoint %q, want the Kubernetes API URL", f.rec.input.Endpoint)
+	}
+
+	if f.rec.input.APIAddress != "192.168.1.50" {
+		t.Errorf("GenerateConfig got APIAddress %q, want the host part of TalosEndpoint 192.168.1.50\n"+
+			"  reason: apid's certificate must name the address the client dials; an address written "+
+			"beside the endpoint instead of derived from it is a TLS failure minutes into a bring-up",
+			f.rec.input.APIAddress)
 	}
 
 	if f.rec.input.ClusterName != "probe" {
