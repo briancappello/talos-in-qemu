@@ -80,9 +80,13 @@ type UpOptions struct {
 	// are written into it so -destroy sweeps them with everything else and the
 	// secrets do not outlive the cluster.
 	StateDir string
-	// TalosEndpoint is the HOST side of the qemu forward to apid, host:port.
+	// TalosEndpoint is the address a client dials to reach this node's apid,
+	// host:port. Under QEMU that is the host side of a forward; for an adopted
+	// node it is the node's own address, where there is no forward at all. It
+	// is also what apid's certificate is issued for — see apiAddress.
 	TalosEndpoint string
-	// KubeEndpoint is the Kubernetes API as seen from the host, a URL.
+	// KubeEndpoint is the same address for kube-apiserver, as a URL: a
+	// forward's host side under QEMU, the node's own address on hardware.
 	KubeEndpoint string
 	// SystemDiskSerial is the install target's serial.
 	SystemDiskSerial string
@@ -158,8 +162,13 @@ func realHooks() *upHooks {
 	}
 }
 
-// Up turns a Talos ISO and a state directory into a working single-node
-// Kubernetes cluster, announcing each of ten steps as it goes.
+// Up turns a maintenance-mode Talos node and a state directory into a working
+// single-node Kubernetes cluster, announcing each of ten steps as it goes.
+//
+// HOW THAT NODE CAME TO BE IN MAINTENANCE MODE IS THE CALLER'S BUSINESS, and
+// that is what lets one sequence serve two substrates: Boot starts a VM from an
+// ISO for `up`, and returns (0, nil) for `adopt`, whose node was booted by a
+// human from a stick. Nothing below this line can tell the two apart.
 //
 // It is IDEMPOTENT, and that is what makes `tinq stop` followed by `tinq up`
 // work — the most natural pair of commands there is, and the one that used to
@@ -462,11 +471,6 @@ func Up(ctx context.Context, opts UpOptions) error {
 // because the caller is what knows they leave a VM behind.
 func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer) ([]byte, error) {
 	// ── 6/10 config ─────────────────────────────────────────────────────────
-	//
-	// WHETHER kexec is disabled is the CALLER's decision, and the reason is
-	// that it is a fact about the host rather than about the node: the one
-	// substrate it applies to is QEMU on macOS/arm64. See UpOptions.DisableKexec
-	// and, for the gate itself, cmd/tinq's upOptions.
 	addr, err := apiAddress(opts.TalosEndpoint)
 	if err != nil {
 		return nil, err
@@ -480,7 +484,12 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer) 
 		ConsoleArg:       opts.ConsoleArg,
 		SystemDiskSerial: opts.SystemDiskSerial,
 		DataDiskSerial:   opts.DataDiskSerial,
-		DisableKexec:     opts.DisableKexec,
+		// WHETHER kexec is disabled is the CALLER's decision, and the reason
+		// is that it is a fact about the host rather than about the node: the
+		// one substrate it applies to is QEMU on macOS/arm64. See
+		// UpOptions.DisableKexec and, for the gate itself, cmd/tinq's
+		// upOptions.
+		DisableKexec: opts.DisableKexec,
 	})
 	if err != nil {
 		return nil, err

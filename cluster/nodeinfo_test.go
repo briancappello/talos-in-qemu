@@ -253,7 +253,7 @@ func TestFormatDisksNotesEveryDistinguishingFact(t *testing.T) {
 	}
 }
 
-// The boot medium is identified by READONLY, not CDROM: client_test.go:929-935
+// The boot medium is identified by READONLY, not CDROM: client_test.go:954-957
 // records that a Talos ISO presents as a read-only virtio-blk device, and so
 // does the squashfs loop device. A table flagging only cdrom shows the stick
 // you booted from as an ordinary candidate.

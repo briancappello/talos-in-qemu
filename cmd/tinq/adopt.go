@@ -190,6 +190,15 @@ func ignoreBaremetalOp(m *unstructured.Unstructured, op string) error {
 // every tick by contract. status carries the endpoint so the operator can ask
 // the node itself, which is the only thing that can answer.
 //
+// THE PRICE IS PAID IN Ready, and it is wider than a node that was adopted and
+// later powered off. Nothing is stat'ed here — not a state dir, not a
+// talosconfig — so a TalosMachine carrying spec.baremetal reports Ready=True
+// from the moment it is applied, before `tinq adopt` has ever been run against
+// it and whether or not the address in spec.baremetal.endpoint has anything
+// behind it. driverkit's Observe contract records the same exception from the
+// other side. Reading Ready as "this node is serving" is wrong for hardware in
+// both directions; the endpoint in status is what to ask instead.
+//
 // No pid: this process did not start that node and holds no handle on it — the
 // same honesty adopt's Boot func uses when it returns 0.
 func observeBaremetal(m *unstructured.Unstructured, dir string) (driverkit.State, map[string]interface{}, error) {

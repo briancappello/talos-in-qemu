@@ -506,9 +506,13 @@ func TestUpAnnouncesTheReasonForEveryNonObviousDecision(t *testing.T) {
 	}
 }
 
-// The console arg is the host's, from Detect. A literal in up.go would read
-// correctly on amd64 and put an arm64 node's console on a UART it does not have.
-func TestUpCarriesTheHostsConsoleArgIntoTheConfig(t *testing.T) {
+// Every node fact Up is GIVEN reaches GenerateConfig unaltered, and the two
+// worth a test of their own are the console arg and the API address. The
+// console arg is the caller's — up.go no longer derives one, and a literal
+// here would read correctly on amd64 and put an arm64 node's console on a UART
+// it does not have. The address is DERIVED, from the endpoint, which is the
+// one field in this struct nobody hands over ready-made.
+func TestUpCarriesTheCallersNodeFactsIntoTheConfig(t *testing.T) {
 	f := newFixture(t)
 	// NOT the fixture's loopback endpoint. APIAddress is asserted below, and
 	// against 127.0.0.1:50000 a hardcoded "127.0.0.1" written beside the
@@ -518,7 +522,7 @@ func TestUpCarriesTheHostsConsoleArgIntoTheConfig(t *testing.T) {
 	f.mustRun(t)
 
 	if f.rec.input.ConsoleArg != "console=ttyFAKE0" {
-		t.Errorf("GenerateConfig got ConsoleArg %q, want the host's console=ttyFAKE0\n"+
+		t.Errorf("GenerateConfig got ConsoleArg %q, want the caller's console=ttyFAKE0\n"+
 			"  reason: hardcoding ttyS0 gives an arm64 node a serial console it does not have",
 			f.rec.input.ConsoleArg)
 	}

@@ -83,8 +83,8 @@ type Disk struct {
 
 // ListDisks asks a maintenance-mode node what disks it has.
 //
-// Same COSI call TestAgainstARealNode has made against real hardware since the
-// bring-up branch (client_test.go:847); this is that call given an exported
+// Same COSI call TestAgainstARealNode has made against a real node since the
+// bring-up branch (client_test.go:915); this is that call given an exported
 // caller, not new capability.
 func ListDisks(ctx context.Context, endpoint string) ([]Disk, error) {
 	c, err := MaintenanceClient(ctx, endpoint)

@@ -48,13 +48,29 @@ type ConfigInput struct {
 	// it is the node's own address. The generated config is identical either
 	// way, which is the whole point.
 	APIAddress string
-	// TalosVersion is the version read off the ISO. It is REQUIRED:
-	// InspectImageVersion renders an unclassifiable image as "", and
-	// GenerateConfig refuses that rather than substituting its own version,
-	// because this value becomes the installer image tag on the node's disk.
+	// TalosVersion is the node's Talos version, resolved by the caller from
+	// whichever source that substrate has: the ISO's volume id before a VM
+	// boots (InspectImageVersion), or the node itself once it is answering in
+	// maintenance mode (NodeVersion). It is REQUIRED: both sources render an
+	// unidentifiable answer as "", and GenerateConfig refuses that rather than
+	// substituting its own version, because this value becomes the installer
+	// image tag on the node's disk.
 	TalosVersion string
-	// ConsoleArg is the console kernel argument for this platform, from
-	// platform.Detect().
+	// ConsoleArg is the console kernel argument for the NODE, or "" for none.
+	//
+	// EMPTY IS AN ANSWER, not an unset field, and two gates below read it as
+	// one: with "" no extraKernelArgs is emitted at all, and
+	// InstallGrubUseUKICmdline is left exactly as machinery set it. The two
+	// move together because they are one decision — GRUB's UKI cmdline and
+	// extraKernelArgs cannot coexist, so switching the UKI cmdline off is only
+	// justified by an argument actually being passed.
+	//
+	// Under QEMU the console is the only way to watch a boot and the installed
+	// system inherits nothing from the ISO, so one has to be named. On hardware
+	// the firmware has already configured a console and there is usually a
+	// display, so naming one is a guess that can boot the node with a dead
+	// console. The CALLER decides which case it is in; this package cannot
+	// know, and no longer has a way to ask.
 	ConsoleArg string
 	// SystemDiskSerial is the serial of the install target.
 	SystemDiskSerial string
@@ -68,8 +84,9 @@ type ConfigInput struct {
 	// and this package does not know one from another.
 	//
 	// It is a bool rather than a GOOS because the config layer has no business
-	// mapping operating systems to workarounds; up.go holds the platform and
-	// makes that call.
+	// mapping operating systems to workarounds — and neither does up.go, which
+	// stopped holding a platform when cluster/ stopped importing one.
+	// cmd/tinq's upOptions makes that call, from the host it detected.
 	DisableKexec bool
 }
 
