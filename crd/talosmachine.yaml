@@ -76,10 +76,19 @@ spec:
                     a TalosMachine is either hardware (spec.baremetal) or a VM to build
                     (image, cpu, memory, disk). Relaxing `required` is what allows the
                     first; this rule is what stops it also allowing a VM with no disk.
-                - rule: "!(has(self.baremetal) && has(self.hostForwards))"
+                - rule: "!(has(self.baremetal) && (has(self.hostForwards) || has(self.image) || has(self.cpu) || has(self.memory) || has(self.disk) || has(self.dataDisk)))"
                   message: >-
-                    spec.hostForwards describes a qemu user-mode port forward and has no
-                    meaning for hardware, which serves apid on its own address.
+                    image, cpu, memory, disk, dataDisk and hostForwards all describe a guest
+                    to BUILD, and a machine that already exists is not built: nothing here
+                    creates its disks, sizes its RAM, or forwards a host port into it —
+                    hardware serves apid on its own address. ACCEPTING THEM AND IGNORING
+                    THEM IS THE WORSE FAILURE, because a manifest carrying both shapes reads
+                    as configuration that is in effect when none of it is; the machine is
+                    hardware the moment spec.baremetal is present, and every one of these
+                    fields is then dead text. The price is paid on migration: turning a VM
+                    manifest into a hardware one means DELETING these fields, not merely
+                    adding spec.baremetal. That is the trade — one explicit edit, over a
+                    silent discard that never announces itself.
               properties:
                 site:
                   type: string
