@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/coglative/talos-in-qemu/platform"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // THE OUTPUT IS THE FEATURE, so the output is what this file tests.
@@ -48,6 +50,12 @@ const (
 	fakeTalosconfig  = "talosconfig-secret-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 	fakeSecrets      = "secretsbundle-secret-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 	fakeKubeconfig   = "kubeconfig-secret-DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+	// The talosconfig a PREVIOUS `up` left in the state dir. It is deliberately
+	// a different string from fakeTalosconfig, which is what THIS run's config
+	// generation would produce: a resumed bring-up that quietly generated fresh
+	// material and used that instead would be invisible if the two agreed, and
+	// what it produces is a new CA the installed node does not trust.
+	existingTalosconfig = "existing-talosconfig-secret-EEEEEEEEEEEEEEEEEEEEEEEEEEEE"
 )
 
 // recorder captures what Up asked its hooks to do, so a test can assert on
@@ -248,29 +256,30 @@ func wants(t *testing.T, transcript string, fragments ...string) {
 	}
 }
 
-// The step line is the contract: the number, the total and the label. Asserting
-// on the label alone lets two steps swap places and the suite stay green — and
-// the ORDER is the thing an operator reads a bring-up transcript for.
-func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
-	f := newFixture(t)
-	transcript := f.mustRun(t)
+// announcedSteps is every step line a bring-up prints, in order. It is shared
+// because a RESUMED bring-up has to print all ten of them too: steps it skips
+// are announced as skipped, never dropped, so the numbering cannot silently
+// close up and describe a sequence that did not run.
+var announcedSteps = []string{
+	"[ 1/10] platform",
+	"[ 2/10] image",
+	"[ 3/10] version guard",
+	"[ 4/10] boot",
+	"[ 5/10] maintenance",
+	"[ 6/10] config",
+	"[ 7/10] apply-config",
+	"[ 8/10] bootstrap",
+	"[ 9/10] kubeconfig",
+	"[10/10] storage",
+}
 
-	steps := []string{
-		"[ 1/10] platform",
-		"[ 2/10] image",
-		"[ 3/10] version guard",
-		"[ 4/10] boot",
-		"[ 5/10] maintenance",
-		"[ 6/10] config",
-		"[ 7/10] apply-config",
-		"[ 8/10] bootstrap",
-		"[ 9/10] kubeconfig",
-		"[10/10] storage",
-	}
+// stepsInOrder asserts every announced step is present, once, in order.
+func stepsInOrder(t *testing.T, transcript string) {
+	t.Helper()
 
 	at := -1
 
-	for _, step := range steps {
+	for _, step := range announcedSteps {
 		i := strings.Index(transcript, step)
 		if i < 0 {
 			t.Fatalf("no %q line in the transcript\n%s", step, redact(transcript))
@@ -284,6 +293,16 @@ func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
 
 		at = i
 	}
+}
+
+// The step line is the contract: the number, the total and the label. Asserting
+// on the label alone lets two steps swap places and the suite stay green — and
+// the ORDER is the thing an operator reads a bring-up transcript for.
+func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
+	f := newFixture(t)
+	transcript := f.mustRun(t)
+
+	stepsInOrder(t, transcript)
 
 	// A reason printed flush left reads as a step of its own, and the
 	// transcript's whole shape is "the operation, then why". Every line inside
@@ -620,6 +639,22 @@ func TestUpNeverPrintsSecrets(t *testing.T) {
 		}
 	})
 
+	// A RESUMED bring-up reads a talosconfig off disk and announces that it
+	// did, which is a new place for the file's contents to end up in a line
+	// that is meant to name it.
+	t.Run("on-a-resumed-run", func(t *testing.T) {
+		f := newFixture(t)
+		writeTalosconfig(t, f.dir)
+
+		transcript := f.mustRun(t)
+
+		if strings.Contains(transcript, existingTalosconfig) {
+			t.Errorf("the talosconfig read from the state dir was printed to the transcript (%d chars)\n"+
+				"  reason: it is a cluster CA and a client key; the step may name the file, never its contents",
+				len(existingTalosconfig))
+		}
+	})
+
 	// Every step after the config exists holds secret material in a local, and
 	// a failure is where an error message goes looking for context to add.
 	for _, step := range []string{"applyConfig", "waitBootstrapReady", "bootstrap", "kubeconfig", "waitNodeReady", "installStorage"} {
@@ -641,9 +676,11 @@ func TestUpNeverPrintsSecrets(t *testing.T) {
 	}
 }
 
-// A bring-up that dies half way leaves a VM and a state dir, and v1 has no
-// resume. Saying so is the difference between a retry that works and a second
-// -up against a node that is no longer in maintenance mode.
+// A bring-up that dies half way leaves a VM and a state dir. Re-running `up` is
+// now the first thing to try — it resumes from whatever the machine reached —
+// so the message has to say that AND name the one case a retry cannot repair:
+// a config written to the state dir but never accepted by the node, where the
+// state dir says "configured" and the node is still in maintenance mode.
 func TestUpSaysHowToRecoverFromAMidFlightFailure(t *testing.T) {
 	f := newFixture(t)
 	f.rec.failAt = "bootstrap"
@@ -653,11 +690,19 @@ func TestUpSaysHowToRecoverFromAMidFlightFailure(t *testing.T) {
 		t.Fatal("a failing bootstrap did not fail the bring-up")
 	}
 
-	for _, want := range []string{"-destroy", "not resumable"} {
+	for _, want := range []string{"tinq up", "tinq destroy", "maintenance mode"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the failure does not mention %q: %s\n"+
-				"  reason: re-running -up against a node past maintenance mode waits out the whole timeout for nothing",
-				want, redactErr(err))
+				"  reason: the retry that works and the retry that waits out a ten-minute timeout are different commands, "+
+				"and this message is the only thing that tells them apart", want, redactErr(err))
+		}
+	}
+
+	// The flag spellings are gone: these are cobra verbs now, and a message
+	// telling an operator to run `tinq -destroy` sends them to a usage error.
+	for _, stale := range []string{"-destroy", "-up "} {
+		if strings.Contains(err.Error(), stale) {
+			t.Errorf("the failure still tells the operator to run %q: %s", stale, redactErr(err))
 		}
 	}
 }
@@ -976,6 +1021,263 @@ func TestUpKeepsTheVersionGuardsExplanation(t *testing.T) {
 	}
 
 	wants(t, err.Error(), "v1.99.0", GeneratorVersion())
+}
+
+// ── D8: a bring-up starts from wherever the machine already is ──────────────
+//
+// `tinq stop` keeps a machine's disks, so the most natural next command is
+// `tinq up` — and before this it could not work. The node boots the system it
+// INSTALLED, never re-enters maintenance mode, and step 5 spent its entire
+// five-minute budget proving that before failing.
+//
+// The discriminator is the talosconfig in the state dir, and what it is matters
+// to every test below: it is a CREDENTIAL, not a status. Its presence is what
+// makes an authenticated call possible at all; the claim that the node is
+// configured still comes from whether that call's handshake succeeds, which a
+// node in maintenance mode cannot fake.
+
+// writeTalosconfig leaves behind what a previous `up` leaves behind. It is the
+// ONLY difference between the two paths.
+func writeTalosconfig(t *testing.T, dir string) {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, "talosconfig"), []byte(existingTalosconfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A machine that has been configured before must not be sent back through
+// maintenance mode, config generation or apply-config: the first waits for a
+// state the node has left forever, and the other two mint a NEW secrets bundle
+// whose CA the installed node has never heard of.
+func TestUpSkipsConfigurationForAMachineThatAlreadyHasATalosconfig(t *testing.T) {
+	f := newFixture(t)
+	writeTalosconfig(t, f.dir)
+
+	transcript := f.mustRun(t)
+
+	for _, op := range []string{"waitMaintenance", "generateConfig", "applyConfig"} {
+		if f.rec.did(op) {
+			t.Errorf("%s ran for a machine that was already configured\n"+
+				"  reason: %s", op, resumeReason(op))
+		}
+	}
+
+	if !f.rec.did("waitBootstrapReady") {
+		t.Error("nothing waited for the node to be reachable before bootstrap\n" +
+			"  reason: the VM was just started; bootstrapping into a booting node fails on a dial")
+	}
+
+	// The credential in flight is the one from DISK. A resumed run that used
+	// freshly generated material would authenticate against a CA the node does
+	// not trust, and every call after this point would fail on the handshake.
+	if got := string(f.rec.payload["bootstrap"]); got != existingTalosconfig {
+		t.Errorf("bootstrap was handed a %d-byte talosconfig, want the %d-byte one from the state dir\n"+
+			"  reason: a regenerated bundle is a NEW cluster CA, and the installed node trusts the old one",
+			len(got), len(existingTalosconfig))
+	}
+
+	// And nothing overwrote it. secrets.yaml and controlplane.yaml are the
+	// same story: rewriting them buries the material the node actually holds.
+	b, err := os.ReadFile(filepath.Join(f.dir, "talosconfig"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(b) != existingTalosconfig {
+		t.Errorf("the talosconfig in the state dir was rewritten (%d bytes, was %d)\n"+
+			"  reason: it is the only way back into the installed node", len(b), len(existingTalosconfig))
+	}
+
+	// The run still finishes the cluster half: kubeconfig, node Ready, storage.
+	for _, op := range []string{"bootstrap", "kubeconfig", "waitNodeReady", "installStorage"} {
+		if !f.rec.did(op) {
+			t.Errorf("%s never ran on a resumed bring-up\n"+
+				"  reason: the point of `up` is a Ready node with somewhere to put a PVC, from whatever state it starts in", op)
+		}
+	}
+
+	stepsInOrder(t, transcript)
+}
+
+func resumeReason(op string) string {
+	switch op {
+	case "waitMaintenance":
+		return "the node boots the system it installed and never re-enters maintenance mode, so this can only time out"
+	case "generateConfig":
+		return "generation mints a fresh secrets bundle, and its CA is not the one the installed node was given"
+	}
+
+	return "the config is already on the node; applying another would install over a running system"
+}
+
+// The transcript must say WHICH steps did not run and WHY. Silently renumbering
+// or leaving gaps turns the one artifact an operator reads a bring-up by into
+// something they have to reverse-engineer.
+func TestUpAnnouncesTheStepsAResumedBringUpSkips(t *testing.T) {
+	f := newFixture(t)
+	writeTalosconfig(t, f.dir)
+
+	transcript := f.mustRun(t)
+
+	wants(t, transcript,
+		"[ 5/10] maintenance", "[ 6/10] config", "[ 7/10] apply-config",
+		// each skip named as a skip
+		"skipped",
+		// and the discriminator explained, in the operator's terms
+		"talosconfig",
+		// the reason maintenance can never answer again
+		"maintenance mode",
+		// the reason regenerating would be worse than useless
+		"CA",
+	)
+
+	// A skipped step must not claim work it did not do.
+	for _, lie := range []string{
+		"wrote controlplane.yaml, talosconfig, secrets.yaml",
+		"reachable after",
+		"installing... rebooting...",
+	} {
+		if strings.Contains(transcript, lie) {
+			t.Errorf("a resumed bring-up printed %q\n"+
+				"  reason: the step did not run; announcing it makes the transcript something to debug rather than debug from\n%s",
+				lie, redact(transcript))
+		}
+	}
+}
+
+// The other side: a machine with NO talosconfig is a machine nothing has ever
+// configured — an `apply` machine, or a fresh one — and it must take the
+// original path unchanged. TestUpRunsTheOperationsInTheOrderTheNodeRequires
+// asserts the whole sequence; this one names the three steps D8 could have
+// stolen from it, so a discriminator inverted by a missing `!` cannot pass.
+func TestUpConfiguresAMachineWithNoTalosconfig(t *testing.T) {
+	f := newFixture(t)
+
+	if _, err := os.Stat(filepath.Join(f.dir, "talosconfig")); !os.IsNotExist(err) {
+		t.Fatalf("the fixture state dir already holds a talosconfig; this test asserts nothing")
+	}
+
+	transcript := f.mustRun(t)
+
+	for _, op := range []string{"waitMaintenance", "generateConfig", "applyConfig"} {
+		if !f.rec.did(op) {
+			t.Errorf("%s did not run for a machine that was never configured\n"+
+				"  reason: nothing else applies a machine config, and a node in maintenance mode never installs without one", op)
+		}
+	}
+
+	if strings.Contains(transcript, "skipped (already configured)") {
+		t.Errorf("a never-configured machine was treated as resumable\n%s", redact(transcript))
+	}
+}
+
+// ── D9: bootstrap is ATTEMPTED, never probed ────────────────────────────────
+//
+// `up` applies the config, waits out the reboot, and only THEN bootstraps etcd.
+// A machine stopped inside that window comes back with apid serving the cluster
+// PKI — so the authenticated wait succeeds — and with no etcd at all. Skipping
+// bootstrap on the strength of that wait hangs forever in step 9 against a node
+// that can never report Ready.
+
+// alreadyBootstrappedError is exactly what a node returns for a second
+// bootstrap, wrapped the way bootstrapEtcd wraps it. Source, Talos v1.13.7,
+// internal/app/machined/internal/server/v1alpha1/v1alpha1_server.go:457:
+//
+//	if entries, _ := os.ReadDir(constants.EtcdDataPath); len(entries) > 0 {
+//		return nil, status.Error(codes.AlreadyExists, "etcd data directory is not empty")
+//	}
+func alreadyBootstrappedError() error {
+	return fmt.Errorf("bootstrapping etcd: %w",
+		status.Error(codes.AlreadyExists, "etcd data directory is not empty"))
+}
+
+func TestUpTreatsAnAlreadyBootstrappedNodeAsSuccess(t *testing.T) {
+	f := newFixture(t)
+	writeTalosconfig(t, f.dir)
+	f.rec.failAt = "bootstrap"
+	f.rec.err = alreadyBootstrappedError()
+
+	transcript := f.mustRun(t)
+
+	wants(t, transcript, "[ 8/10] bootstrap", "already bootstrapped")
+
+	for _, op := range []string{"kubeconfig", "waitNodeReady", "installStorage"} {
+		if !f.rec.did(op) {
+			t.Errorf("%s never ran after a node reported it was already bootstrapped\n"+
+				"  reason: that refusal is the node agreeing etcd exists, which is the whole precondition of the steps after it", op)
+		}
+	}
+}
+
+// The near-miss mutants, and the reason the matcher is a gRPC CODE rather than
+// a string: everything else from bootstrap is a real failure, and swallowing it
+// would leave `up` waiting on a node that can never become Ready.
+func TestUpFailsOnABootstrapErrorThatIsNotAlreadyBootstrapped(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{
+			// The node's OTHER refusal: apid is up but the runtime is not ready
+			// to bootstrap yet. Same shape, different code, and retrying is not
+			// the answer.
+			"another gRPC code",
+			fmt.Errorf("bootstrapping etcd: %w",
+				status.Error(codes.FailedPrecondition, "bootstrap is not available yet")),
+		},
+		{
+			// The same WORDS with no status attached. A substring matcher would
+			// accept this; nothing in Talos produces it over the wire, and
+			// anything that did is not a node telling us etcd exists.
+			"the same message with no code",
+			errors.New("etcd data directory is not empty"),
+		},
+		{
+			"an ordinary failure",
+			errors.New("connection refused"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			writeTalosconfig(t, f.dir)
+			f.rec.failAt = "bootstrap"
+			f.rec.err = tc.err
+
+			err := f.run(t)
+			if err == nil {
+				t.Fatalf("a failing bootstrap (%v) was reported as a working cluster\n"+
+					"  reason: only AlreadyExists means etcd is there; every other error leaves a node that never reaches Ready", tc.err)
+			}
+
+			if f.rec.did("kubeconfig") {
+				t.Error("the bring-up continued past a bootstrap that failed")
+			}
+		})
+	}
+}
+
+// The matcher itself, at the unit it is written in. The message is upstream's
+// to reword; the code is what Talos's own API contract carries.
+func TestAlreadyBootstrappedMatchesTheGRPCCodeNotTheMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"the node's refusal", status.Error(codes.AlreadyExists, "etcd data directory is not empty"), true},
+		{"wrapped, as bootstrapEtcd wraps it", alreadyBootstrappedError(), true},
+		{"a different code", status.Error(codes.FailedPrecondition, "bootstrap is not available yet"), false},
+		{"the message alone", errors.New("etcd data directory is not empty"), false},
+		{"anything else", errors.New("connection refused"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := alreadyBootstrapped(tc.err); got != tc.want {
+				t.Errorf("alreadyBootstrapped(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
 }
 
 // ── the kexec workaround is macOS/arm64-ONLY ────────────────────────────────

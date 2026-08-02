@@ -11,6 +11,8 @@ import (
 
 	"github.com/coglative/talos-in-qemu/platform"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	"github.com/siderolabs/talos/pkg/machinery/client"
+	"google.golang.org/grpc/codes"
 )
 
 // THE OUTPUT IS THE FEATURE. This file is a bring-up sequence, but what it
@@ -36,6 +38,13 @@ import (
 //
 // Bring-up is BOOTSTRAP ONLY, like the rest of this package. It creates a
 // cluster; it never upgrades, scales or reconciles one.
+//
+// It is also IDEMPOTENT, which is a different claim and not in tension with
+// that one: run twice it converges on the same cluster instead of building a
+// second, because a stopped machine is started again with `up`. Every step that
+// can already be done is decided by ASKING the node — which client can complete
+// a handshake, whether a bootstrap is refused — never by reading back something
+// this tool wrote down.
 
 // Ten steps, and the count is printed in every line. It lives here so the
 // transcript cannot claim a total the sequence does not have.
@@ -135,10 +144,18 @@ func realHooks() *upHooks {
 // Up turns a Talos ISO and a state directory into a working single-node
 // Kubernetes cluster, announcing each of ten steps as it goes.
 //
-// It is not resumable. A failure part way through leaves a VM and a state dir,
-// and recovery is -destroy followed by a retry — which the error says, because
-// the obvious alternative (run -up again) waits out a five-minute maintenance
-// timeout against a node that has left maintenance mode.
+// It is IDEMPOTENT, and that is what makes `tinq stop` followed by `tinq up`
+// work — the most natural pair of commands there is, and the one that used to
+// spend a five-minute maintenance timeout proving the node had left maintenance
+// mode forever. A machine that has already been configured skips steps 5 to 7
+// and waits for the AUTHENTICATED API instead; a bootstrap the node refuses
+// because etcd already exists is a success. Both questions are put to the node,
+// never to a file: see the talosconfig read below and alreadyBootstrapped.
+//
+// Idempotent is not resumable in every case. A config written to the state dir
+// but never accepted by the node leaves the two disagreeing — the file says
+// configured, the node is still in maintenance mode — and no wait on this side
+// can end. That one is destroy and retry, which the error says.
 func Up(ctx context.Context, opts UpOptions) error {
 	out := opts.Out
 	if out == nil {
@@ -247,21 +264,182 @@ func Up(ctx context.Context, opts UpOptions) error {
 
 	// Everything from here leaves a VM and a state dir behind when it fails.
 	fail := func(err error) error {
-		return fmt.Errorf("%w\n\nbring-up is not resumable in v1: a failure part way through leaves a "+
-			"running VM and a state dir, and re-running -up waits out the maintenance timeout against a "+
-			"node that has left maintenance mode.\n\n  tinq -destroy <this file>, then try again", err)
+		return fmt.Errorf("%w\n\n`tinq up` is idempotent: re-running it is the first thing to try, and it "+
+			"resumes from whatever this machine already reached rather than starting over.\n\nThe one failure a "+
+			"retry cannot repair is a config written to the state dir but never accepted by the node: the state "+
+			"dir then says configured while the node is still in maintenance mode, and the authenticated wait "+
+			"can only time out. That one is\n\n  tinq destroy <this file>, then try again", err)
 	}
 
-	// ── 5/10 maintenance ────────────────────────────────────────────────────
-	// A REAL Talos API call, never a dial: a qemu hostfwd is accepted by the
-	// HOST, so a TCP connect succeeds against a guest that never booted.
-	started := time.Now()
-	if err := hooks.waitMaintenance(ctx, opts.TalosEndpoint, maintenanceTimeout); err != nil {
+	// ── 5/10 – 7/10: configure, or skip what a previous `up` already did ─────
+	//
+	// A CREDENTIAL, NOT A STATUS, and that distinction is the whole reason this
+	// read does not break the rule Observe obeys — never trust a state file.
+	// Nothing here is believed about the node. Nothing CAN be: an authenticated
+	// call is impossible without this file, so having it is a precondition of
+	// asking, and the claim still comes from whether the node completes the
+	// mutual TLS handshake below. A node in maintenance mode cannot complete it
+	// (see AuthenticatedClient), so a talosconfig sitting beside a node that
+	// never took its config fails the wait rather than being believed.
+	//
+	// Which is exactly the failure the message above names. Step 6 writes this
+	// file BEFORE step 7 applies it — deliberately, so the artifacts that
+	// explain a failed apply survive it — so the file can outlive an apply that
+	// never landed. Nothing on this side can tell that apart from a machine
+	// that was stopped, and asking the node is what the wait is for.
+	talosconfig, err := os.ReadFile(filepath.Join(opts.StateDir, "talosconfig"))
+
+	configured := err == nil
+
+	if !configured && !os.IsNotExist(err) {
+		// os.ReadFile's error quotes the PATH and never the contents, so it is
+		// safe to wrap. Nothing below may relax that.
+		return fail(fmt.Errorf("reading this machine's talosconfig: %w", err))
+	}
+
+	if configured {
+		// Every skipped step is still ANNOUNCED, under its own number. The
+		// numbering is what an operator reads the sequence by, so a resumed run
+		// that jumped from 4 to 8 would read as a bring-up that lost three
+		// steps rather than one that had already passed them — and closing the
+		// gap by renumbering would be worse: two different meanings for
+		// "[ 5/10]" and nothing to tell them apart.
+		p.step("maintenance", "skipped (already configured)")
+		p.detail("this machine has a talosconfig, so a previous run applied a config to it. The")
+		p.detail("node boots the system it INSTALLED and never re-enters maintenance mode, so")
+		p.detail("this wait could only spend its whole %s and then fail", maintenanceTimeout)
+
+		p.step("config", "skipped (reusing the talosconfig in the state dir)")
+		p.detail("generating again mints a FRESH secrets bundle, and its CA is not the one this")
+		p.detail("node was installed with — the new talosconfig could not authenticate to it,")
+		p.detail("and overwriting the old one would take away the only way back in")
+
+		// The SAME wait step 7 ends on, on purpose: what has to be true before
+		// bootstrap does not depend on how the node got there. It gets the same
+		// budget too — a restarted node has an install's worth of work to skip
+		// but the same firmware boot, the same kernel and the same apid to
+		// start, and a wait that is generous in the one case is not mean in the
+		// other.
+		started := time.Now()
+		if err := hooks.waitBootstrapReady(ctx, talosconfig, opts.TalosEndpoint, installTimeout); err != nil {
+			return fail(err)
+		}
+
+		p.step("apply-config", "skipped (already applied), authenticated api answered after %s", took(started))
+		p.detail("that answer IS the proof, and it is the gate a fresh bring-up passes here too:")
+		p.detail("a node in maintenance mode cannot satisfy the cluster PKI, so an authenticated")
+		p.detail("call completing means the config is on disk and the installed system is serving")
+	} else {
+		// ── 5/10 maintenance ────────────────────────────────────────────
+		// A REAL Talos API call, never a dial: a qemu hostfwd is accepted by
+		// the HOST, so a TCP connect succeeds against a guest that never booted.
+		started := time.Now()
+		if err := hooks.waitMaintenance(ctx, opts.TalosEndpoint, maintenanceTimeout); err != nil {
+			return fail(err)
+		}
+
+		p.step("maintenance", "reachable after %s", took(started))
+
+		if talosconfig, err = configure(ctx, hooks, opts, p, host, imageVersion); err != nil {
+			return fail(err)
+		}
+	}
+
+	// ── 8/10 bootstrap ──────────────────────────────────────────────────────
+	//
+	// ATTEMPTED, NEVER PROBED, and tolerating the refusal is what makes the
+	// step idempotent. `up` applies the config, waits out the reboot, and only
+	// THEN bootstraps: a machine stopped inside that window comes back with
+	// apid serving the cluster PKI — so the wait above succeeds — and with no
+	// etcd at all. Skipping bootstrap on the strength of that wait would hang
+	// in step 9 forever, against a node that can never report Ready. Asking the
+	// node instead, and accepting its refusal, collapses both cases into one
+	// path with no extra probe and nothing to keep in step.
+	switch err := hooks.bootstrap(ctx, talosconfig, opts.TalosEndpoint); {
+	case err == nil:
+		p.step("bootstrap", "etcd bootstrapped")
+		p.detail("fired while the node is 'booting', NOT 'running' — waiting for 'running'")
+		p.detail("deadlocks: a control-plane node cannot reach running until etcd exists,")
+		p.detail("and bootstrap is the call that creates etcd")
+	case alreadyBootstrapped(err):
+		p.step("bootstrap", "already bootstrapped (the node refused a second one)")
+		p.detail("Talos rejects a bootstrap once its etcd data directory is not empty, and")
+		p.detail("that refusal is the node agreeing etcd exists. It is ASKED rather than")
+		p.detail("guessed: a machine stopped between apply-config and bootstrap answers the")
+		p.detail("authenticated API with no etcd behind it, and skipping this on that")
+		p.detail("evidence waits for a Ready node that can never arrive")
+	default:
 		return fail(err)
 	}
 
-	p.step("maintenance", "reachable after %s", took(started))
+	// ── 9/10 kubeconfig ─────────────────────────────────────────────────────
+	started := time.Now()
 
+	kubeconfig, err := hooks.kubeconfig(ctx, talosconfig, opts.TalosEndpoint)
+	if err != nil {
+		return fail(err)
+	}
+
+	if err := writeArtifacts(opts.StateDir, map[string][]byte{"kubeconfig": kubeconfig}); err != nil {
+		return fail(err)
+	}
+
+	// The KUBERNETES API, not the Talos one: the Talos API answers long before
+	// kubelet has joined, so nothing on that side can report this.
+	if err := hooks.waitNodeReady(ctx, kubeconfig, nodeReadyTimeout); err != nil {
+		return fail(err)
+	}
+
+	p.step("kubeconfig", "wrote kubeconfig, node Ready after %s", took(started))
+
+	// ── 10/10 storage ───────────────────────────────────────────────────────
+	//
+	// RE-RUN on a resumed bring-up rather than skipped, and storage.go's
+	// "BOOTSTRAP ONLY" is not in tension with that: InstallStorage is a
+	// server-side apply of a pinned manifest, so a second run converges on the
+	// same objects instead of failing AlreadyExists. Skipping it would mean a
+	// machine stopped between step 9 and step 10 could never get a
+	// StorageClass, and the only sign would be a PVC that stays Pending —
+	// exactly the failure the announced skip below exists to make visible.
+	// Re-applying is one round trip; not applying is a cluster that cannot bind
+	// a volume.
+	//
+	// Gated on the SAME field as the user volume in step 6, so the two halves
+	// of storage cannot disagree. The skip is ANNOUNCED because the way a data
+	// disk goes missing is a typo: `dataDisk: 40` omits the unit, decodes as a
+	// number, reads as "not set" and produces no disk and no error. Silence
+	// here means the first sign of it is a Pending PVC an hour later.
+	if opts.DataDiskSerial == "" {
+		p.step("storage", "skipped (spec.dataDisk not set)")
+		p.detail("no data disk means no user volume and no StorageClass, so a PVC with no")
+		p.detail("storageClassName stays Pending forever. If you meant to have one, check")
+		p.detail("the unit: `dataDisk: 40` is not a size and reads as unset, `dataDisk: 40Gi` is.")
+	} else {
+		if err := hooks.installStorage(ctx, kubeconfig); err != nil {
+			return fail(err)
+		}
+
+		p.step("storage", "local-path-provisioner %s, default StorageClass", LocalPathVersion)
+		p.detail("root %s", mountPath)
+		p.detail("  Talos's root filesystem is read-only, so upstream's /opt path cannot work")
+		p.detail("namespace local-path-storage labelled privileged")
+	}
+
+	p.summary(opts.StateDir, opts.DataDiskSerial != "")
+
+	return nil
+}
+
+// configure is steps 6 and 7: generate this machine's machine config, write the
+// artifacts, apply it, and wait for the installed system to come back. It
+// returns the talosconfig, which is the credential every step after it needs.
+//
+// It is a function of its own for ONE reason: it is exactly the half a machine
+// that has already been configured must not repeat. Everything in it is what Up
+// ran inline before, in the same order, and its errors are returned bare
+// because the caller is what knows they leave a VM behind.
+func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer,
+	host *platform.Platform, imageVersion string) ([]byte, error) {
 	// ── 6/10 config ─────────────────────────────────────────────────────────
 	//
 	// KEXEC IS DISABLED ON macOS/arm64 ONLY. Talos kexecs straight into the
@@ -290,7 +468,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 		DisableKexec:     disableKexec,
 	})
 	if err != nil {
-		return fail(err)
+		return nil, err
 	}
 
 	// Written before the config is applied: if the apply fails, the artifacts
@@ -300,7 +478,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 		"talosconfig":       generated.Talosconfig,
 		"secrets.yaml":      generated.Secrets,
 	}); err != nil {
-		return fail(err)
+		return nil, err
 	}
 
 	p.step("config", "wrote controlplane.yaml, talosconfig, secrets.yaml")
@@ -332,9 +510,9 @@ func Up(ctx context.Context, opts UpOptions) error {
 	}
 
 	// ── 7/10 apply-config ───────────────────────────────────────────────────
-	started = time.Now()
+	started := time.Now()
 	if err := hooks.applyConfig(ctx, opts.TalosEndpoint, generated.ControlPlane); err != nil {
-		return fail(err)
+		return nil, err
 	}
 
 	// The gate is the AUTHENTICATED API answering, and it is named
@@ -342,67 +520,12 @@ func Up(ctx context.Context, opts UpOptions) error {
 	// cannot satisfy the cluster PKI, so success here proves the config landed,
 	// the installed system booted, and apid is serving.
 	if err := hooks.waitBootstrapReady(ctx, generated.Talosconfig, opts.TalosEndpoint, installTimeout); err != nil {
-		return fail(err)
+		return nil, err
 	}
 
 	p.step("apply-config", "installing... rebooting... api back after %s", took(started))
 
-	// ── 8/10 bootstrap ──────────────────────────────────────────────────────
-	if err := hooks.bootstrap(ctx, generated.Talosconfig, opts.TalosEndpoint); err != nil {
-		return fail(err)
-	}
-
-	p.step("bootstrap", "etcd bootstrapped")
-	p.detail("fired while the node is 'booting', NOT 'running' — waiting for 'running'")
-	p.detail("deadlocks: a control-plane node cannot reach running until etcd exists,")
-	p.detail("and bootstrap is the call that creates etcd")
-
-	// ── 9/10 kubeconfig ─────────────────────────────────────────────────────
-	started = time.Now()
-
-	kubeconfig, err := hooks.kubeconfig(ctx, generated.Talosconfig, opts.TalosEndpoint)
-	if err != nil {
-		return fail(err)
-	}
-
-	if err := writeArtifacts(opts.StateDir, map[string][]byte{"kubeconfig": kubeconfig}); err != nil {
-		return fail(err)
-	}
-
-	// The KUBERNETES API, not the Talos one: the Talos API answers long before
-	// kubelet has joined, so nothing on that side can report this.
-	if err := hooks.waitNodeReady(ctx, kubeconfig, nodeReadyTimeout); err != nil {
-		return fail(err)
-	}
-
-	p.step("kubeconfig", "wrote kubeconfig, node Ready after %s", took(started))
-
-	// ── 10/10 storage ───────────────────────────────────────────────────────
-	//
-	// Gated on the SAME field as the user volume in step 6, so the two halves
-	// of storage cannot disagree. The skip is ANNOUNCED because the way a data
-	// disk goes missing is a typo: `dataDisk: 40` omits the unit, decodes as a
-	// number, reads as "not set" and produces no disk and no error. Silence
-	// here means the first sign of it is a Pending PVC an hour later.
-	if opts.DataDiskSerial == "" {
-		p.step("storage", "skipped (spec.dataDisk not set)")
-		p.detail("no data disk means no user volume and no StorageClass, so a PVC with no")
-		p.detail("storageClassName stays Pending forever. If you meant to have one, check")
-		p.detail("the unit: `dataDisk: 40` is not a size and reads as unset, `dataDisk: 40Gi` is.")
-	} else {
-		if err := hooks.installStorage(ctx, kubeconfig); err != nil {
-			return fail(err)
-		}
-
-		p.step("storage", "local-path-provisioner %s, default StorageClass", LocalPathVersion)
-		p.detail("root %s", mountPath)
-		p.detail("  Talos's root filesystem is read-only, so upstream's /opt path cannot work")
-		p.detail("namespace local-path-storage labelled privileged")
-	}
-
-	p.summary(opts.StateDir, opts.DataDiskSerial != "")
-
-	return nil
+	return generated.Talosconfig, nil
 }
 
 // printer owns every line of the transcript and, with it, the step numbering.
@@ -527,6 +650,30 @@ func applyConfiguration(ctx context.Context, endpoint string, config []byte) err
 	}
 
 	return nil
+}
+
+// alreadyBootstrapped reports whether a bootstrap was refused because this
+// node's etcd already exists.
+//
+// THE gRPC CODE IS THE MATCHER, NOT THE MESSAGE. Talos refuses a second
+// bootstrap in exactly one place, and it is the only AlreadyExists the
+// Bootstrap RPC can return — v1.13.7,
+// internal/app/machined/internal/server/v1alpha1/v1alpha1_server.go:457:
+//
+//	if entries, _ := os.ReadDir(constants.EtcdDataPath); len(entries) > 0 {
+//		return nil, status.Error(codes.AlreadyExists, "etcd data directory is not empty")
+//	}
+//
+// The code is part of the API contract and the sentence is not, so matching on
+// the sentence is a bring-up that breaks on an upstream rewording — and breaks
+// by SWALLOWING a real failure or by failing a healthy cluster, neither of
+// which the transcript could explain.
+//
+// client.StatusCode rather than grpc's own status.Code because it UNWRAPS:
+// the error arrives through bootstrapEtcd's %w, and machinery wraps multi-node
+// replies in a multierror that status.Code reads as Unknown.
+func alreadyBootstrapped(err error) bool {
+	return err != nil && client.StatusCode(err) == codes.AlreadyExists
 }
 
 // bootstrapEtcd issues the one call that creates the cluster's etcd.
