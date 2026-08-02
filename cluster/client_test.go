@@ -874,6 +874,23 @@ func TestAgainstARealNode(t *testing.T) {
 			"  installed system is up; if maintenance mode satisfies it, they all return early")
 	}
 
+	// RISK 1 FROM THE DESIGN SPEC, resolved against a live node: whether a
+	// maintenance-mode node reports a populated version tag before any config
+	// is applied. If this ever fails, spec.baremetal.talosVersion is the
+	// documented fallback.
+	version, err := NodeVersion(ctx, endpoint)
+	if err != nil {
+		t.Fatalf("NodeVersion: %s", redactErr(err))
+	}
+
+	if version == "" {
+		t.Error("a maintenance-mode node reported no Talos version tag\n" +
+			"  reason: adopt pins the installer image to this value; with no tag it " +
+			"must fall back to spec.baremetal.talosVersion")
+	}
+
+	t.Logf("the node reports Talos %s", version)
+
 	c, err := MaintenanceClient(ctx, endpoint)
 	if err != nil {
 		t.Fatalf("MaintenanceClient(%s): %s", endpoint, redactErr(err))
