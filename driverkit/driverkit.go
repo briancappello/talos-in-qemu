@@ -242,7 +242,21 @@ func reconcile(ctx context.Context, dc dynamic.Interface, cfg Config, d Driver, 
 			_ = publish(ctx, ri, m, st, state, false, false, "StopFailed", err.Error())
 			return fmt.Errorf("stop: %w", err)
 		}
-		log.Printf("%s: stopped", m.GetName())
+		// SAME RULE AS THE DELETE PATH ABOVE, and the reachable half of it.
+		// nil from Stop promises "the driver has no stop work left", not "the
+		// machine is powered off". A driver handed a resource it did not
+		// create cannot power-cycle it: it changes nothing, says so on its own
+		// line, and returns nil because an error here would spin the tick
+		// forever. "bm0: stopped" printed underneath is the loop contradicting
+		// the driver, and spec.powerState: Stopped keeps asking, so it does it
+		// on every tick.
+		//
+		// Reachable where the create arm above is not: such a driver Observes
+		// Running, so plan() never asks it to create and always asks it to
+		// stop. Softened rather than fixed with an outcome value, for the
+		// reason the delete path gives — driverkit must not learn what any one
+		// driver's special case means.
+		log.Printf("%s: stop reported complete", m.GetName())
 		return nil // next tick observes it
 	}
 
