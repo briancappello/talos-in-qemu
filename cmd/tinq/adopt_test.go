@@ -46,6 +46,106 @@ func TestIsBaremetalKeysOnTheSpecBlock(t *testing.T) {
 	}
 }
 
+// isBaremetal decides whether the four DESTRUCTIVE driver methods may run, so
+// every way it can be wrong is not symmetric: a VM mistaken for hardware costs
+// a refusal, hardware mistaken for a VM costs the only talosconfig that reaches
+// a node that can never be adopted again.
+//
+// The rows that matter are `scalar` and `null`. spec.baremetal is unschematised
+// today — the CRD is a later task — so nothing upstream rejects either shape,
+// and a discriminator that measures presence by a successful map cast reads
+// both as ABSENT. Ask NestedMap instead of NestedFieldNoCopy and those two rows
+// go green-as-a-VM: sweepable, destroyable, state dir removable.
+func TestIsBaremetalMeasuresPresenceNotShape(t *testing.T) {
+	machine := func(spec map[string]interface{}) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]interface{}{
+			"metadata": map[string]interface{}{"name": "bm0"},
+			"spec":     spec,
+		}}
+	}
+
+	for _, tc := range []struct {
+		name      string
+		spec      map[string]interface{}
+		baremetal bool // may the destructive methods run? (false == may run)
+		readable  bool // are there fields to read?
+	}{
+		{"map", map[string]interface{}{"baremetal": map[string]interface{}{
+			"endpoint": "192.168.1.50"}}, true, true},
+		{"scalar", map[string]interface{}{"baremetal": "yes"}, true, false},
+		{"null", map[string]interface{}{"baremetal": nil}, true, false},
+		{"empty-map", map[string]interface{}{"baremetal": map[string]interface{}{}}, true, true},
+		{"absent", map[string]interface{}{"image": "talos.iso"}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := machine(tc.spec)
+
+			if got := isBaremetal(m); got != tc.baremetal {
+				t.Errorf("isBaremetal = %v, want %v\n"+
+					"  reason: a present-but-malformed block is a manifest typo, not "+
+					"consent to sweep a machine on a desk", got, tc.baremetal)
+			}
+
+			block, present := specBaremetal(m)
+			if present != tc.baremetal {
+				t.Errorf("present = %v, want %v", present, tc.baremetal)
+			}
+			if (block != nil) != tc.readable {
+				t.Errorf("block = %#v, want readable=%v\n"+
+					"  reason: presence and well-formedness are different questions and "+
+					"only presence may decide destructiveness", block, tc.readable)
+			}
+		})
+	}
+}
+
+// The other half of the same guard: a present-but-unreadable block must be
+// NAMED, not silently treated as a machine with every field missing. adopt is
+// the only caller that reads the block, so it is the only one that can say it.
+func TestAdoptRefusesAMalformedBaremetalBlock(t *testing.T) {
+	for _, tc := range []struct{ name, doc string }{
+		{"scalar", "  baremetal: yes\n"},
+		{"null", "  baremetal:\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "machine.yaml")
+			doc := `apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata: {name: bm0, namespace: default}
+spec:
+  site: lab
+` + tc.doc
+			if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			root := t.TempDir()
+			d := &hvf{stateRoot: root, imageRoot: t.TempDir()}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			err := adoptMachine(ctx, d, path)
+			if err == nil {
+				t.Fatal("adopt accepted a spec.baremetal that carries no fields")
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("adopt dialled on a block it could not read: %v", err)
+			}
+			// Not the "endpoint is required" a readable-but-empty block earns.
+			// That one sends the operator looking for a field in a block that
+			// is not a block, which is the wrong hunt.
+			if !strings.Contains(err.Error(), "not a block of fields") {
+				t.Errorf("the refusal does not say the block is unreadable: %v", err)
+			}
+			if entries, readErr := os.ReadDir(root); readErr != nil || len(entries) != 0 {
+				t.Errorf("a refused adopt left %v under the state root (err %v), want nothing",
+					entries, readErr)
+			}
+		})
+	}
+}
+
 func TestBaremetalEndpointsUseTalosDefaultPorts(t *testing.T) {
 	m := baremetalMachine()
 

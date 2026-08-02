@@ -19,31 +19,68 @@ import (
 // power button, and firmware on real hardware is slower than QEMU's.
 const adoptMaintenanceTimeout = 10 * time.Minute
 
-// specBaremetal returns spec.baremetal, or nil when the machine is a VM.
+// specBaremetal answers TWO questions about spec.baremetal, and they are
+// different questions: is the block PRESENT, and is it WELL-FORMED.
 //
-// Its PRESENCE is the discriminator, not a mode field. A machine either
-// describes hardware that already exists or a guest this tool creates, and
-// there is no third thing — so an explicit `provider:` string would be a second
-// source of truth that could contradict the block beside it.
-func specBaremetal(m *unstructured.Unstructured) map[string]interface{} {
-	v, _, _ := unstructured.NestedMap(m.Object, "spec", "baremetal")
-	return v
+// Presence is the discriminator, not a mode field. A machine either describes
+// hardware that already exists or a guest this tool creates, and there is no
+// third thing — so an explicit `provider:` string would be a second source of
+// truth that could contradict the block beside it.
+//
+// ONLY PRESENCE MAY DECIDE DESTRUCTIVENESS, which is why the two answers are
+// returned separately. This measures presence with NestedFieldNoCopy's found
+// rather than a successful map cast, because a successful cast answers the
+// other question. The block is unschematised today, so a scalar (`baremetal:
+// yes`) or a bare `baremetal:` that YAML decodes to null reaches here intact;
+// asking NestedMap about either gets nil, and nil read as "absent" makes a
+// machine on a desk sweepable, destroyable and its talosconfig removable. A
+// malformed block is a typo in a manifest — it is not consent to power-cycle
+// hardware, so it counts as present and the caller refuses to touch it.
+//
+// block is nil exactly when the machine is a VM (present false) or the block
+// is malformed (present true) — the caller distinguishes those two by present.
+// An empty `baremetal: {}` is well-formed and yields a non-nil empty map: it
+// fails later, on the fields it is missing, which is the honest complaint.
+func specBaremetal(m *unstructured.Unstructured) (block map[string]interface{}, present bool) {
+	v, found, err := unstructured.NestedFieldNoCopy(m.Object, "spec", "baremetal")
+	if err != nil || !found {
+		// err here means spec itself is not a map, so it holds no baremetal
+		// block to be wrong about.
+		return nil, false
+	}
+	block, _ = v.(map[string]interface{})
+	return block, true
 }
 
-func isBaremetal(m *unstructured.Unstructured) bool { return specBaremetal(m) != nil }
+// isBaremetal is the guard the four destructive driver methods key on. It asks
+// only whether the block is THERE — see specBaremetal for why reading it is a
+// separate question, and why a malformed block answers true here.
+func isBaremetal(m *unstructured.Unstructured) bool {
+	_, present := specBaremetal(m)
+	return present
+}
+
+// baremetalFields is the read side: the block's fields, empty for a VM AND for
+// a machine whose block is malformed. Every caller of this is a field read that
+// has a sane empty answer; the one place a malformed block must be named out
+// loud is adoptMachine, which says so before it reads anything.
+func baremetalFields(m *unstructured.Unstructured) map[string]interface{} {
+	block, _ := specBaremetal(m)
+	return block
+}
 
 // The two endpoints of an adopted node. NO FORWARD IS INVOLVED: apid and
 // kube-apiserver serve their own default ports on the node itself, so these are
 // the same constants the guest side uses, applied to a real address.
 func baremetalTalosEndpoint(m *unstructured.Unstructured) string {
-	if a := str(specBaremetal(m)["endpoint"], ""); a != "" {
+	if a := str(baremetalFields(m)["endpoint"], ""); a != "" {
 		return fmt.Sprintf("%s:%d", a, talosAPIGuestPort)
 	}
 	return ""
 }
 
 func baremetalKubeEndpoint(m *unstructured.Unstructured) string {
-	if a := str(specBaremetal(m)["endpoint"], ""); a != "" {
+	if a := str(baremetalFields(m)["endpoint"], ""); a != "" {
 		return fmt.Sprintf("https://%s:%d", a, kubeAPIGuestPort)
 	}
 	return ""
@@ -180,7 +217,19 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		return err
 	}
 
-	spec := specBaremetal(m)
+	// PRESENT IS NOT THE SAME AS READABLE. refuseWrongSubstrate has just
+	// established the block is there, which is all the driver guards need; adopt
+	// is the one caller that goes on to READ it, so it is the one caller that
+	// has to care whether there is anything to read. Saying so here is the
+	// difference between a manifest typo and a pile of "required" errors about
+	// fields that were never going to be found.
+	spec, _ := specBaremetal(m)
+	if spec == nil {
+		return fmt.Errorf("%s has spec.baremetal, but it is not a block of fields — a scalar "+
+			"or an empty `baremetal:` cannot carry an endpoint or a disk serial\n\n"+
+			"  it must be a mapping:\n\n    baremetal:\n      endpoint: 192.168.1.50\n"+
+			"      systemDiskSerial: S1", m.GetName())
+	}
 
 	endpoint := baremetalTalosEndpoint(m)
 	if endpoint == "" {
