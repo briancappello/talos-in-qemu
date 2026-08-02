@@ -644,27 +644,27 @@ Working and exercised:
 
 Not done yet — stated plainly rather than implied:
 
-- **The graceful rung of `stop` has never met a real guest.** `stop` now sends
-  Talos's `Shutdown` before it signals anything, but nothing in CI can answer
-  that call, so only the FAILURE paths are tested: no `talosconfig` fails fast,
-  an unusable one falls through to SIGTERM/SIGKILL, and neither puts secret
-  material in an error. That the clean power-off actually happens is
-  expected-to-work, not proven. A node still in maintenance mode never gets
-  that rung by design: it cannot satisfy the mutual TLS, which is safe rather
-  than a compromise, since it holds no applied config and nothing persistent to
-  corrupt.
-- **`tinq stop` and `spec.powerState` reconciliation are unit-tested, not
-  hardware-exercised.** The transition table, the `Synced`/`Ready` split and
-  the SIGTERM/SIGKILL escalation have tests — but the escalation is exercised
-  against a decoy process, not a live Talos guest, and neither `tinq stop` nor
-  the `Absent -> Running -> Stopped` convergence has been run against a real VM.
-  Treat them as expected-to-work, not proven.
+- **`stop` and `up` are hardware-verified; the escalation ladder is not.** One
+  `up` -> `stop` -> `up` -> `destroy` round trip was run against a real Talos
+  v1.13.7 guest. `stop` asked the guest and it powered itself off in 36s — the
+  clean rung, not a fallback, since every non-graceful path logs and that run
+  was silent. `up` then resumed the stopped node in 1m14s, printing steps 5-7
+  as skipped and step 8 as `already bootstrapped (the node refused a second
+  one)`; the node came back as the SAME object with an age spanning the stop,
+  so etcd survived. What that run did NOT exercise is the escalation: a guest
+  that ignores `Shutdown` has never been observed, so SIGTERM -> SIGKILL is
+  still only tested against a decoy process. A node in maintenance mode never
+  gets the graceful rung by design — it cannot satisfy the mutual TLS, which is
+  safe rather than a compromise, since it holds no applied config and nothing
+  persistent to corrupt.
+- **`spec.powerState` reconciliation is unit-tested, not hardware-exercised.**
+  The transition table and the `Synced`/`Ready` split have tests, but the
+  controller loop driving a real machine between states — including the
+  `Absent -> Running -> Stopped` convergence — has only been run against the
+  hook seam. The standalone verbs are what the hardware run covered.
 - **`up` is bootstrap only.** It creates a cluster; it never upgrades, scales
-  or reconciles one. It is idempotent — re-running it resumes from wherever the
-  machine already is, which is how a machine halted with `stop` comes back —
-  but that idempotence is **unit-tested against the hook seam, not exercised
-  against a real stopped node**. The `stop` -> `up` round trip has never been
-  run end to end on hardware.
+  or reconciles one. It is idempotent — re-running resumes from wherever the
+  machine already is, which is how a machine halted with `stop` comes back.
 - **One stderr line still interleaves with the transcript.** client-go relays
   the API server's `restricted:latest` PodSecurity *warning* during step 10,
   which reads like a failure and is not — the namespace is labelled
