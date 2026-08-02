@@ -10,6 +10,8 @@
 
 **Design spec:** `docs/superpowers/specs/2026-08-02-baremetal-foundation-design.md` (commit `731f859`). Decisions are referenced below as D1–D7.
 
+**Nine tasks, strictly sequential.** Task 8 was added during Task 1's review: it is a Tier 1 instance of the very defect class this branch removes, found in `cmd/tinq`. The live gate is Task 9.
+
 ## Global Constraints
 
 - **Go 1.26.5.** `new(false)` / `new(true)` (generic `new` with a value) is used in `config.go` and is valid — match that idiom, do not introduce `ptr()` helpers.
@@ -1303,7 +1305,121 @@ git commit -m "crd: spec.baremetal, and a validation rule that keeps VMs whole"
 
 ---
 
-### Task 8: The live gate — QEMU regression and the non-loopback rehearsal
+### Task 8: `talosEndpoint`/`kubeEndpoint` honour `hostAddr` (Tier 1, found during Task 1 review)
+
+**Files:**
+- Modify: `cmd/tinq/main.go:338-357` (`talosEndpoint`, `kubeEndpoint`, and `hostForward`)
+- Test: `cmd/tinq/main_test.go`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `hostForward` returning the bind address alongside the port; both endpoint helpers using it.
+
+**Why this is Tier 1 and not scope creep.** This branch exists to delete hardcoded `127.0.0.1` assumptions. `main.go:341` and `:353` are two more instances of exactly that class, in the same call chain that feeds `UpOptions.TalosEndpoint` — the field Task 1 made the sole source of the certificate SAN. `spec.hostForwards[].hostAddr` already exists (`main.go:874`) and already defaults to loopback, but these two functions ignore it: set `hostAddr: 192.168.1.165` and QEMU binds that address ONLY, while `tinq up` dials `127.0.0.1` where nothing is listening and spends the entire 5-minute maintenance budget before failing.
+
+Fixing it also strengthens Task 9: `tinq up` on the rehearsal VM then proves the non-loopback path through the `up` verb independently of `adopt`.
+
+- [ ] **Step 1: Write the failing test**
+
+```go
+func TestEndpointsHonourHostAddr(t *testing.T) {
+	m := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"hostForwards": []interface{}{
+			map[string]interface{}{"hostPort": int64(50000), "guestPort": int64(50000),
+				"hostAddr": "192.168.1.165"},
+			map[string]interface{}{"hostPort": int64(6443), "guestPort": int64(6443),
+				"hostAddr": "192.168.1.165"},
+		}},
+	}}
+
+	if got := talosEndpoint(m); got != "192.168.1.165:50000" {
+		t.Errorf("talosEndpoint = %q, want 192.168.1.165:50000\n"+
+			"  reason: qemu binds the forward to hostAddr ONLY, so dialling loopback "+
+			"reaches nothing and spends the whole maintenance budget proving it", got)
+	}
+
+	if got := kubeEndpoint(m); got != "https://192.168.1.165:6443" {
+		t.Errorf("kubeEndpoint = %q, want https://192.168.1.165:6443\n"+
+			"  reason: this address is written into the kubeconfig AND becomes the "+
+			"cert SAN, so a wrong one fails every kubectl call", got)
+	}
+}
+
+// The default is the regression that matters: an entry with no hostAddr must
+// still produce loopback, because that is what every existing machine file has.
+func TestEndpointsDefaultToLoopbackWithoutHostAddr(t *testing.T) {
+	m := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"hostForwards": []interface{}{
+			map[string]interface{}{"hostPort": int64(50000), "guestPort": int64(50000)},
+		}},
+	}}
+
+	if got := talosEndpoint(m); got != "127.0.0.1:50000" {
+		t.Errorf("talosEndpoint = %q, want 127.0.0.1:50000", got)
+	}
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `go test ./cmd/tinq -run TestEndpoints -v`
+Expected: FAIL — `talosEndpoint = "127.0.0.1:50000", want 192.168.1.165:50000`.
+
+- [ ] **Step 3: Thread the address through**
+
+`hostForward` currently returns only the port. Return the address too, and use the SAME default the qemu argument builder uses at `main.go:874` — `str(h["hostAddr"], "127.0.0.1")` — so the dialled address and the bound address cannot disagree:
+
+```go
+// hostForward reports the HOST address and port forwarded to guestPort, or
+// ("", 0) when the machine forwards nothing there.
+//
+// THE ADDRESS IS RETURNED, not assumed. qemu binds each forward to its own
+// hostAddr (main.go:874) and binds it EXCLUSIVELY: with hostAddr set to a LAN
+// address, nothing is listening on loopback at all. Returning a hardcoded
+// 127.0.0.1 here sent every wait to an address that could never answer, and the
+// symptom was a full maintenance timeout rather than a connection refusal.
+func hostForward(m *unstructured.Unstructured, guestPort int) (string, int) {
+	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
+		h, _ := hf.(map[string]interface{})
+		if toInt(h["guestPort"]) == guestPort {
+			return str(h["hostAddr"], "127.0.0.1"), toInt(h["hostPort"])
+		}
+	}
+	return "", 0
+}
+
+func talosEndpoint(m *unstructured.Unstructured) string {
+	if a, p := hostForward(m, talosAPIGuestPort); p > 0 {
+		return fmt.Sprintf("%s:%d", a, p)
+	}
+	return ""
+}
+
+func kubeEndpoint(m *unstructured.Unstructured) string {
+	if a, p := hostForward(m, kubeAPIGuestPort); p > 0 {
+		return fmt.Sprintf("https://%s:%d", a, p)
+	}
+	return ""
+}
+```
+
+Update `hostForward`'s other caller for the two-value return.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `go test ./cmd/tinq -run TestEndpoints -v` then `go build ./... && go vet ./... && go test ./...`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add cmd/tinq/main.go cmd/tinq/main_test.go
+git commit -m "tinq: dial the address the forward is actually bound to"
+```
+
+---
+
+### Task 9: The live gate — QEMU regression and the non-loopback rehearsal
 
 Nothing before this proves the change works against a real Talos node. Both runs below are required before the hardware attempt.
 
