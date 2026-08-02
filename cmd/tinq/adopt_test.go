@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -423,7 +424,19 @@ func TestObserveDoesNotCallHardwareAbsent(t *testing.T) {
 // Create and Stop must return nil, not an error. The controller retries a
 // failed verb on every tick and this one could never clear — a permanent error
 // spin is noise that teaches an operator to stop reading the log.
+//
+// THE LOG IS THE ONLY LEVER STOP HAS. nil is not evidence Stop refused: delete
+// its guard and Stop still returns nil, because Observe's own guard reports
+// Running, readPid finds no pidfile and returns 0, shutdownGuest fails on the
+// talosconfig that is not there — and that failure is LOGGED, NOT RETURNED —
+// and halt(ctx, 0, dir) signals nothing and reports success. The state root is
+// no lever either, since none of that writes a file. So the guard is asserted
+// by what it says and by what a fall-through would have said instead.
 func TestCreateAndStopDoNotSpinOnHardware(t *testing.T) {
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
 	h := &hvf{stateRoot: t.TempDir(), imageRoot: t.TempDir(),
 		detect: func() (*platform.Platform, error) {
 			t.Error("a refusal must not probe the host")
@@ -440,5 +453,23 @@ func TestCreateAndStopDoNotSpinOnHardware(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(h.stateRoot); err != nil || len(entries) != 0 {
 		t.Errorf("state root holds %v (err %v) after a refusal, want nothing", entries, err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "refusing to create it") {
+		t.Errorf("Create did not announce its refusal:\n%s", out)
+	}
+	if !strings.Contains(out, "refusing to stop it") {
+		t.Errorf("Stop did not announce its refusal — it fell through to the VM path:\n%s\n"+
+			"  reason: nil is what a missing guard returns too; this line is the "+
+			"difference", out)
+	}
+	// The fall-through's OWN fingerprint, and the half that catches a guard
+	// moved below Observe rather than deleted. Nothing on the hardware path may
+	// try to talk to a guest.
+	if strings.Contains(out, "graceful shutdown unavailable") {
+		t.Errorf("Stop tried to power off a machine on a desk:\n%s\n"+
+			"  reason: it dialled a talosconfig that adopt wrote for a node this "+
+			"driver has no power control over", out)
 	}
 }
