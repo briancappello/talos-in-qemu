@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"fmt"
+
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 )
 
 // NODE FACTS, NOT PROBES. Everything in this file asks a maintenance-mode node
@@ -36,13 +38,24 @@ func NodeVersion(ctx context.Context, endpoint string) (string, error) {
 		return "", fmt.Errorf("asking the node its Talos version: %w", err)
 	}
 
+	return versionTag(resp), nil
+}
+
+// versionTag picks a version tag out of a Version reply, or "" when the reply
+// carries none.
+//
+// It is split out of NodeVersion because this loop IS the "never errors on an
+// unidentifiable version" contract above, and a pure function is the only way
+// to pin it: reaching these branches through NodeVersion would take a fake
+// apid, so left inline they are asserted by nothing but a doc comment.
+func versionTag(resp *machineapi.VersionResponse) string {
 	// One node, so one message — but ranging costs nothing and a nil Messages
 	// slice is a real reply shape rather than a panic.
 	for _, m := range resp.GetMessages() {
 		if tag := m.GetVersion().GetTag(); tag != "" {
-			return tag, nil
+			return tag
 		}
 	}
 
-	return "", nil
+	return ""
 }
