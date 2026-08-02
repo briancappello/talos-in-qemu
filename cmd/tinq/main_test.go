@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -1858,5 +1859,194 @@ func TestHaltRefusesToSignalAPidItCannotProveIsOurs(t *testing.T) {
 	case <-died:
 		t.Fatalf("halt signalled pid %d, which it never proved was this machine's qemu", pid)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// ── adopt: the baremetal substrate ──────────────────────────────────────────
+
+func baremetalMachine() *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "machine.hvf.fleet.io/v1alpha1",
+		"kind":       "TalosMachine",
+		"metadata":   map[string]interface{}{"name": "bm0", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"site": "lab", "role": "talos-cp",
+			"baremetal": map[string]interface{}{
+				"endpoint":         "192.168.1.50",
+				"systemDiskSerial": "S1",
+			},
+		},
+	}}
+}
+
+func TestIsBaremetalKeysOnTheSpecBlock(t *testing.T) {
+	if !isBaremetal(baremetalMachine()) {
+		t.Error("a machine with spec.baremetal was not recognised as baremetal")
+	}
+
+	qemu := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"image": "talos.iso"},
+	}}
+	if isBaremetal(qemu) {
+		t.Error("a machine with no spec.baremetal was treated as baremetal\n" +
+			"  reason: presence of the block IS the discriminator")
+	}
+}
+
+func TestBaremetalEndpointsUseTalosDefaultPorts(t *testing.T) {
+	m := baremetalMachine()
+
+	if got := baremetalTalosEndpoint(m); got != "192.168.1.50:50000" {
+		t.Errorf("talos endpoint = %q, want 192.168.1.50:50000\n"+
+			"  reason: there is no forward on hardware; apid serves its own default port", got)
+	}
+
+	if got := baremetalKubeEndpoint(m); got != "https://192.168.1.50:6443" {
+		t.Errorf("kube endpoint = %q, want https://192.168.1.50:6443", got)
+	}
+}
+
+func TestVMVerbsRefuseABaremetalMachine(t *testing.T) {
+	for _, verb := range []string{"apply", "up", "stop", "destroy"} {
+		err := refuseWrongSubstrate(baremetalMachine(), verb)
+		if err == nil {
+			t.Errorf("%s accepted a baremetal machine\n"+
+				"  reason: destroy in particular would delete the only talosconfig "+
+				"that can reach a node it cannot destroy", verb)
+			continue
+		}
+		if !strings.Contains(err.Error(), "adopt") {
+			t.Errorf("%s's refusal does not name the verb that does work: %s", verb, err)
+		}
+	}
+}
+
+func TestAdoptRefusesAQEMUMachine(t *testing.T) {
+	qemu := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"image": "talos.iso"},
+	}}
+	if err := refuseWrongSubstrate(qemu, "adopt"); err == nil {
+		t.Error("adopt accepted a machine with no spec.baremetal")
+	}
+}
+
+// The refusal has to be WIRED IN, not merely written. Every assertion above
+// calls refuseWrongSubstrate directly, and all four would stay green with the
+// call deleted from standalone — which is the only place a user reaches it.
+//
+// It also pins the ORDER, and the fixture is what makes that assertable: the
+// state root is a regular FILE, so Observe's stat of <root>/<site>/<uid>/
+// system.qcow2 fails with ENOTDIR rather than ENOENT and standalone returns
+// "observe: ...". Seeing the refusal instead proves nothing observed first —
+// which matters because Observe stats a qcow2 and would call a machine that is
+// a machine Absent.
+func TestStandaloneRefusesABaremetalMachineBeforeObserving(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(root, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "machine.yaml")
+	if err := os.WriteFile(path, []byte(`apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata: {name: bm0, namespace: default}
+spec:
+  site: lab
+  baremetal:
+    endpoint: 192.168.1.50
+    systemDiskSerial: S1
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &hvf{stateRoot: root, imageRoot: t.TempDir(),
+		detect: func() (*platform.Platform, error) {
+			t.Error("a refusal must not probe the host: the machine is not this host's guest")
+			return nil, fmt.Errorf("no accelerator")
+		}}
+
+	for _, verb := range []string{"apply", "up", "stop", "destroy"} {
+		t.Run(verb, func(t *testing.T) {
+			err := standalone(context.Background(), d, path, verb)
+			if err == nil {
+				t.Fatalf("standalone %s ran against a baremetal machine", verb)
+			}
+			if strings.HasPrefix(err.Error(), "observe:") {
+				t.Fatalf("standalone %s observed before refusing: %v\n"+
+					"  reason: Observe stats system.qcow2 and reports hardware as "+
+					"Absent, which is a meaningless answer", verb, err)
+			}
+			if !strings.Contains(err.Error(), "adopt") {
+				t.Errorf("standalone %s's refusal does not name the verb that works: %v", verb, err)
+			}
+		})
+	}
+}
+
+// adopt is reachable, spelled the way the docs spell it, and refuses a VM
+// through the same door a user opens. A verb missing from AddCommand compiles.
+func TestAdoptIsRegisteredAndRefusesAVM(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "machine.yaml")
+	if err := os.WriteFile(path, []byte(machineDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	root := newRootCmd()
+	root.SetArgs([]string{"adopt", "--state-root", t.TempDir(), path})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("adopt ran against a machine with no spec.baremetal")
+	}
+	if strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("adopt is not registered: %v", err)
+	}
+	// The REFUSAL, specifically, and not the "endpoint is required" that a
+	// machine which got past it fails on next — that one also says
+	// "spec.baremetal", so a looser assertion here is green against an adopt
+	// that accepted a VM and then tripped over the missing block anyway.
+	if !strings.Contains(err.Error(), "`tinq up` is the verb that builds it") {
+		t.Errorf("adopt's refusal does not send a VM to the verb that builds it: %v", err)
+	}
+}
+
+// A PORT IN THE ENDPOINT IS A HANG, and that is why it is refused rather than
+// left to fail somewhere. The two ports are Talos's own and adopt appends them,
+// so "10.0.0.5:50000" becomes "10.0.0.5:50000:50000" — measured: ten minutes of
+// the maintenance budget spent on an address nothing can dial, with only
+// "waiting for the Talos maintenance API" printed to explain it.
+//
+// The refusal must land BEFORE the wait, which is what the deadline asserts:
+// this test may not take ten minutes to discover a typo.
+func TestAdoptRefusesAnEndpointCarryingAPort(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "machine.yaml")
+	if err := os.WriteFile(path, []byte(`apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata: {name: bm0, namespace: default}
+spec:
+  site: lab
+  baremetal:
+    endpoint: 10.0.0.5:50000
+    systemDiskSerial: S1
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &hvf{stateRoot: t.TempDir(), imageRoot: t.TempDir()}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := adoptMachine(ctx, d, path)
+	if err == nil {
+		t.Fatal("adopt accepted an endpoint with a port in it")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("adopt dialled before checking the address it was given: %v", err)
+	}
+	if !strings.Contains(err.Error(), "10.0.0.5:50000") {
+		t.Errorf("the refusal does not quote the endpoint it rejected: %v", err)
 	}
 }

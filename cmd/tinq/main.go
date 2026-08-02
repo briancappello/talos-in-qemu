@@ -27,6 +27,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -198,6 +199,25 @@ func newRootCmd() *cobra.Command {
 		RunE: runVerb("up"),
 	}
 
+	adopt := &cobra.Command{
+		Use:   "adopt <machine.yaml>",
+		Short: "Bring up a Talos node this tool did NOT create",
+		Long: "Takes a machine that is already booted into maintenance mode — from a USB\n" +
+			"stick, virtual media, or netboot — and drives it to a Ready single-node\n" +
+			"cluster using the same ten steps `up` uses.\n\n" +
+			"Requires spec.baremetal. Run it once with no systemDiskSerial and it prints\n" +
+			"the node's disks and refuses; write one down and run it again.\n\n" +
+			"It never powers anything on and never installs without an explicit serial.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			d, err := newDriver()
+			if err != nil {
+				return err
+			}
+			return adoptMachine(cmd.Context(), d, args[0])
+		},
+	}
+
 	controller := &cobra.Command{
 		Use:   "controller",
 		Short: "Watch TalosMachine resources in a cluster and reconcile them",
@@ -220,7 +240,7 @@ func newRootCmd() *cobra.Command {
 	}
 	controller.Flags().DurationVar(&interval, "interval", 5*time.Second, "reconcile interval")
 
-	root.AddCommand(apply, stop, destroy, up, controller)
+	root.AddCommand(apply, stop, destroy, up, adopt, controller)
 	return root
 }
 
@@ -243,21 +263,16 @@ func newRootCmd() *cobra.Command {
 // controller owns the resource it reconciles powerState normally. `tinq stop`
 // is the verb that halts a machine on this path.
 func standalone(ctx context.Context, d *hvf, path, verb string) error {
-	b, err := os.ReadFile(path)
+	m, err := readMachine(path)
 	if err != nil {
 		return err
 	}
-	var obj map[string]interface{}
-	if err := yaml.Unmarshal(b, &obj); err != nil {
-		return fmt.Errorf("parse: %w", err)
-	}
-	m := &unstructured.Unstructured{Object: obj}
-	if m.GetUID() == "" {
-		// The controller gets a UID from the API server; here there is none, so
-		// derive a STABLE one from namespace/name. It keys the state dir, so it
-		// must be identical across runs or a re-apply would orphan the first VM
-		// and boot a second beside it.
-		m.SetUID(types.UID(fmt.Sprintf("bootstrap-%s-%s", m.GetNamespace(), m.GetName())))
+
+	// BEFORE Observe, not after. Observe stats system.qcow2 and would report a
+	// machine that is a machine as Absent — a meaningless answer for hardware,
+	// and one that reads as "not created yet" to everything downstream.
+	if err := refuseWrongSubstrate(m, verb); err != nil {
+		return err
 	}
 
 	state, status, err := d.Observe(ctx, m)
@@ -310,6 +325,31 @@ func standalone(ctx context.Context, d *hvf, path, verb string) error {
 	}
 }
 
+// readMachine loads one TalosMachine from a file and gives it a STABLE identity.
+//
+// The UID is derived rather than random because it keys the state dir: a
+// re-run that minted a new one would orphan the first machine's artifacts and
+// build a second beside it. Shared by every file-driven verb so the derivation
+// cannot drift between them.
+func readMachine(path string) (*unstructured.Unstructured, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var obj map[string]interface{}
+	if err := yaml.Unmarshal(b, &obj); err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+
+	m := &unstructured.Unstructured{Object: obj}
+	if m.GetUID() == "" {
+		m.SetUID(types.UID(fmt.Sprintf("bootstrap-%s-%s", m.GetNamespace(), m.GetName())))
+	}
+
+	return m, nil
+}
+
 // The two guest ports a bring-up talks to. They are Talos's, not ours: apid
 // serves on 50000 and kube-apiserver on 6443, so these are the guest sides that
 // spec.hostForwards has to map onto the host.
@@ -353,6 +393,178 @@ func kubeEndpoint(m *unstructured.Unstructured) string {
 		return fmt.Sprintf("https://127.0.0.1:%d", p)
 	}
 	return ""
+}
+
+// specBaremetal returns spec.baremetal, or nil when the machine is a VM.
+//
+// Its PRESENCE is the discriminator, not a mode field. A machine either
+// describes hardware that already exists or a guest this tool creates, and
+// there is no third thing — so an explicit `provider:` string would be a second
+// source of truth that could contradict the block beside it.
+func specBaremetal(m *unstructured.Unstructured) map[string]interface{} {
+	v, _, _ := unstructured.NestedMap(m.Object, "spec", "baremetal")
+	return v
+}
+
+func isBaremetal(m *unstructured.Unstructured) bool { return specBaremetal(m) != nil }
+
+// The two endpoints of an adopted node. NO FORWARD IS INVOLVED: apid and
+// kube-apiserver serve their own default ports on the node itself, so these are
+// the same constants the guest side uses, applied to a real address.
+func baremetalTalosEndpoint(m *unstructured.Unstructured) string {
+	if a := str(specBaremetal(m)["endpoint"], ""); a != "" {
+		return fmt.Sprintf("%s:%d", a, talosAPIGuestPort)
+	}
+	return ""
+}
+
+func baremetalKubeEndpoint(m *unstructured.Unstructured) string {
+	if a := str(specBaremetal(m)["endpoint"], ""); a != "" {
+		return fmt.Sprintf("https://%s:%d", a, kubeAPIGuestPort)
+	}
+	return ""
+}
+
+// refuseWrongSubstrate rejects a verb applied to the substrate it cannot serve.
+//
+// The four VM verbs are not merely inapplicable to hardware, they are unsafe on
+// it. `destroy` is the sharp one: its contract is to take the entire SCC, and
+// on a machine it did not create it can take only the artifacts — including the
+// sole talosconfig that reaches a node it has no way to destroy. A verb that
+// half-honours its contract while deleting the only credential to the surviving
+// machine is worse than one that refuses.
+func refuseWrongSubstrate(m *unstructured.Unstructured, verb string) error {
+	bm := isBaremetal(m)
+
+	if verb == "adopt" {
+		if bm {
+			return nil
+		}
+		return fmt.Errorf("`tinq adopt` needs spec.baremetal (the node's address and its "+
+			"disk serials); %s describes a VM, so `tinq up` is the verb that builds it",
+			m.GetName())
+	}
+
+	if !bm {
+		return nil
+	}
+
+	return fmt.Errorf("`tinq %s` cannot act on %s: it has spec.baremetal, so it is a machine "+
+		"this tool did not create and cannot power-cycle\n\n  `tinq adopt` is the verb that "+
+		"brings it up\n\n(there is no `forget` verb yet, so clearing its state directory is "+
+		"`rm -rf` for now)", verb, m.GetName())
+}
+
+// adoptMachine is the `adopt` verb: bring up a node this tool did not create.
+//
+// It does NOT go through driverkit. Observe/Create/Stop/Destroy all describe a
+// resource this program owns the lifecycle of, and none of the four has an
+// honest implementation for a machine on a desk with no power control.
+//
+// Everything before cluster.Up is a PRE-FLIGHT that a QEMU bring-up does not
+// need: the version and the disks both come from the node, so both require a
+// maintenance-mode node to already be answering.
+func adoptMachine(ctx context.Context, d *hvf, path string) error {
+	m, err := readMachine(path)
+	if err != nil {
+		return err
+	}
+
+	if err := refuseWrongSubstrate(m, "adopt"); err != nil {
+		return err
+	}
+
+	spec := specBaremetal(m)
+
+	endpoint := baremetalTalosEndpoint(m)
+	if endpoint == "" {
+		return errors.New("spec.baremetal.endpoint is required: it is the address this host " +
+			"dials to reach the node, and it goes into apid's certificate")
+	}
+
+	// A BARE ADDRESS, and a port in it is a TEN-MINUTE HANG rather than a parse
+	// error. The two ports are Talos's own and the helpers above append them,
+	// so "10.0.0.5:50000" becomes "10.0.0.5:50000:50000" — measured: the whole
+	// maintenance budget spent resolving an address that cannot exist, with one
+	// "waiting for the Talos maintenance API" line to explain it. Nothing
+	// downstream can tell that apart from a node that has not booted yet.
+	//
+	// An IPv6 literal is caught here too, and truthfully rather than by
+	// accident: baremetalTalosEndpoint cannot bracket one, so a v6 address is
+	// unsupported and this is where it should be said.
+	if addr := str(spec["endpoint"], ""); strings.Contains(addr, ":") {
+		return fmt.Errorf("spec.baremetal.endpoint %q must be a bare address with no port: "+
+			"apid's %d and kube-apiserver's %d are Talos's own and are added for you\n\n"+
+			"  (an IPv6 literal lands here too, and is not supported yet)",
+			addr, talosAPIGuestPort, kubeAPIGuestPort)
+	}
+
+	dir := d.dir(m)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("state dir: %w", err)
+	}
+
+	log.Printf("waiting for the Talos maintenance API at %s", endpoint)
+
+	if err := cluster.WaitMaintenance(ctx, endpoint, adoptMaintenanceTimeout); err != nil {
+		return err
+	}
+
+	disks, err := cluster.ListDisks(ctx, endpoint)
+	if err != nil {
+		return err
+	}
+
+	systemSerial := str(spec["systemDiskSerial"], "")
+	if err := cluster.RequireDisk(disks, systemSerial, "install target"); err != nil {
+		return err
+	}
+
+	// Checked ONLY when asked for. An absent data disk is a legitimate choice
+	// and step 10 announces what it costs; an absent one that was MEANT to be
+	// present is a typo, which the same check catches.
+	dataSerial := str(spec["dataDiskSerial"], "")
+	if dataSerial != "" {
+		if err := cluster.RequireDisk(disks, dataSerial, "data disk"); err != nil {
+			return err
+		}
+	}
+
+	// The node's own answer, with the spec as an override for the case Risk 1
+	// of the design spec describes: a maintenance-mode node that reports no tag.
+	version := str(spec["talosVersion"], "")
+	source := "spec.baremetal.talosVersion"
+
+	if version == "" {
+		if version, err = cluster.NodeVersion(ctx, endpoint); err != nil {
+			return err
+		}
+		source = "the node's maintenance API"
+	}
+
+	return cluster.Up(ctx, cluster.UpOptions{
+		ClusterName:      m.GetName(),
+		StateDir:         dir,
+		TalosEndpoint:    endpoint,
+		KubeEndpoint:     baremetalKubeEndpoint(m),
+		SystemDiskSerial: systemSerial,
+		DataDiskSerial:   dataSerial,
+		TalosVersion:     version,
+		VersionSource:    source,
+		Substrate:        fmt.Sprintf("baremetal, %s", str(spec["endpoint"], "")),
+		// EMPTY BY DEFAULT. Real hardware has a firmware-configured console and
+		// usually a display; a console argument derived from THIS host's
+		// architecture is a guess, and a wrong one is silent at exactly the
+		// boot you would need it for.
+		ConsoleArg: str(spec["consoleArg"], ""),
+		// The kexec workaround is QEMU-on-macOS-specific. Hardware reboots
+		// through its own firmware and has nothing to work around.
+		DisableKexec: false,
+		// ALREADY RUNNING, by definition — that is what adopt means. Returning
+		// a pid of 0 is honest: this process did not start it and has no
+		// handle on it.
+		Boot: func() (int, error) { return 0, nil },
+	})
 }
 
 // bringUp is the -up verb: create (or adopt) the VM, then hand everything after
@@ -559,6 +771,11 @@ func (h *hvf) Stop(ctx context.Context, m *unstructured.Unstructured) error {
 	}
 	return halt(ctx, pid, dir)
 }
+
+// adoptMaintenanceTimeout covers a node that may still be booting when adopt is
+// run. It is generous because the operator has just walked over and pressed a
+// power button, and firmware on real hardware is slower than QEMU's.
+const adoptMaintenanceTimeout = 10 * time.Minute
 
 const (
 	gracefulStopTimeout = 60 * time.Second
