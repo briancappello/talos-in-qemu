@@ -527,10 +527,100 @@ leaving you to find out:
 machine's state directory, and `destroy` takes the whole state directory. This
 is a local development cluster, not a place to keep anything.
 
+## `adopt` — a node TinQ did not create
+
+*Verified against a QEMU node published on a LAN address. **Not yet run on
+physical hardware** — see Status.*
+
+Every verb above builds a VM. `adopt` is the one that does not: it takes a Talos
+machine **already booted into maintenance mode** — from a USB stick, IPMI virtual
+media, or netboot — and drives it to a Ready single-node cluster using the same
+ten steps `up` uses.
+
+It never powers anything on, and it never installs without a disk serial you
+chose.
+
+```yaml
+spec:
+  site: lab
+  role: talos-cp
+  baremetal:
+    endpoint: 192.168.1.50      # the node's address, NO port
+```
+
+`endpoint` carries **no port**. Talos's own defaults are used — 50000 for apid,
+6443 for kube-apiserver — because there is no forward to describe. Writing
+`192.168.1.50:50000` produced `192.168.1.50:50000:50000` and hung for the full
+ten-minute budget before that was refused up front.
+
+### Run it twice, on purpose
+
+The first run is **expected to refuse**, because a serial cannot be guessed and
+guessing wrong overwrites a disk that may hold data:
+
+```
+$ tinq adopt node.yaml
+tinq: no serial given for the install target, and one cannot be guessed
+
+this node's disks:
+
+  DEVICE   SERIAL         MODEL          SIZE     NOTES
+  loop0    (none)                        84 MB    readonly — probably the medium you booted from
+  sr0      (none)         QEMU DVD-ROM   0 B      readonly — …, cdrom, sata
+  vda      talos-system                  22 GB    rotational, virtio
+  vdb      (none)                        336 MB   readonly — …, rotational, virtio
+  vdc      talos-data                    22 GB    rotational, virtio
+
+  put one of those serials in the machine file, then run adopt again
+```
+
+That table is the remedy, not decoration — without `talosctl` there is no other
+way to learn a serial. Note **`readonly`, not `cdrom`, identifies the medium you
+booted from**: a Talos ISO presents as a read-only virtio-blk device (`vdb`
+above), so a table flagging only CDROM would list your USB stick as an ordinary
+install candidate.
+
+Write a serial into `spec.baremetal.systemDiskSerial`, add `dataDiskSerial` if
+you want a StorageClass, and run it again. A serial matching **no** disk is
+refused the same way — that is the realistic failure, and Talos does not report
+it as one: it installs nowhere and the bring-up hangs.
+
+### The other verbs refuse hardware
+
+`apply`, `up`, `stop` and `destroy` all refuse a machine with `spec.baremetal`,
+each naming `adopt`. `destroy` matters most: its contract is to take the entire
+state directory, and on hardware that would delete the **only talosconfig that
+can reach a node it has no way to destroy** — a node that has left maintenance
+mode and can never be re-adopted.
+
+The controller applies the same rule from the other side. Deleting an adopted
+machine's resource **forgets** it: nothing on disk is removed, the node keeps
+running, and the finalizer clears so the resource goes away. Deleting a
+*registration* must not delete the credential to a machine that outlives it.
+
+There is no `forget` verb yet, so clearing an adopted node's state directory is
+`rm -rf` for now. The refusals say so.
+
+### Known rough edges
+
+- **Re-running `adopt` on an already-adopted node waits out the full ten-minute
+  maintenance budget** and then fails. `up`'s resume logic knows this case; the
+  pre-flight runs before it. Use `up`'s idempotency story only for VMs.
+- `powerState: Stopped` on a baremetal machine publishes no status at all.
+- The transcript's step 4 prints `boot: pid 0` — honest (TinQ booted nothing),
+  but it reads oddly.
+- **DHCP is assumed.** A node that comes up without a lease is unreachable, and
+  TinQ cannot tell that apart from a node that never booted.
+
 ## Unprivileged by construction
 
 QEMU **user-mode networking** (SLIRP), so no `vmnet`, no `tap`, no bridge, no
 `sudo`. `hostForwards` is how the host reaches the guest.
+
+`hostForwards[].hostAddr` sets the bind address per forward and defaults to
+`127.0.0.1`. QEMU binds it **exclusively**, so publishing on a LAN address means
+nothing is listening on loopback — TinQ dials whatever address the forward is
+actually bound to.
 
 The tradeoff is real and worth stating: user-mode networking gives each VM NAT'd
 egress and forwarded ingress, and **VMs cannot reach each other**. For a single
@@ -607,6 +697,19 @@ Working and exercised:
   below
 - Controller mode against a cluster with the CRD installed
 - `Destroy` sweeps process + state directory
+- `adopt` against a **QEMU node published on a LAN address** — the full ten
+  steps to Ready, with the apiserver certificate naming that address and
+  `kubectl` reaching it. Both disk refusals fired; a PVC bound onto the
+  serial-selected data disk (`/dev/vdc1`). This rehearses everything hardware
+  needs except a real NIC and disk serials TinQ did not choose
+
+Not yet exercised:
+
+- **`adopt` against physical hardware.** Nothing in this branch has met a
+  machine that is not a VM. The rehearsal above is deliberately as close as a
+  VM can get, and the two remaining unknowns are named: a real NIC taking a
+  DHCP lease, and real disk serials (some consumer NVMe report none, in which
+  case WWID is the fallback and the table shows it)
 
 - **A real cluster, end to end** — *before this branch, by hand, on
   macOS/arm64*. Single-node control plane, Kubernetes v1.36.1 on Talos v1.9.5,
