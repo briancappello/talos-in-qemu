@@ -473,3 +473,155 @@ func TestCreateAndStopDoNotSpinOnHardware(t *testing.T) {
 			"driver has no power control over", out)
 	}
 }
+
+// staticMachine is baremetalMachine with the block the target hardware needs.
+// The maintenance address and the static address are DELIBERATELY EQUAL, which
+// is the no-DHCP case: the operator gave the node its final address at the GRUB
+// prompt, so nothing moves.
+func staticMachine() *unstructured.Unstructured {
+	m := baremetalMachine()
+	m.Object["spec"].(map[string]interface{})["baremetal"] = map[string]interface{}{
+		"maintenanceEndpoint": "192.168.2.10",
+		"systemDiskSerial":    "S1",
+		"network": map[string]interface{}{
+			"address":      "192.168.2.10/24",
+			"gateway":      "192.168.2.1",
+			"nameservers":  []interface{}{"1.1.1.1"},
+			"hardwareAddr": "84:47:09:47:35:f9",
+		},
+	}
+
+	return m
+}
+
+func TestBaremetalNetworkReadsEveryFieldOutOfTheBlock(t *testing.T) {
+	n, err := baremetalNetwork(staticMachine())
+	if err != nil {
+		t.Fatalf("baremetalNetwork: %s", err)
+	}
+
+	if n == nil {
+		t.Fatal("the network block was not read at all")
+	}
+
+	// EVERY field, because a reader that drops one produces a config that
+	// installs and then cannot resolve, or route, or come up at all — and each
+	// of those looks like a different bug.
+	if n.Address != "192.168.2.10/24" || n.Gateway != "192.168.2.1" ||
+		n.HardwareAddr != "84:47:09:47:35:f9" ||
+		len(n.Nameservers) != 1 || n.Nameservers[0] != "1.1.1.1" {
+		t.Errorf("baremetalNetwork = %+v, want every field of the manifest block", n)
+	}
+}
+
+func TestBaremetalNetworkIsNilForADHCPMachine(t *testing.T) {
+	n, err := baremetalNetwork(baremetalMachine())
+	if err != nil {
+		t.Fatalf("baremetalNetwork: %s", err)
+	}
+
+	if n != nil {
+		t.Errorf("a machine with no network block produced %+v, want nil — absent is the "+
+			"answer every node gave before this field existed", n)
+	}
+}
+
+func TestBaremetalNetworkRefusesAMalformedBlock(t *testing.T) {
+	m := baremetalMachine()
+	m.Object["spec"].(map[string]interface{})["baremetal"].(map[string]interface{})["network"] = "192.168.2.10/24"
+
+	if _, err := baremetalNetwork(m); err == nil {
+		t.Error("a scalar `network:` was accepted, and every field read off it would be empty")
+	}
+}
+
+// THE ENDPOINTS A CLIENT KEEPS. Both are baked into artifacts on disk — the
+// talosconfig and the kubeconfig — so pointing them at the maintenance address
+// leaves the operator with two files that dial an address the node dropped.
+func TestBaremetalEndpointsFollowTheStaticAddress(t *testing.T) {
+	m := staticMachine()
+	m.Object["spec"].(map[string]interface{})["baremetal"].(map[string]interface{})["maintenanceEndpoint"] = "192.168.2.99"
+
+	if got := baremetalTalosEndpoint(m); got != "192.168.2.99:50000" {
+		t.Errorf("talos endpoint = %q, want 192.168.2.99:50000 — before the install the node "+
+			"holds only the maintenance address", got)
+	}
+
+	if got := baremetalInstalledEndpoint(m); got != "192.168.2.10:50000" {
+		t.Errorf("installed endpoint = %q, want 192.168.2.10:50000", got)
+	}
+
+	if got := baremetalKubeEndpoint(m); got != "https://192.168.2.10:6443" {
+		t.Errorf("kube endpoint = %q, want https://192.168.2.10:6443 — a kubeconfig pointing "+
+			"at the maintenance address cannot be used after the install reboot", got)
+	}
+}
+
+func TestBaremetalEndpointsStayPutWithoutANetworkBlock(t *testing.T) {
+	m := baremetalMachine()
+
+	if got := baremetalInstalledEndpoint(m); got != "192.168.1.50:50000" {
+		t.Errorf("installed endpoint = %q, want 192.168.1.50:50000 — a DHCP node does not move", got)
+	}
+
+	if got := baremetalKubeEndpoint(m); got != "https://192.168.1.50:6443" {
+		t.Errorf("kube endpoint = %q, want https://192.168.1.50:6443", got)
+	}
+}
+
+// Observe reports what a client dials, and after the install that is the static
+// address. Reporting the maintenance one puts an address in kubectl output that
+// stopped answering at the first reboot.
+func TestObserveReportsTheAddressTheNodeKeeps(t *testing.T) {
+	_, status, err := observeBaremetal(staticMachine(), t.TempDir())
+	if err != nil {
+		t.Fatalf("observeBaremetal: %s", err)
+	}
+
+	if got := status["apiEndpoint"]; got != "192.168.2.10:50000" {
+		t.Errorf("status.apiEndpoint = %v, want 192.168.2.10:50000", got)
+	}
+}
+
+// The refusal must land BEFORE the ten-minute maintenance wait. Reaching it
+// afterwards is ten minutes spent on a verdict that was provable from the file.
+func TestAdoptRefusesAnUnreachableStaticAddressWithoutDialling(t *testing.T) {
+	// The same on-disk shape TestAdoptRefusesAnEndpointCarryingAPort uses
+	// (adopt_test.go:285): a machine file in a temp dir and an hvf rooted in
+	// another. There is no helper for this in the package; do not invent one.
+	path := filepath.Join(t.TempDir(), "machine.yaml")
+	if err := os.WriteFile(path, []byte(`apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata: {name: bm0, namespace: default}
+spec:
+  site: lab
+  baremetal:
+    maintenanceEndpoint: 192.168.1.186
+    systemDiskSerial: S1
+    network:
+      address: 192.168.2.10/24
+      gateway: 192.168.2.1
+      nameservers: [1.1.1.1]
+      hardwareAddr: 84:47:09:47:35:f9
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &hvf{stateRoot: t.TempDir(), imageRoot: t.TempDir()}
+
+	started := time.Now()
+	err := adoptMachine(context.Background(), d, path)
+
+	if err == nil {
+		t.Fatal("adopt accepted a static address on a segment the node is not on")
+	}
+
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Errorf("adopt took %s to refuse, so it dialled first\n"+
+			"  reason: this verdict comes from the manifest alone", elapsed)
+	}
+
+	if !strings.Contains(err.Error(), "192.168.2.10/24") {
+		t.Errorf("the refusal does not name the address that caused it: %s", err)
+	}
+}

@@ -79,10 +79,86 @@ func baremetalTalosEndpoint(m *unstructured.Unstructured) string {
 	return ""
 }
 
+// baremetalNetwork reads spec.baremetal.network, or nil when there is none.
+//
+// nil is a REAL ANSWER — DHCP, which is what every node had before this block
+// existed. A malformed block is not: a scalar `network: 192.168.2.10/24` reads
+// as every field empty, and a config generated from that would name no
+// interface at all.
+func baremetalNetwork(m *unstructured.Unstructured) (*cluster.Network, error) {
+	raw, present := baremetalFields(m)["network"]
+	if !present || raw == nil {
+		return nil, nil
+	}
+
+	block, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("spec.baremetal.network is not a block of fields\n\n"+
+			"  it must be a mapping:\n\n    network:\n      address: 192.168.2.10/24\n"+
+			"      gateway: 192.168.2.1\n      nameservers: [1.1.1.1]\n"+
+			"      hardwareAddr: 84:47:09:47:35:f9\n\n  (%s)", m.GetName())
+	}
+
+	n := &cluster.Network{
+		Address:      str(block["address"], ""),
+		Gateway:      str(block["gateway"], ""),
+		HardwareAddr: str(block["hardwareAddr"], ""),
+	}
+
+	// A non-string entry becomes "", which cluster.CheckNetwork refuses as "not
+	// an address" — the same complaint it would make about a typo, which is the
+	// honest one for a value that is not a resolver either way.
+	if list, ok := block["nameservers"].([]interface{}); ok {
+		for _, v := range list {
+			n.Nameservers = append(n.Nameservers, str(v, ""))
+		}
+	}
+
+	return n, nil
+}
+
+// baremetalInstalledAddr is the BARE address a client dials once the node has
+// installed: the static address when there is one, the maintenance address
+// otherwise.
+//
+// The parse error is DISCARDED and the maintenance address stands in, which is
+// safe for exactly one reason: adopt refuses an unparseable block up front, so
+// the only caller that can reach the fallback is Observe — on a manifest adopt
+// would never have accepted. Returning an error here instead would put a
+// refusal in a status reporter, which has no way to state one.
+func baremetalInstalledAddr(m *unstructured.Unstructured) string {
+	maintenance := str(baremetalFields(m)["maintenanceEndpoint"], "")
+
+	n, err := baremetalNetwork(m)
+	if err != nil || n == nil {
+		return maintenance
+	}
+
+	ip, err := n.IP()
+	if err != nil {
+		return maintenance
+	}
+
+	return ip
+}
+
+// baremetalInstalledEndpoint is where the node answers AFTER the install.
+func baremetalInstalledEndpoint(m *unstructured.Unstructured) string {
+	if a := baremetalInstalledAddr(m); a != "" {
+		return fmt.Sprintf("%s:%d", a, talosAPIGuestPort)
+	}
+
+	return ""
+}
+
+// baremetalKubeEndpoint is the kubeconfig's server, and it follows the address
+// the node KEEPS. A kubeconfig written against the maintenance address is a
+// file that stops working at the first reboot, on a node that is otherwise fine.
 func baremetalKubeEndpoint(m *unstructured.Unstructured) string {
-	if a := str(baremetalFields(m)["maintenanceEndpoint"], ""); a != "" {
+	if a := baremetalInstalledAddr(m); a != "" {
 		return fmt.Sprintf("https://%s:%d", a, kubeAPIGuestPort)
 	}
+
 	return ""
 }
 
@@ -203,7 +279,7 @@ func ignoreBaremetalOp(m *unstructured.Unstructured, op string) error {
 // same honesty adopt's Boot func uses when it returns 0.
 func observeBaremetal(m *unstructured.Unstructured, dir string) (driverkit.State, map[string]interface{}, error) {
 	return driverkit.Running, map[string]interface{}{
-		"stateDir": dir, "apiEndpoint": baremetalTalosEndpoint(m),
+		"stateDir": dir, "apiEndpoint": baremetalInstalledEndpoint(m),
 	}, nil
 }
 
@@ -264,6 +340,19 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 			addr, talosAPIGuestPort, kubeAPIGuestPort)
 	}
 
+	// PARSED AND REFUSED BEFORE ANYTHING IS DIALLED. Every check in
+	// CheckNetwork is provable from the file, and the expensive one to discover
+	// late is the containment refusal: reaching it after the maintenance wait
+	// costs ten minutes for a verdict the manifest already contained.
+	network, err := baremetalNetwork(m)
+	if err != nil {
+		return err
+	}
+
+	if err := cluster.CheckNetwork(network, str(spec["maintenanceEndpoint"], "")); err != nil {
+		return err
+	}
+
 	dir := d.dir(m)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("state dir: %w", err)
@@ -291,6 +380,23 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 	dataSerial := str(spec["dataDiskSerial"], "")
 	if dataSerial != "" {
 		if err := cluster.RequireDisk(disks, dataSerial, "data disk"); err != nil {
+			return err
+		}
+	}
+
+	// ASKED ONLY WHEN THERE IS A STATIC BLOCK. A DHCP node's NIC is Talos's
+	// business and naming one for it would be a choice nobody asked for.
+	//
+	// The refusal that matters here is CARRIER: this repo's target machine has
+	// two ports with one cable, and a config pointing at the empty one installs,
+	// reboots, brings up a link that cannot pass traffic, and goes silent.
+	if network != nil {
+		links, err := cluster.ListLinks(ctx, endpoint)
+		if err != nil {
+			return err
+		}
+
+		if err := cluster.RequireLink(links, network.HardwareAddr); err != nil {
 			return err
 		}
 	}
@@ -325,6 +431,9 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		// The kexec workaround is QEMU-on-macOS-specific. Hardware reboots
 		// through its own firmware and has nothing to work around.
 		DisableKexec: false,
+		// The address the node answers on AFTERWARDS is derived from this by
+		// cluster.Up, never configured beside it — see installedEndpoint.
+		Network: network,
 		// ALREADY RUNNING, by definition — that is what adopt means. Returning
 		// a pid of 0 is honest: this process did not start it and has no
 		// handle on it.
