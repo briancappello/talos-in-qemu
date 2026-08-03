@@ -202,10 +202,10 @@ func Up(ctx context.Context, opts UpOptions) error {
 	// Both messages describe what the endpoint IS and prescribe no field to
 	// fix it in. There are two origins and they have nothing in common: a VM's
 	// endpoint is the host side of a forward, from spec.hostForwards, and an
-	// adopted node's is derived from spec.baremetal.endpoint, which the CRD
-	// forbids alongside hostForwards. A message naming one of them is wrong
-	// for the other half of its readers, and naming hostForwards to an adopt
-	// would prescribe the exact field the CRD rejects.
+	// adopted node's is derived from spec.baremetal.maintenanceEndpoint, which
+	// the CRD forbids alongside hostForwards. A message naming one of them is
+	// wrong for the other half of its readers, and naming hostForwards to an
+	// adopt would prescribe the exact field the CRD rejects.
 	if opts.TalosEndpoint == "" {
 		return errors.New("no Talos API endpoint: this is the address a client dials to reach " +
 			"this node's Talos API, as host:port — apid's port 50000 at the machine's own " +

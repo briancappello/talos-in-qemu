@@ -17,10 +17,10 @@
 # the state directory, and sharing one would put this node's talosconfig inside
 # the VM's state dir — where `tinq destroy` would take it.
 #
-# NO PORT on endpoint. Talos's own defaults are used (50000 for apid, 6443 for
-# kube-apiserver) because there is no forward to describe. Writing
-# `192.168.1.165:50000` here produced `192.168.1.165:50000:50000` and hung for
-# the full ten-minute budget before that was refused up front.
+# NO PORT on maintenanceEndpoint. Talos's own defaults are used (50000 for
+# apid, 6443 for kube-apiserver) because there is no forward to describe.
+# Writing `192.168.1.165:50000` here produced `192.168.1.165:50000:50000` and
+# hung for the full ten-minute budget before that was refused up front.
 apiVersion: machine.hvf.fleet.io/v1alpha1
 kind: TalosMachine
 metadata:
@@ -30,6 +30,6 @@ spec:
   site: rehearsal
   role: talos-cp
   baremetal:
-    endpoint: 192.168.1.165
+    maintenanceEndpoint: 192.168.1.165
     # systemDiskSerial: talos-system   # uncomment after the first run prints it
     # dataDiskSerial: talos-data       # omit entirely for no PVC storage

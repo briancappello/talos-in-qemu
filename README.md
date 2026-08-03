@@ -545,13 +545,13 @@ spec:
   site: lab
   role: talos-cp
   baremetal:
-    endpoint: 192.168.1.50      # the node's address, NO port
+    maintenanceEndpoint: 192.168.1.50      # the node's address, NO port
 ```
 
-`endpoint` carries **no port**. Talos's own defaults are used — 50000 for apid,
-6443 for kube-apiserver — because there is no forward to describe. Writing
-`192.168.1.50:50000` produced `192.168.1.50:50000:50000` and hung for the full
-ten-minute budget before that was refused up front.
+`maintenanceEndpoint` carries **no port**. Talos's own defaults are used —
+50000 for apid, 6443 for kube-apiserver — because there is no forward to
+describe. Writing `192.168.1.50:50000` produced `192.168.1.50:50000:50000` and
+hung for the full ten-minute budget before that was refused up front.
 
 ### Run it twice, on purpose
 

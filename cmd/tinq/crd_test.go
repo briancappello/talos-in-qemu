@@ -105,25 +105,25 @@ func TestCRDGuardsWhatTheGoCodeAssumes(t *testing.T) {
 
 	baremetal := crdMap(t, crdDig(t, specSchema, "properties", "baremetal"), "spec.baremetal")
 
-	if got, want := crdStrings(t, baremetal["required"], "spec.baremetal.required"), []string{"endpoint"}; !reflect.DeepEqual(got, want) {
+	if got, want := crdStrings(t, baremetal["required"], "spec.baremetal.required"), []string{"maintenanceEndpoint"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("spec.baremetal.required is %v, want %v — adopt.go cannot dial a node with no address", got, want)
 	}
 
 	props := crdMap(t, baremetal["properties"], "spec.baremetal.properties")
 
-	// required is KEY PRESENCE, so `endpoint: ""` satisfies it and reaches
-	// adopt.go, which then refuses it. minLength is what makes the schema mean
-	// what that `required` line reads as. Reported rather than fatal, so losing
-	// it does not hide the field checks below.
-	if got := fmt.Sprint(crdMap(t, props["endpoint"], "spec.baremetal.endpoint")["minLength"]); got != "1" {
-		t.Errorf("spec.baremetal.endpoint minLength is %s, want 1 — `required` alone accepts an empty string", got)
+	// required is KEY PRESENCE, so `maintenanceEndpoint: ""` satisfies it and
+	// reaches adopt.go, which then refuses it. minLength is what makes the
+	// schema mean what that `required` line reads as. Reported rather than
+	// fatal, so losing it does not hide the field checks below.
+	if got := fmt.Sprint(crdMap(t, props["maintenanceEndpoint"], "spec.baremetal.maintenanceEndpoint")["minLength"]); got != "1" {
+		t.Errorf("spec.baremetal.maintenanceEndpoint minLength is %s, want 1 — `required` alone accepts an empty string", got)
 	}
 
 	// Every field cmd/tinq/adopt.go reads out of the block. A schema missing one
 	// of these prunes it on the way through an apiserver, so the value the
 	// operator wrote never arrives.
 
-	for _, f := range []string{"endpoint", "systemDiskSerial", "dataDiskSerial", "consoleArg", "talosVersion"} {
+	for _, f := range []string{"maintenanceEndpoint", "systemDiskSerial", "dataDiskSerial", "consoleArg", "talosVersion"} {
 		if _, ok := props[f]; !ok {
 			t.Errorf("spec.baremetal.%s is missing from the schema, but adopt.go reads it", f)
 		}

@@ -26,8 +26,8 @@ func baremetalMachine() *unstructured.Unstructured {
 		"spec": map[string]interface{}{
 			"site": "lab", "role": "talos-cp",
 			"baremetal": map[string]interface{}{
-				"endpoint":         "192.168.1.50",
-				"systemDiskSerial": "S1",
+				"maintenanceEndpoint": "192.168.1.50",
+				"systemDiskSerial":    "S1",
 			},
 		},
 	}}
@@ -72,7 +72,7 @@ func TestIsBaremetalMeasuresPresenceNotShape(t *testing.T) {
 		readable  bool // are there fields to read?
 	}{
 		{"map", map[string]interface{}{"baremetal": map[string]interface{}{
-			"endpoint": "192.168.1.50"}}, true, true},
+			"maintenanceEndpoint": "192.168.1.50"}}, true, true},
 		{"scalar", map[string]interface{}{"baremetal": "yes"}, true, false},
 		{"null", map[string]interface{}{"baremetal": nil}, true, false},
 		{"empty-map", map[string]interface{}{"baremetal": map[string]interface{}{}}, true, true},
@@ -207,7 +207,7 @@ metadata: {name: bm0, namespace: default}
 spec:
   site: lab
   baremetal:
-    endpoint: 192.168.1.50
+    maintenanceEndpoint: 192.168.1.50
     systemDiskSerial: S1
 `), 0o644); err != nil {
 		t.Fatal(err)
@@ -290,7 +290,7 @@ metadata: {name: bm0, namespace: default}
 spec:
   site: lab
   baremetal:
-    endpoint: 10.0.0.5:50000
+    maintenanceEndpoint: 10.0.0.5:50000
     systemDiskSerial: S1
 `), 0o644); err != nil {
 		t.Fatal(err)

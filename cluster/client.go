@@ -108,9 +108,9 @@ func errNoEndpoint() error {
 // still holds no secrets while it is in maintenance mode, and the window still
 // closes the moment ApplyConfiguration lands, after which AuthenticatedClient
 // verifies properly. What is gone is loopback-by-construction: `adopt` dials
-// spec.baremetal.endpoint, the node's own LAN address, and `up` dials
-// hostForwards[].hostAddr, which the README documents as a way to publish on a
-// LAN. The channel is whatever network segment lies between.
+// spec.baremetal.maintenanceEndpoint, the node's own LAN address, and `up`
+// dials hostForwards[].hostAddr, which the README documents as a way to publish
+// on a LAN. The channel is whatever network segment lies between.
 //
 // So the exposure is not "nothing", it is bounded by WHO CAN SIT IN THAT PATH,
 // and it has to be: applyConfiguration sends the machine config over this

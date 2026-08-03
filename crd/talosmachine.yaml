@@ -124,24 +124,29 @@ spec:
                     Omit for a single-disk machine with no StorageClass.
                 baremetal:
                   type: object
-                  required: [endpoint]
+                  required: [maintenanceEndpoint]
                   description: >-
                     Present when this machine is HARDWARE that already exists. Its
                     presence is the discriminator: apply/up/stop/destroy refuse a
                     machine that has it, and `tinq adopt` requires it. Nothing here
                     powers a node on — it must already be in maintenance mode.
                   properties:
-                    endpoint:
+                    maintenanceEndpoint:
                       type: string
                       # minLength CARRIES THE WEIGHT `required` LOOKS LIKE IT DOES.
-                      # `required: [endpoint]` is key presence only, so `endpoint: ""`
-                      # satisfies it and travels all the way to adopt.go, which then
-                      # rejects it. The schema should refuse what it appears to refuse.
+                      # `required: [maintenanceEndpoint]` is key presence only, so
+                      # `maintenanceEndpoint: ""` satisfies it and travels all the way to
+                      # adopt.go, which then rejects it. The schema should refuse what it
+                      # appears to refuse.
                       minLength: 1
                       description: >-
-                        The node's address, no port. Talos's own defaults are used
-                        (50000 for apid, 6443 for kube-apiserver) because there is no
-                        forward to describe. This value goes into apid's certificate.
+                        Where the node answers RIGHT NOW, in maintenance mode. No port:
+                        Talos's own defaults are used (50000 for apid, 6443 for
+                        kube-apiserver) because there is no forward to describe.
+                        With no network block this is also where the node answers
+                        FOREVER, and it goes into apid's certificate. With one, it is
+                        transient — spec.baremetal.network.address takes over the moment
+                        the node reboots into what it installed.
                     systemDiskSerial:
                       type: string
                       description: >-

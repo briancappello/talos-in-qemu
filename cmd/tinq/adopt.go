@@ -73,14 +73,14 @@ func baremetalFields(m *unstructured.Unstructured) map[string]interface{} {
 // kube-apiserver serve their own default ports on the node itself, so these are
 // the same constants the guest side uses, applied to a real address.
 func baremetalTalosEndpoint(m *unstructured.Unstructured) string {
-	if a := str(baremetalFields(m)["endpoint"], ""); a != "" {
+	if a := str(baremetalFields(m)["maintenanceEndpoint"], ""); a != "" {
 		return fmt.Sprintf("%s:%d", a, talosAPIGuestPort)
 	}
 	return ""
 }
 
 func baremetalKubeEndpoint(m *unstructured.Unstructured) string {
-	if a := str(baremetalFields(m)["endpoint"], ""); a != "" {
+	if a := str(baremetalFields(m)["maintenanceEndpoint"], ""); a != "" {
 		return fmt.Sprintf("https://%s:%d", a, kubeAPIGuestPort)
 	}
 	return ""
@@ -194,9 +194,9 @@ func ignoreBaremetalOp(m *unstructured.Unstructured, op string) error {
 // later powered off. Nothing is stat'ed here — not a state dir, not a
 // talosconfig — so a TalosMachine carrying spec.baremetal reports Ready=True
 // from the moment it is applied, before `tinq adopt` has ever been run against
-// it and whether or not the address in spec.baremetal.endpoint has anything
-// behind it. driverkit's Observe contract records the same exception from the
-// other side. Reading Ready as "this node is serving" is wrong for hardware in
+// it and whether or not the address in spec.baremetal.maintenanceEndpoint has
+// anything behind it. driverkit's Observe contract records the same exception
+// from the other side. Reading Ready as "this node is serving" is wrong for hardware in
 // both directions; the endpoint in status is what to ask instead.
 //
 // No pid: this process did not start that node and holds no handle on it — the
@@ -236,14 +236,15 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 	if spec == nil {
 		return fmt.Errorf("%s has spec.baremetal, but it is not a block of fields — a scalar "+
 			"or an empty `baremetal:` cannot carry an endpoint or a disk serial\n\n"+
-			"  it must be a mapping:\n\n    baremetal:\n      endpoint: 192.168.1.50\n"+
+			"  it must be a mapping:\n\n    baremetal:\n      maintenanceEndpoint: 192.168.1.50\n"+
 			"      systemDiskSerial: S1", m.GetName())
 	}
 
 	endpoint := baremetalTalosEndpoint(m)
 	if endpoint == "" {
-		return errors.New("spec.baremetal.endpoint is required: it is the address this host " +
-			"dials to reach the node, and it goes into apid's certificate")
+		return errors.New("spec.baremetal.maintenanceEndpoint is required: it is the address this host " +
+			"dials to reach the node while it is in maintenance mode, and with no network block " +
+			"it is also where the node answers afterwards")
 	}
 
 	// A BARE ADDRESS, and a port in it is a TEN-MINUTE HANG rather than a parse
@@ -256,8 +257,8 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 	// An IPv6 literal is caught here too, and truthfully rather than by
 	// accident: baremetalTalosEndpoint cannot bracket one, so a v6 address is
 	// unsupported and this is where it should be said.
-	if addr := str(spec["endpoint"], ""); strings.Contains(addr, ":") {
-		return fmt.Errorf("spec.baremetal.endpoint %q must be a bare address with no port: "+
+	if addr := str(spec["maintenanceEndpoint"], ""); strings.Contains(addr, ":") {
+		return fmt.Errorf("spec.baremetal.maintenanceEndpoint %q must be a bare address with no port: "+
 			"apid's %d and kube-apiserver's %d are Talos's own and are added for you\n\n"+
 			"  (an IPv6 literal lands here too, and is not supported yet)",
 			addr, talosAPIGuestPort, kubeAPIGuestPort)
@@ -315,7 +316,7 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		DataDiskSerial:   dataSerial,
 		TalosVersion:     version,
 		VersionSource:    source,
-		Substrate:        fmt.Sprintf("baremetal, %s", str(spec["endpoint"], "")),
+		Substrate:        fmt.Sprintf("baremetal, %s", str(spec["maintenanceEndpoint"], "")),
 		// EMPTY BY DEFAULT. Real hardware has a firmware-configured console and
 		// usually a display; a console argument derived from THIS host's
 		// architecture is a guess, and a wrong one is silent at exactly the
