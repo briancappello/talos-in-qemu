@@ -71,6 +71,11 @@ type recorder struct {
 	// talosconfig to a node in maintenance mode, or installing storage with
 	// the machine config, fails on the node rather than here.
 	payload map[string][]byte
+	// endpoint is the address each operation was pointed at. A node with a
+	// static block ANSWERS AT TWO ADDRESSES over its life, and every hook below
+	// takes a string — so pointing bootstrap at the maintenance address still
+	// COMPILES, and fails minutes later against a node that stopped holding it.
+	endpoint map[string]string
 }
 
 func (r *recorder) call(name string, payload ...[]byte) error {
@@ -93,6 +98,16 @@ func (r *recorder) call(name string, payload ...[]byte) error {
 	}
 
 	return nil
+}
+
+func (r *recorder) at(name, endpoint string, payload ...[]byte) error {
+	if r.endpoint == nil {
+		r.endpoint = map[string]string{}
+	}
+
+	r.endpoint[name] = endpoint
+
+	return r.call(name, payload...)
 }
 
 func (r *recorder) did(name string) bool {
@@ -135,20 +150,20 @@ func (r *recorder) hooks() *upHooks {
 				Secrets:      []byte(fakeSecrets),
 			}, nil
 		},
-		waitMaintenance: func(context.Context, string, time.Duration) error {
-			return r.call("waitMaintenance")
+		waitMaintenance: func(_ context.Context, endpoint string, _ time.Duration) error {
+			return r.at("waitMaintenance", endpoint)
 		},
-		applyConfig: func(_ context.Context, _ string, config []byte) error {
-			return r.call("applyConfig", config)
+		applyConfig: func(_ context.Context, endpoint string, config []byte) error {
+			return r.at("applyConfig", endpoint, config)
 		},
-		waitBootstrapReady: func(_ context.Context, talosconfig []byte, _ string, _ time.Duration) error {
-			return r.call("waitBootstrapReady", talosconfig)
+		waitBootstrapReady: func(_ context.Context, talosconfig []byte, endpoint string, _ time.Duration) error {
+			return r.at("waitBootstrapReady", endpoint, talosconfig)
 		},
-		bootstrap: func(_ context.Context, talosconfig []byte, _ string) error {
-			return r.call("bootstrap", talosconfig)
+		bootstrap: func(_ context.Context, talosconfig []byte, endpoint string) error {
+			return r.at("bootstrap", endpoint, talosconfig)
 		},
-		kubeconfig: func(_ context.Context, talosconfig []byte, _ string) ([]byte, error) {
-			if err := r.call("kubeconfig", talosconfig); err != nil {
+		kubeconfig: func(_ context.Context, talosconfig []byte, endpoint string) ([]byte, error) {
+			if err := r.at("kubeconfig", endpoint, talosconfig); err != nil {
 				return nil, err
 			}
 
@@ -1439,5 +1454,151 @@ func TestStep6CreditsTheKernelArgToTheNode(t *testing.T) {
 		t.Errorf("step 6 credits the console arg to THIS host\n"+
 			"  reason: adopt drives a node that is not this host, and the transcript "+
 			"is what an operator learns Talos from\n%s", redact(transcript))
+	}
+}
+
+// The two fixture addresses are deliberately UNRELATED to each other and to
+// every other value in this file. Both are inside one /24 so CheckNetwork
+// accepts them — a same-wire re-pin, which is the only kind that can finish —
+// and they differ in the last octet so a hook handed the wrong one cannot pass.
+const (
+	fakeMaintenanceEndpoint = "10.99.0.186:50000"
+	fakeInstalledEndpoint   = "10.99.0.7:50000"
+)
+
+func fakeStaticNetwork() *Network {
+	return &Network{
+		Address:      "10.99.0.7/24",
+		Gateway:      "10.99.0.1",
+		Nameservers:  []string{"10.99.0.53"},
+		HardwareAddr: "84:47:09:47:35:f9",
+	}
+}
+
+// THE SEAM, not the function. Everything about the two addresses is correct in
+// cluster/network.go and worth nothing if Up hands the wrong one to a hook —
+// which compiles, because all five take a string.
+func TestUpDialsMaintenanceBeforeTheInstallAndTheStaticAddressAfter(t *testing.T) {
+	f := newFixture(t)
+	f.opts.TalosEndpoint = fakeMaintenanceEndpoint
+	f.opts.Network = fakeStaticNetwork()
+
+	f.mustRun(t)
+
+	before := []string{"waitMaintenance", "applyConfig"}
+	for _, op := range before {
+		if got := f.rec.endpoint[op]; got != fakeMaintenanceEndpoint {
+			t.Errorf("%s dialled %q, want %q\n"+
+				"  reason: before the install the node holds ONLY the maintenance address",
+				op, got, fakeMaintenanceEndpoint)
+		}
+	}
+
+	after := []string{"waitBootstrapReady", "bootstrap", "kubeconfig"}
+	for _, op := range after {
+		if got := f.rec.endpoint[op]; got != fakeInstalledEndpoint {
+			t.Errorf("%s dialled %q, want %q\n"+
+				"  reason: the node rebooted into what it installed and stopped holding %s;\n"+
+				"  a wait pointed there can only spend its whole budget",
+				op, got, fakeInstalledEndpoint, fakeMaintenanceEndpoint)
+		}
+	}
+}
+
+// The certificate names what the client dials, and after the install that is
+// the static address. Named wrong, the node installs, boots, serves apid, and
+// every authenticated call fails on a certificate nobody can point at.
+func TestUpPutsTheStaticAddressInTheCertificate(t *testing.T) {
+	f := newFixture(t)
+	f.opts.TalosEndpoint = fakeMaintenanceEndpoint
+	f.opts.Network = fakeStaticNetwork()
+
+	f.mustRun(t)
+
+	if got := f.rec.input.APIAddress; got != "10.99.0.7" {
+		t.Errorf("APIAddress = %q, want 10.99.0.7\n"+
+			"  reason: this becomes apid's subject alt name AND the talosconfig endpoint,\n"+
+			"  both baked at generation time and unrepairable afterwards", got)
+	}
+
+	if f.rec.input.Network == nil {
+		t.Error("the network block never reached ConfigInput\n" +
+			"  reason: a correct networkOption that nothing calls emits nothing")
+	} else if got := f.rec.input.Network.Address; got != "10.99.0.7/24" {
+		t.Errorf("ConfigInput.Network.Address = %q, want 10.99.0.7/24", got)
+	}
+}
+
+// EVERY MACHINE THAT EXISTED BEFORE THIS FEATURE takes this path, including
+// every QEMU one. With no block the node does not move, so both halves dial the
+// same address and the config carries no network at all.
+func TestUpDialsOneAddressForAMachineWithNoNetworkBlock(t *testing.T) {
+	f := newFixture(t)
+
+	f.mustRun(t)
+
+	for op, got := range f.rec.endpoint {
+		if got != f.opts.TalosEndpoint {
+			t.Errorf("%s dialled %q, want %q — a DHCP node does not move",
+				op, got, f.opts.TalosEndpoint)
+		}
+	}
+
+	if f.rec.input.Network != nil {
+		t.Error("ConfigInput.Network is set for a machine with no network block")
+	}
+}
+
+// Refused where the two endpoint refusals already are: BEFORE Boot. Failing
+// here costs nothing; failing after costs a VM nobody asked to keep and, on
+// hardware, a node that has already been told to install.
+func TestUpRefusesAnUnreachableStaticAddressBeforeBooting(t *testing.T) {
+	f := newFixture(t)
+	f.opts.TalosEndpoint = "192.168.1.186:50000"
+	f.opts.Network = fakeStaticNetwork() // 10.99.0.7/24 — another segment entirely
+
+	err := f.run(t)
+	if err == nil {
+		t.Fatal("Up accepted a static address on a different segment than the node it is adopting")
+	}
+
+	if f.booted != 0 {
+		t.Error("Up booted the machine before refusing\n" +
+			"  reason: the refusal is provable from the options alone, and reaching it later\n" +
+			"  leaves residue for a verdict that was free")
+	}
+
+	if !strings.Contains(err.Error(), "10.99.0.7/24") {
+		t.Errorf("the refusal does not name the address that caused it: %s", err)
+	}
+}
+
+// A CLAIM ABOUT REALITY, printed only when it is one. On a segment with no DHCP
+// the operator typed the node's FINAL address at the GRUB prompt, so it is
+// adopted and answers at the same place — and a transcript announcing a move
+// that is not happening sends the operator looking for a node at an address
+// nothing changed to.
+func TestStep6AnnouncesTheMoveOnlyWhenTheNodeMoves(t *testing.T) {
+	moves := newFixture(t)
+	moves.opts.TalosEndpoint = fakeMaintenanceEndpoint
+	moves.opts.Network = fakeStaticNetwork()
+
+	wants(t, moves.mustRun(t),
+		"network: 10.99.0.7/24 via 10.99.0.1 on 84:47:09:47:35:f9, dhcp off",
+		"this node MOVES: adopted at "+fakeMaintenanceEndpoint+
+			", answers at "+fakeInstalledEndpoint+" from the reboot onward")
+
+	// Adopted at the address the static block already names.
+	stays := newFixture(t)
+	stays.opts.TalosEndpoint = fakeInstalledEndpoint
+	stays.opts.Network = fakeStaticNetwork()
+
+	transcript := stays.mustRun(t)
+
+	wants(t, transcript, "network: 10.99.0.7/24 via 10.99.0.1 on 84:47:09:47:35:f9, dhcp off")
+
+	if strings.Contains(transcript, "this node MOVES") {
+		t.Errorf("step 6 announces a move for a node adopted at its own static address\n%s",
+			redact(transcript))
 	}
 }

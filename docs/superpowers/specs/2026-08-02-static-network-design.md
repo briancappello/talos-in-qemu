@@ -269,24 +269,37 @@ this is the right seam.
 
 ### `cluster/up.go`
 
-One field, one local:
+One field, and the post-install endpoint DERIVED from it rather than configured
+beside it:
 
 ```go
-// InstalledEndpoint is where the node answers AFTER the install reboot.
-// Empty means it does not move — which is every QEMU machine and every
-// baremetal machine with no network block.
-InstalledEndpoint string
+// Network is the node's static addressing, or nil for DHCP.
+//
+// There is NO companion field for the address the node answers on
+// afterwards, and there must not be one: it is derived. A second field
+// holding it would compile, read correctly, and be settable to an address
+// the node will never hold — which is the defect CheckNetwork exists to
+// refuse, reintroduced one layer down.
+Network *Network
 ```
 
 ```go
-installed := opts.InstalledEndpoint
-if installed == "" { installed = opts.TalosEndpoint }
+// installedEndpoint is where the node answers AFTER the install reboot, as
+// both a bare address — for apid's certificate and the talosconfig — and a
+// dialable host:port.
+//
+// With no static block the node does not move, and both are the maintenance
+// endpoint it already answers on. With one, the host changes and the PORT
+// DOES NOT: apid serves 50000 before and after the install, so reusing the
+// caller's port is not a shortcut, it is the fact.
+func installedEndpoint(endpoint string, n *Network) (addr, hostPort string, err error)
 ```
 
-`configure` already derives the SAN with `apiAddress(opts.TalosEndpoint)`
-(up.go:474); it derives it from `installed` instead. That is the ONE line that
-moves the certificate onto the post-install address, and every other change
-below is a routing change.
+`Up` calls it once, beside the two endpoint refusals and before `Boot`, and
+hands both halves to `configure`. `configure` no longer calls
+`apiAddress(opts.TalosEndpoint)` for the SAN — it receives the derived address
+instead. That is the ONE change that moves the certificate onto the post-install
+address, and every other change below is a routing change.
 
 `up` already has the before/after seam cleanly; this only stops the two halves
 sharing one string:

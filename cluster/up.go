@@ -121,6 +121,14 @@ type UpOptions struct {
 	// the workaround applies is a fact about the host, which this package no
 	// longer holds.
 	DisableKexec bool
+	// Network is the node's static addressing, or nil for DHCP.
+	//
+	// There is NO companion field for the address the node answers on
+	// afterwards, and there must not be one: it is derived below. A second
+	// field holding it would compile, read correctly, and be settable to an
+	// address the node will never hold — which is the defect CheckNetwork
+	// exists to refuse, reintroduced one layer down.
+	Network *Network
 
 	// Boot starts the VM, or adopts one already running, and returns its pid.
 	// Owned by package main: this package knows nothing about qemu.
@@ -217,6 +225,28 @@ func Up(ctx context.Context, opts UpOptions) error {
 			"this node's kube-apiserver — port 6443 at the machine's own address, or the host " +
 			"side of a forward to it; a kubeconfig pointing anywhere else cannot be used from " +
 			"this host")
+	}
+
+	// Refused here, beside the two above, and for the same reason: it is
+	// provable from the options alone. Reaching it after Boot spends a VM and a
+	// state dir on a verdict that was free — and on hardware it would spend a
+	// node that has already been told to install.
+	//
+	// CheckNetwork is given the MAINTENANCE address, because that is the one
+	// that has to sit inside the static prefix. Handing it the installed
+	// address instead would compare a value to itself and pass everything.
+	maintenanceAddr, err := apiAddress(opts.TalosEndpoint)
+	if err != nil {
+		return err
+	}
+
+	if err := CheckNetwork(opts.Network, maintenanceAddr); err != nil {
+		return err
+	}
+
+	installedAddr, installed, err := installedEndpoint(opts.TalosEndpoint, opts.Network)
+	if err != nil {
+		return err
 	}
 
 	p := &printer{w: out}
@@ -352,7 +382,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 		// start, and a wait that is generous in the one case is not mean in the
 		// other.
 		started := time.Now()
-		if err := hooks.waitBootstrapReady(ctx, talosconfig, opts.TalosEndpoint, installTimeout); err != nil {
+		if err := hooks.waitBootstrapReady(ctx, talosconfig, installed, installTimeout); err != nil {
 			return fail(err)
 		}
 
@@ -371,7 +401,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 
 		p.step("maintenance", "reachable after %s", took(started))
 
-		if talosconfig, err = configure(ctx, hooks, opts, p); err != nil {
+		if talosconfig, err = configure(ctx, hooks, opts, p, installedAddr, installed); err != nil {
 			return fail(err)
 		}
 	}
@@ -386,7 +416,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 	// in step 9 forever, against a node that can never report Ready. Asking the
 	// node instead, and accepting its refusal, collapses both cases into one
 	// path with no extra probe and nothing to keep in step.
-	switch err := hooks.bootstrap(ctx, talosconfig, opts.TalosEndpoint); {
+	switch err := hooks.bootstrap(ctx, talosconfig, installed); {
 	case err == nil:
 		p.step("bootstrap", "etcd bootstrapped")
 		p.detail("fired while the node is 'booting', NOT 'running' — waiting for 'running'")
@@ -406,7 +436,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 	// ── 9/10 kubeconfig ─────────────────────────────────────────────────────
 	started := time.Now()
 
-	kubeconfig, err := hooks.kubeconfig(ctx, talosconfig, opts.TalosEndpoint)
+	kubeconfig, err := hooks.kubeconfig(ctx, talosconfig, installed)
 	if err != nil {
 		return fail(err)
 	}
@@ -469,17 +499,12 @@ func Up(ctx context.Context, opts UpOptions) error {
 // that has already been configured must not repeat. Everything in it is what Up
 // ran inline before, in the same order, and its errors are returned bare
 // because the caller is what knows they leave a VM behind.
-func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer) ([]byte, error) {
+func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, installedAddr, installed string) ([]byte, error) {
 	// ── 6/10 config ─────────────────────────────────────────────────────────
-	addr, err := apiAddress(opts.TalosEndpoint)
-	if err != nil {
-		return nil, err
-	}
-
 	generated, err := hooks.generateConfig(ConfigInput{
 		ClusterName:      opts.ClusterName,
 		Endpoint:         opts.KubeEndpoint,
-		APIAddress:       addr,
+		APIAddress:       installedAddr,
 		TalosVersion:     opts.TalosVersion,
 		ConsoleArg:       opts.ConsoleArg,
 		SystemDiskSerial: opts.SystemDiskSerial,
@@ -490,6 +515,10 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer) 
 		// UpOptions.DisableKexec and, for the gate itself, cmd/tinq's
 		// upOptions.
 		DisableKexec: opts.DisableKexec,
+		// The address a client dials AFTER the install is derived from this
+		// block by the caller, so the certificate above and the address below
+		// cannot name two different hosts.
+		Network: opts.Network,
 	})
 	if err != nil {
 		return nil, err
@@ -535,6 +564,22 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer) 
 		p.detail("  reaches the ISO's running kernel before the reboot it has to change.")
 	}
 
+	if opts.Network != nil {
+		p.detail("network: %s via %s on %s, dhcp off", opts.Network.Address,
+			opts.Network.Gateway, opts.Network.HardwareAddr)
+		p.detail("  the installed system writes its own cmdline and inherits nothing from the")
+		p.detail("  ISO, so an address that is not in this config is gone at the install reboot")
+
+		// PRINTED ONLY WHEN IT IS TRUE. On a segment with no DHCP the operator
+		// gave the node its final address at the GRUB prompt and nothing moves;
+		// saying it moved would be a claim about an address change that is not
+		// happening.
+		if installed != opts.TalosEndpoint {
+			p.detail("  this node MOVES: adopted at %s, answers at %s from the reboot onward",
+				opts.TalosEndpoint, installed)
+		}
+	}
+
 	if opts.DataDiskSerial != "" {
 		p.detail("userVolume: %s on serial %s", userVolumeName, opts.DataDiskSerial)
 		p.detail("  PVCs get their own disk, so a runaway one cannot wedge etcd on EPHEMERAL")
@@ -550,7 +595,7 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer) 
 	// WaitBootstrapReady because that is what it is for: maintenance mode
 	// cannot satisfy the cluster PKI, so success here proves the config landed,
 	// the installed system booted, and apid is serving.
-	if err := hooks.waitBootstrapReady(ctx, generated.Talosconfig, opts.TalosEndpoint, installTimeout); err != nil {
+	if err := hooks.waitBootstrapReady(ctx, generated.Talosconfig, installed, installTimeout); err != nil {
 		return nil, err
 	}
 
@@ -647,6 +692,35 @@ func apiAddress(endpoint string) (string, error) {
 	}
 
 	return host, nil
+}
+
+// installedEndpoint is where the node answers AFTER the install reboot, as both
+// a bare address — for apid's certificate and the talosconfig — and a dialable
+// host:port.
+//
+// With no static block the node does not move, and both are the maintenance
+// endpoint it already answers on. With one, the host changes and the PORT DOES
+// NOT: apid serves 50000 before and after the install, so reusing the caller's
+// port is not a shortcut, it is the fact.
+func installedEndpoint(endpoint string, n *Network) (addr, hostPort string, err error) {
+	if addr, err = apiAddress(endpoint); err != nil {
+		return "", "", err
+	}
+
+	if n == nil {
+		return addr, endpoint, nil
+	}
+
+	if addr, err = n.IP(); err != nil {
+		return "", "", err
+	}
+
+	_, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return "", "", fmt.Errorf("the Talos endpoint %q is not host:port: %w", endpoint, err)
+	}
+
+	return addr, net.JoinHostPort(addr, port), nil
 }
 
 // writeArtifacts writes generated material into the machine's state directory
