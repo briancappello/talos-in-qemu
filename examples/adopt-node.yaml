@@ -33,29 +33,41 @@ spec:
     maintenanceEndpoint: 192.168.1.165
     # systemDiskSerial: talos-system   # uncomment after the first run prints it
     # dataDiskSerial: talos-data       # omit entirely for no PVC storage
-    # STATIC ADDRESSING, for a segment that serves no DHCP. Omit the whole block
-    # and the node uses DHCP, which is what this example does and what every
-    # QEMU machine does.
+    # STATIC ADDRESSING. Omit the whole block and the node uses DHCP, which is
+    # what this example does and what every QEMU machine does.
     #
     # Its address MUST be on the same segment as maintenanceEndpoint above.
     # Inside that prefix the node re-pins itself on the same wire and comes back
     # reachable; outside it the node boots onto an address that does not exist
     # on the wire it is plugged into, and adopt refuses before applying anything
     # because a re-run cannot repair it — an installed node never serves the
-    # maintenance API again.
+    # maintenance API again. So the block below is written against THIS file's
+    # 192.168.1.165, and on another segment both have to move together.
     #
-    # On a segment with no DHCP the node has NO ADDRESS from the ISO, so there
-    # is nothing for adopt to dial. Give the maintenance boot one at the GRUB
-    # menu: press `e`, append this to the linux line, Ctrl-X.
+    # TWO SITUATIONS REACH THAT BLOCK, and only one of them needs a kernel
+    # argument.
     #
-    #   ip=192.168.2.10::192.168.2.1:255.255.255.0::enp1s0:off
+    # SAME-WIRE RE-PIN — this segment serves DHCP, which is why
+    # maintenanceEndpoint is a plain address and nothing is typed at the
+    # console. Adopt reaches the node at the 192.168.1.165 its lease gave it,
+    # installs the static 192.168.1.50/24 below, and the node reboots and comes
+    # back at 192.168.1.50 on the same wire. No ip= line, no cable moved. The
+    # two addresses differ on purpose: what is checked is the prefix, not the
+    # host.
     #
-    # That covers the maintenance boot ONLY. The installed system writes its own
-    # command line and inherits nothing from the ISO — which is what the block
-    # below is for.
+    # NO DHCP ON THE SEGMENT — the node has NO ADDRESS from the ISO, so there is
+    # nothing for adopt to dial. Give the maintenance boot one at the GRUB menu:
+    # press `e`, append this to the linux line, Ctrl-X.
+    #
+    #   ip=192.168.1.50::192.168.1.1:255.255.255.0::enp1s0:off
+    #
+    # maintenanceEndpoint must then be that same 192.168.1.50, because it is the
+    # only address the node answers at. The ip= line covers the maintenance boot
+    # ONLY — the installed system writes its own command line and inherits
+    # nothing from the ISO, which is what the block below is for.
     #
     # network:
-    #   address: 192.168.2.10/24
-    #   gateway: 192.168.2.1
+    #   address: 192.168.1.50/24
+    #   gateway: 192.168.1.1
     #   nameservers: [1.1.1.1]
     #   hardwareAddr: 84:47:09:47:35:f9   # adopt prints this node's links on a mismatch
