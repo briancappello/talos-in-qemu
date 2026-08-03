@@ -546,12 +546,48 @@ spec:
   role: talos-cp
   baremetal:
     maintenanceEndpoint: 192.168.1.50      # the node's address, NO port
+
+    # static addressing — omit for DHCP; the address must be on maintenanceEndpoint's segment
+    # network:
+    #   address: 192.168.1.50/24
+    #   gateway: 192.168.1.1
+    #   nameservers: [1.1.1.1]
+    #   hardwareAddr: 84:47:09:47:35:f9
 ```
 
 `maintenanceEndpoint` carries **no port**. Talos's own defaults are used —
 50000 for apid, 6443 for kube-apiserver — because there is no forward to
 describe. Writing `192.168.1.50:50000` produced `192.168.1.50:50000:50000` and
 hung for the full ten-minute budget before that was refused up front.
+
+**No `network` block means DHCP**, which is what every QEMU machine uses and
+what every node used before the block existed. With one, the four fields are
+required together — a static node with no nameservers cannot resolve a registry
+and so cannot pull the image it was just told to install.
+
+`address` must sit **inside the same prefix as `maintenanceEndpoint`**, and adopt
+checks that from the file before it dials anything. Inside it, the node re-pins
+itself on the same wire and comes back reachable; outside it, the node boots onto
+an address that does not exist on the wire it is plugged into — and re-running
+cannot repair that, because an installed node never serves the maintenance API
+again. That address becomes apid's certificate SAN, the talosconfig endpoint and
+the kubeconfig server.
+
+A segment with no DHCP also leaves the node with **no address from the ISO**, so
+there is nothing for adopt to dial in the first place. Give the maintenance boot
+one at the GRUB menu — press `e`, append `ip=` to the linux line, Ctrl-X:
+
+```
+ip=192.168.1.50::192.168.1.1:255.255.255.0::enp1s0:off
+```
+
+That covers the **maintenance boot only**; the installed system writes its own
+command line and inherits nothing from the ISO, which is what the `network` block
+carries. `hardwareAddr` is a MAC rather than an interface name for the reason the
+install disk is a serial rather than a size — a stable identity, not an
+enumeration artifact. Omitting it is refused from the file; a MAC that is
+well-formed but **wrong** is refused once the node has answered, with this node's
+real links printed to copy from.
 
 ### Run it twice, on purpose
 
