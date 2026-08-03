@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coglative/talos-in-qemu/cluster"
 	"github.com/coglative/talos-in-qemu/driverkit"
 	"github.com/coglative/talos-in-qemu/platform"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -623,5 +625,49 @@ spec:
 
 	if !strings.Contains(err.Error(), "192.168.2.10/24") {
 		t.Errorf("the refusal does not name the address that caused it: %s", err)
+	}
+}
+
+// ── adopt: the ip= line on a maintenance timeout ────────────────────────────
+
+// The NETMASK is the whole reason this is generated rather than documented.
+// /24 is the one everybody types correctly; /26 is the one that strands a
+// machine, and it is exactly the arithmetic a human does in their head at a
+// GRUB prompt with a laptop balanced on a rack rail.
+func TestKernelCmdlineHintDerivesTheNetmask(t *testing.T) {
+	cases := []struct {
+		address string
+		want    string
+	}{
+		{"192.168.2.10/24", "ip=192.168.2.10::192.168.2.1:255.255.255.0::<your-nic>:off"},
+		{"192.168.2.10/26", "ip=192.168.2.10::192.168.2.1:255.255.255.192::<your-nic>:off"},
+		{"192.168.2.10/16", "ip=192.168.2.10::192.168.2.1:255.255.0.0::<your-nic>:off"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.address, func(t *testing.T) {
+			n := &cluster.Network{Address: c.address, Gateway: "192.168.2.1"}
+
+			got := kernelCmdlineHint(errors.New("gave up waiting"), n)
+			if !strings.Contains(got.Error(), c.want) {
+				t.Errorf("the hint does not carry %q:\n%s", c.want, got)
+			}
+
+			// The original failure must survive. A hint that replaces the error
+			// hides which wait actually timed out.
+			if !strings.Contains(got.Error(), "gave up waiting") {
+				t.Errorf("the hint swallowed the failure it decorates:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestKernelCmdlineHintLeavesADHCPFailureAlone(t *testing.T) {
+	// A node with no static block was reachable by DHCP or it was not, and an
+	// ip= recipe is advice for a problem it does not have.
+	want := errors.New("gave up waiting")
+
+	if got := kernelCmdlineHint(want, nil); got != want {
+		t.Errorf("the failure was decorated for a machine with no network block:\n%s", got)
 	}
 }

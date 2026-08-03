@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -283,6 +285,50 @@ func observeBaremetal(m *unstructured.Unstructured, dir string) (driverkit.State
 	}, nil
 }
 
+// kernelCmdlineHint explains a maintenance-wait timeout for a machine that
+// declares a static address, and prints the kernel command line that fixes it.
+//
+// ONLY on the timeout, because that is the only moment it helps. adopt can run
+// at all only once the node is already reachable, which means this line was
+// already typed correctly — printing it on a successful run is noise on every
+// run where nothing is wrong.
+//
+// The device field is left blank on purpose. The kernel wants an interface
+// NAME and the manifest holds a MAC, which is the one cost of selecting the NIC
+// by a stable identity. Three of the four values still come from the file,
+// including the netmask, whose arithmetic is what gets typed wrong on a /26.
+func kernelCmdlineHint(err error, n *cluster.Network) error {
+	if n == nil {
+		return err
+	}
+
+	// A block this malformed was already refused by CheckNetwork before
+	// anything dialled, so this arm is unreachable through adopt. Returning the
+	// original failure is still the right answer: a hint is decoration, and
+	// decoration must never replace the error it decorates.
+	prefix, perr := netip.ParsePrefix(n.Address)
+	if perr != nil {
+		return err
+	}
+
+	mask := net.IP(net.CIDRMask(prefix.Bits(), 32)).String()
+
+	return fmt.Errorf("%w\n\n"+
+		"This machine declares a STATIC address, so the segment it sits on probably serves\n"+
+		"no DHCP — and a node booted from the ISO then has no address at all. There is\n"+
+		"nothing here to reach until you give it one.\n\n"+
+		"The ISO's kernel takes one on its command line. At the GRUB menu press `e`,\n"+
+		"append this to the linux line, then Ctrl-X:\n\n"+
+		"  ip=%s::%s:%s::<your-nic>:off\n\n"+
+		"  fields: client::gateway:netmask:hostname:device:autoconf\n"+
+		"  <your-nic> is the interface NAME, e.g. enp1s0 — the kernel wants a name where\n"+
+		"  this machine file holds a MAC, and the node's console lists both.\n\n"+
+		"That configures the MAINTENANCE boot ONLY. The installed system writes its own\n"+
+		"command line and inherits nothing from the ISO, which is what the network block\n"+
+		"in this machine file exists to carry.",
+		err, prefix.Addr(), n.Gateway, mask)
+}
+
 // adoptMachine is the `adopt` verb: bring up a node this tool did not create.
 //
 // It does NOT go through driverkit. Observe/Create/Stop/Destroy all describe a
@@ -361,7 +407,7 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 	log.Printf("waiting for the Talos maintenance API at %s", endpoint)
 
 	if err := cluster.WaitMaintenance(ctx, endpoint, adoptMaintenanceTimeout); err != nil {
-		return err
+		return kernelCmdlineHint(err, network)
 	}
 
 	disks, err := cluster.ListDisks(ctx, endpoint)
