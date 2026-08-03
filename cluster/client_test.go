@@ -24,6 +24,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/types/block/blockhelpers"
 	"github.com/siderolabs/talos/pkg/machinery/proto"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
+	netres "github.com/siderolabs/talos/pkg/machinery/resources/network"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -1000,5 +1001,28 @@ func TestAgainstARealNode(t *testing.T) {
 		t.Errorf("the fallback selector matched %v — only ambiguous selectors justify the serial\n"+
 			"  reason: if elimination were unambiguous on a real node, this test would be arguing "+
 			"for a selector nobody needs", matchedByElimination)
+	}
+
+	// THE ONE ASSUMPTION THIS BRANCH COULD NOT PROVE FROM SOURCE. Whether
+	// maintenance mode serves LinkStatuses is a fact about the Talos server,
+	// and machinery holds no answer. If this fails, adopt cannot print a links
+	// table and spec.baremetal.network.hardwareAddr has to be copied off the
+	// node's own console instead.
+	//
+	// Not fatal, for the same reason the version question above is not: it has
+	// a documented fallback, and aborting here would cost the rest of the run.
+	links, err := safe.StateListAll[*netres.LinkStatus](ctx, c.COSI)
+
+	switch {
+	case err != nil:
+		t.Errorf("listing LinkStatuses over COSI: %s\n"+
+			"  reason: adopt's links table and its carrier check both depend on this call",
+			redactErr(err))
+	case links.Len() == 0:
+		t.Error("the node reports no links at all")
+	default:
+		// Nothing here is generated material, so it is logged unredacted: this
+		// is the evidence.
+		t.Logf("links:\n%s", FormatLinks(toLinks(slices.Collect(links.All()))))
 	}
 }

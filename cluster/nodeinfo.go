@@ -2,13 +2,16 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strings"
 
 	"github.com/cosi-project/runtime/pkg/safe"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	blockres "github.com/siderolabs/talos/pkg/machinery/resources/block"
+	netres "github.com/siderolabs/talos/pkg/machinery/resources/network"
 )
 
 // NODE FACTS, NOT PROBES. This file asks a maintenance-mode node QUESTIONS,
@@ -222,4 +225,165 @@ func RequireDisk(disks []Disk, serial, what string) error {
 		"  a serial that matches nothing is almost always a typo. Talos does not "+
 		"report it as one:\n  it installs nowhere and the bring-up hangs.",
 		what, serial, FormatDisks(disks))
+}
+
+// Link is one of a node's network interfaces, reduced to what CHOOSING one
+// needs. A struct of our own rather than machinery's LinkStatusSpec, for the
+// reason Disk is one: the table below cannot drift with a field we never render.
+type Link struct {
+	ID            string
+	HardwareAddr  string
+	PermanentAddr string
+	Driver        string
+	OperState     string
+	Carrier       bool
+	Physical      bool
+}
+
+// ListLinks asks a maintenance-mode node what network interfaces it has.
+//
+// The same call shape as ListDisks, against the same maintenance client. Whether
+// maintenance mode authorizes this resource is asserted in TestAgainstARealNode
+// rather than assumed here — see that test for the fallback.
+func ListLinks(ctx context.Context, endpoint string) ([]Link, error) {
+	c, err := MaintenanceClient(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	defer c.Close() //nolint:errcheck
+
+	list, err := safe.StateListAll[*netres.LinkStatus](ctx, c.COSI)
+	if err != nil {
+		return nil, fmt.Errorf("listing the node's network links: %w", err)
+	}
+
+	return toLinks(slices.Collect(list.All())), nil
+}
+
+// toLinks reduces machinery's link resources to the fields the table renders,
+// in a deterministic order.
+//
+// Split out of ListLinks for the reason toDisks is split out of ListDisks:
+// reaching it through ListLinks takes a node, so the only half of that function
+// with any decisions in it would be asserted by nothing. A swapped pair here
+// still compiles and still prints a table — one whose MAC column shows drivers.
+func toLinks(ls []*netres.LinkStatus) []Link {
+	out := make([]Link, 0, len(ls))
+
+	for _, l := range ls {
+		s := l.TypedSpec()
+
+		// PHYSICAL ONLY. Talos reports loopback, bonds, bridges and vlans
+		// through the same resource, and none of them is a NIC an operator can
+		// plug a cable into. Physical() is machinery's own predicate for it.
+		if !s.Physical() {
+			continue
+		}
+
+		out = append(out, Link{
+			ID:            l.Metadata().ID(),
+			HardwareAddr:  net.HardwareAddr(s.HardwareAddr).String(),
+			PermanentAddr: net.HardwareAddr(s.PermanentAddr).String(),
+			Driver:        s.Driver,
+			OperState:     s.OperationalState.String(),
+			// CARRIER, not "up". A link can be administratively up with no
+			// cable in it, and that is exactly the NIC an operator picks by
+			// mistake on a two-port box.
+			Carrier:  s.LinkState,
+			Physical: true,
+		})
+	}
+
+	// COSI's list order is not a promise, and this table is read by a human
+	// copying a MAC out of it.
+	slices.SortFunc(out, func(a, b Link) int { return strings.Compare(a.ID, b.ID) })
+
+	return out
+}
+
+// linkRow is shared by the header and the rows beneath it because they are one
+// table: widen a column in only one and the header slides off its values with
+// nothing to fail.
+const linkRow = "  %-10s %-19s %-10s %-8s %s\n"
+
+// FormatLinks renders the table that is the REMEDY for the refusals below.
+// Without talosctl there is no other way to learn this node's MACs, so it is
+// not diagnostic decoration — it is the only path forward.
+func FormatLinks(links []Link) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, linkRow, "DEVICE", "MAC", "DRIVER", "STATE", "NOTES")
+
+	for _, l := range links {
+		var notes []string
+
+		if l.Carrier {
+			notes = append(notes, "carrier — a cable is in it")
+		} else {
+			notes = append(notes, "NO CARRIER — nothing plugged in, or the far end is down")
+		}
+
+		// Printed only when it DIFFERS. Equal is the normal case and a second
+		// identical MAC in the row is noise a reader has to rule out.
+		if l.PermanentAddr != "" && l.PermanentAddr != l.HardwareAddr {
+			notes = append(notes, "permanent "+l.PermanentAddr)
+		}
+
+		fmt.Fprintf(&b, linkRow, l.ID, l.HardwareAddr, l.Driver, l.OperState, strings.Join(notes, ", "))
+	}
+
+	return b.String()
+}
+
+// RequireLink refuses unless hardwareAddr names a link this node has AND that
+// link has carrier.
+//
+// THREE refusals, and the first two share one table because they are the same
+// remedy. Empty is a first run. Unmatched is a typo — the realistic failure and
+// the expensive one, because Talos with a selector matching nothing configures
+// nothing and the node comes back with no address at all. No carrier is the
+// third and it is the one this repo's target machine invites: two ports, one
+// cabled, and the wrong choice is invisible until the install reboot.
+func RequireLink(links []Link, hardwareAddr string) error {
+	// Before any of them, because every refusal below ends by telling the
+	// reader to copy a MAC out of the table, and with no links that table is a
+	// header over nothing.
+	if len(links) == 0 {
+		return errors.New("the node reports no physical network links at all, so no NIC can be chosen\n\n" +
+			"  a MAC cannot be picked from an empty list. Check that this machine has an\n" +
+			"  ethernet interface its kernel can see, then run adopt again")
+	}
+
+	if hardwareAddr == "" {
+		return fmt.Errorf("no hardwareAddr given for the static network, and one cannot be guessed\n\n"+
+			"this node's links:\n\n%s\n"+
+			"  put the MAC of the cabled one in spec.baremetal.network.hardwareAddr, then run\n"+
+			"  adopt again", FormatLinks(links))
+	}
+
+	for _, l := range links {
+		// EqualFold, because a MAC copied from a switch UI or a datasheet is
+		// upper case and the node reports lower. Refusing that is a refusal
+		// over presentation, and the remedy would read as a typo hunt.
+		if !strings.EqualFold(l.HardwareAddr, hardwareAddr) {
+			continue
+		}
+
+		if !l.Carrier {
+			return fmt.Errorf("hardwareAddr %s is this node's %s, which has NO CARRIER\n\n"+
+				"this node's links:\n\n%s\n"+
+				"  nothing is plugged into it, or the far end is down. Configured anyway, the\n"+
+				"  node installs, reboots, brings up a link that cannot pass traffic, and is\n"+
+				"  never heard from again.", hardwareAddr, l.ID, FormatLinks(links))
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("hardwareAddr %s matches none of this node's links\n\n"+
+		"this node's links:\n\n%s\n"+
+		"  a MAC that matches nothing is almost always a typo. Talos does not report it as\n"+
+		"  one: it configures no interface, and the node comes back with no address.",
+		hardwareAddr, FormatLinks(links))
 }

@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	blockres "github.com/siderolabs/talos/pkg/machinery/resources/block"
+	netres "github.com/siderolabs/talos/pkg/machinery/resources/network"
 )
 
 func testDisks() []Disk {
@@ -331,5 +333,276 @@ func TestVersionTag(t *testing.T) {
 					"version, and it only ever sees one because this returns %q", got, tc.want, tc.want)
 			}
 		})
+	}
+}
+
+// testLinks is the target machine's real shape: two physical NICs, one up and
+// one down, plus the loopback every node has. The DOWN one is the point — a
+// name or a MAC typo that lands on it strands the machine just as thoroughly as
+// a wrong disk serial overwrites one.
+func testLinks() []Link {
+	return []Link{
+		{ID: "enp1s0", HardwareAddr: "84:47:09:47:35:f9", Driver: "igc", OperState: "up", Carrier: true, Physical: true},
+		{ID: "enp2s0", HardwareAddr: "84:47:09:47:35:f8", Driver: "igc", OperState: "down", Carrier: false, Physical: true},
+	}
+}
+
+// newLinkResource builds the machinery resource ListLinks would have been
+// handed by COSI. No node and no network, which is the whole point of toLinks
+// being a function of its own.
+//
+// Ether by default: a zero LinkType is not LinkEther, so a fixture left at the
+// zero value would be dropped by the Physical() filter before reaching the
+// assertion it was written for, and every test below would pass on nothing.
+func newLinkResource(id string, mutate func(*netres.LinkStatusSpec)) *netres.LinkStatus {
+	l := netres.NewLinkStatus(netres.NamespaceName, id)
+	l.TypedSpec().Type = nethelpers.LinkEther
+
+	if mutate != nil {
+		mutate(l.TypedSpec())
+	}
+
+	return l
+}
+
+// Every value below is DISTINCT from every other, because the failure this
+// pins is a swapped pair in the composite literal — and a table whose MAC
+// column shows drivers compiles, renders, and is the one thing a human cannot
+// copy a MAC out of.
+func TestToLinksPutsEveryFieldInItsOwnColumn(t *testing.T) {
+	got := toLinks([]*netres.LinkStatus{
+		newLinkResource("enp1s0", func(s *netres.LinkStatusSpec) {
+			s.HardwareAddr = nethelpers.HardwareAddr{0x84, 0x47, 0x09, 0x47, 0x35, 0xf9}
+			s.PermanentAddr = nethelpers.HardwareAddr{0x84, 0x47, 0x09, 0x47, 0x35, 0xf8}
+			s.Driver = "driver-value"
+			s.OperationalState = nethelpers.OperStateUp
+			s.LinkState = true
+			// Never rendered, and named so that reaching for one by mistake
+			// shows up in the diff rather than passing as an empty string.
+			s.BusPath = "bus-path-value"
+			s.Product = "product-value"
+			s.Vendor = "vendor-value"
+			s.DriverVersion = "driver-version-value"
+		}),
+	})
+
+	want := Link{
+		ID: "enp1s0", HardwareAddr: "84:47:09:47:35:f9", PermanentAddr: "84:47:09:47:35:f8",
+		Driver: "driver-value", OperState: "up", Carrier: true, Physical: true,
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("toLinks returned %d links for one input: %+v", len(got), got)
+	}
+
+	if got[0] != want {
+		t.Errorf("toLinks mapped the spec wrongly\n  got:  %+v\n  want: %+v\n"+
+			"  reason: Carrier is LinkState, not OperationalState; ID is the resource's "+
+			"metadata, not a spec field. A pair swapped here still renders a table — one "+
+			"nobody can act on", got[0], want)
+	}
+}
+
+// CARRIER IS LinkState, and it is the field this whole task exists for. A node
+// can report a link operationally up with no cable in it, and that is exactly
+// the NIC an operator picks by mistake on a two-port box.
+func TestToLinksReadsCarrierFromLinkStateNotOperState(t *testing.T) {
+	got := toLinks([]*netres.LinkStatus{
+		newLinkResource("enp2s0", func(s *netres.LinkStatusSpec) {
+			s.OperationalState = nethelpers.OperStateUp
+			s.LinkState = false
+		}),
+	})
+
+	if len(got) != 1 || got[0].Carrier {
+		t.Errorf("toLinks reported carrier on a link whose LinkState is false: %+v\n"+
+			"  reason: an administratively up link with no cable in it is the NIC that "+
+			"strands this machine", got)
+	}
+}
+
+// Loopback, bonds, bridges and vlans arrive through the same resource and none
+// of them is something an operator can plug a cable into. Offering one in the
+// table invites a choice that cannot work.
+func TestToLinksKeepsOnlyLinksACableGoesInto(t *testing.T) {
+	got := toLinks([]*netres.LinkStatus{
+		newLinkResource("enp1s0", nil),
+		newLinkResource("lo", func(s *netres.LinkStatusSpec) { s.Type = nethelpers.LinkLoopbck }),
+		newLinkResource("br0", func(s *netres.LinkStatusSpec) { s.Kind = "bridge" }),
+		newLinkResource("bond0", func(s *netres.LinkStatusSpec) { s.Kind = "bond" }),
+	})
+
+	ids := make([]string, 0, len(got))
+	for _, l := range got {
+		ids = append(ids, l.ID)
+	}
+
+	if want := []string{"enp1s0"}; !slices.Equal(ids, want) {
+		t.Errorf("toLinks returned %v, want %v\n"+
+			"  reason: a bridge or a loopback in the table is a NIC the operator can "+
+			"choose and can never cable", ids, want)
+	}
+}
+
+// Ordering is a binding constraint, not a side effect: the table is read by a
+// human copying a MAC out of it, and COSI promises no order. Inputs are
+// supplied out of order so that returning them untouched fails.
+func TestToLinksOrdersByID(t *testing.T) {
+	got := toLinks([]*netres.LinkStatus{
+		newLinkResource("enp3s0", nil),
+		newLinkResource("enp1s0", nil),
+		newLinkResource("eth0", nil),
+		newLinkResource("enp2s0", nil),
+	})
+
+	ids := make([]string, 0, len(got))
+	for _, l := range got {
+		ids = append(ids, l.ID)
+	}
+
+	if want := []string{"enp1s0", "enp2s0", "enp3s0", "eth0"}; !slices.Equal(ids, want) {
+		t.Errorf("toLinks returned %v, want %v\n"+
+			"  reason: a table that reshuffles between two runs of adopt has to be "+
+			"re-read from the top every time", ids, want)
+	}
+}
+
+func TestToLinksOnANodeWithNoLinks(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []*netres.LinkStatus
+	}{
+		{"a nil list", nil},
+		{"an empty list", []*netres.LinkStatus{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := toLinks(tc.in); len(got) != 0 {
+				t.Errorf("toLinks(%s) = %+v, want nothing", tc.name, got)
+			}
+		})
+	}
+}
+
+// The notes column, branch by branch. Carrier is the one an operator acts on,
+// and the permanent MAC is printed only when it DIFFERS — a second identical
+// MAC in the row is noise the reader has to rule out before copying either.
+func TestFormatLinksNotesEveryDistinguishingFact(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		link    Link
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "a cabled NIC",
+			link: Link{ID: "enp1s0", HardwareAddr: "84:47:09:47:35:f9", Carrier: true},
+			want: []string{"carrier"},
+		},
+		{
+			name:    "a dark NIC",
+			link:    Link{ID: "enp2s0", HardwareAddr: "84:47:09:47:35:f8"},
+			want:    []string{"NO CARRIER"},
+			notWant: []string{"permanent"},
+		},
+		{
+			name:    "a MAC the firmware overrode",
+			link:    Link{ID: "enp1s0", HardwareAddr: "02:00:00:00:00:01", PermanentAddr: "84:47:09:47:35:f9"},
+			want:    []string{"permanent 84:47:09:47:35:f9"},
+			notWant: []string{"permanent 02:00:00:00:00:01"},
+		},
+		{
+			name:    "a MAC nothing overrode",
+			link:    Link{ID: "enp1s0", HardwareAddr: "84:47:09:47:35:f9", PermanentAddr: "84:47:09:47:35:f9"},
+			notWant: []string{"permanent"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := FormatLinks([]Link{tc.link})
+
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("the table does not show %q:\n%s\n"+
+						"  reason: this column is the only way a human learns which NIC is "+
+						"cabled without talosctl", want, out)
+				}
+			}
+
+			for _, notWant := range tc.notWant {
+				if strings.Contains(out, notWant) {
+					t.Errorf("the table claims %q about a link that is not:\n%s", notWant, out)
+				}
+			}
+		})
+	}
+}
+
+func TestRequireLinkAcceptsALinkWithCarrier(t *testing.T) {
+	if err := RequireLink(testLinks(), "84:47:09:47:35:f9"); err != nil {
+		t.Errorf("the node's only NIC with carrier was refused: %s", err)
+	}
+}
+
+func TestRequireLinkIsCaseInsensitive(t *testing.T) {
+	// A MAC copied out of a datasheet or a switch's web UI is upper case, and
+	// the node reports lower. Refusing that is a refusal over presentation.
+	if err := RequireLink(testLinks(), "84:47:09:47:35:F9"); err != nil {
+		t.Errorf("an upper-case MAC was refused: %s", err)
+	}
+}
+
+func TestRequireLinkRefusesALinkWithNoCarrier(t *testing.T) {
+	err := RequireLink(testLinks(), "84:47:09:47:35:f8")
+	if err == nil {
+		t.Fatal("a NIC with no carrier was accepted\n" +
+			"  reason: the node installs, reboots, brings up a cable that is not there,\n" +
+			"  and is never heard from again")
+	}
+
+	if !strings.Contains(err.Error(), "enp2s0") {
+		t.Errorf("the refusal does not name the link it found: %s", err)
+	}
+}
+
+func TestRequireLinkRefusesAMACThisNodeDoesNotHave(t *testing.T) {
+	err := RequireLink(testLinks(), "00:00:00:00:00:01")
+	if err == nil {
+		t.Fatal("a MAC matching none of the node's links was accepted")
+	}
+
+	// The table IS the remedy: without talosctl there is no other way to learn
+	// this node's MACs.
+	for _, want := range []string{"enp1s0", "84:47:09:47:35:f9", "enp2s0"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not print %s, so it cannot be acted on:\n%s", want, err)
+		}
+	}
+}
+
+func TestRequireLinkRefusesAnEmptyMAC(t *testing.T) {
+	// DEFENSIVE, and deliberately kept. CheckNetwork refuses an empty
+	// hardwareAddr from the manifest before adopt ever reaches the node, so
+	// this arm is reachable only by a direct caller of ListLinks. It stays
+	// because the table is the right answer to "which one" no matter who asks,
+	// and because a future caller that skips CheckNetwork must not get an
+	// interface selected by an empty MAC.
+	err := RequireLink(testLinks(), "")
+	if err == nil {
+		t.Fatal("no hardwareAddr was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "84:47:09:47:35:f9") {
+		t.Errorf("the first-run refusal does not print the table:\n%s", err)
+	}
+}
+
+func TestRequireLinkRefusesANodeWithNoLinks(t *testing.T) {
+	err := RequireLink(nil, "84:47:09:47:35:f9")
+	if err == nil {
+		t.Fatal("a node reporting no links at all was accepted")
+	}
+
+	// The remedy is NOT "choose one" — there is nothing to choose from.
+	if strings.Contains(err.Error(), "DEVICE") {
+		t.Error("the refusal prints an empty table as if it were a menu")
 	}
 }
