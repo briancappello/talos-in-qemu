@@ -297,16 +297,23 @@ func TestInstalledNodeVersionRefusesBeforeDialling(t *testing.T) {
 
 	// THE TALOSCONFIG IS A PRIVATE KEY. The parser's message can quote the
 	// document it failed on, so none of it may travel — the same rule
-	// AuthenticatedClient obeys, asserted here because this is a second caller
-	// of it and a wrap added later would silently break it.
-	_, err = InstalledNodeVersion(t.Context(), []byte("not a talosconfig"), "192.0.2.1:50000")
-	if err == nil {
-		t.Fatal("InstalledNodeVersion accepted a talosconfig it could not parse")
-	}
+	// AuthenticatedClient obeys, asserted again here because this is a second
+	// caller of it. What this catches is NOT a %w added inside
+	// InstalledNodeVersion: all it ever sees is errSecretParse's already-redacted
+	// text, so wrapping that leaks nothing. It catches a future fmt.Errorf on
+	// this path that interpolates the talosconfig ARGUMENT into its own message.
+	//
+	// Built the way client_test.go builds its own: valid YAML to the scanner and
+	// a type error to the decoder, carrying the seven-character marker that a
+	// decoder's truncated quote is short enough to show. The assertion is that
+	// file's helper rather than a substring of our own, because a marker long
+	// enough to be truncated away is a test that cannot fail — measured there,
+	// not assumed.
+	broken := []byte("context: default\ncontexts: " + marker + strings.Repeat("A", 200) + "\n")
 
-	if strings.Contains(err.Error(), "not a talosconfig") {
-		t.Errorf("the error quotes the credential it was given: %s", redactErr(err))
-	}
+	_, err = InstalledNodeVersion(t.Context(), broken, "192.0.2.1:50000")
+
+	assertNoSecretParserOutput(t, "talosconfig", err)
 }
 
 // TestVersionTag pins the half of NodeVersion a real node cannot be asked to

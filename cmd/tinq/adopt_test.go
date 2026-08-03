@@ -748,4 +748,15 @@ spec:
 		t.Errorf("adopt failed on the maintenance API for a machine that already has a "+
 			"talosconfig:\n%s", err)
 	}
+
+	// The three assertions above are all satisfied by ANY fast refusal, and
+	// adoptMachine has several of them before it ever reads the talosconfig: the
+	// substrate, the malformed block, the missing endpoint, the port, the network
+	// check. This one is the credential refusal (cluster.errSecretParse), which
+	// only the authenticated branch can raise — without it the test would keep
+	// passing after a new early refusal started short-circuiting the very path it
+	// exists to pin.
+	if !strings.Contains(err.Error(), "the talosconfig could not be parsed") {
+		t.Errorf("adopt did not reach the authenticated call; it failed earlier with:\n%s", err)
+	}
 }
