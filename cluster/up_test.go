@@ -1464,6 +1464,12 @@ func TestStep6CreditsTheKernelArgToTheNode(t *testing.T) {
 const (
 	fakeMaintenanceEndpoint = "10.99.0.186:50000"
 	fakeInstalledEndpoint   = "10.99.0.7:50000"
+	// The Kubernetes endpoint of the SAME node, at the SAME address. It is not
+	// derived from the block — under QEMU it is a forward's host side and could
+	// not be — so every static fixture has to state it, and a fixture that left
+	// the loopback default in place would be a node whose kubeconfig and
+	// control-plane endpoint both point at 127.0.0.1.
+	fakeInstalledKubeEndpoint = "https://10.99.0.7:6443"
 )
 
 func fakeStaticNetwork() *Network {
@@ -1481,6 +1487,7 @@ func fakeStaticNetwork() *Network {
 func TestUpDialsMaintenanceBeforeTheInstallAndTheStaticAddressAfter(t *testing.T) {
 	f := newFixture(t)
 	f.opts.TalosEndpoint = fakeMaintenanceEndpoint
+	f.opts.KubeEndpoint = fakeInstalledKubeEndpoint
 	f.opts.Network = fakeStaticNetwork()
 
 	f.mustRun(t)
@@ -1511,6 +1518,7 @@ func TestUpDialsMaintenanceBeforeTheInstallAndTheStaticAddressAfter(t *testing.T
 func TestUpPutsTheStaticAddressInTheCertificate(t *testing.T) {
 	f := newFixture(t)
 	f.opts.TalosEndpoint = fakeMaintenanceEndpoint
+	f.opts.KubeEndpoint = fakeInstalledKubeEndpoint
 	f.opts.Network = fakeStaticNetwork()
 
 	f.mustRun(t)
@@ -1519,6 +1527,17 @@ func TestUpPutsTheStaticAddressInTheCertificate(t *testing.T) {
 		t.Errorf("APIAddress = %q, want 10.99.0.7\n"+
 			"  reason: this becomes apid's subject alt name AND the talosconfig endpoint,\n"+
 			"  both baked at generation time and unrepairable afterwards", got)
+	}
+
+	// The SAME node, on its other port. This one is not derived — it is the
+	// caller's string, carried through — and it lands in the kubeconfig's
+	// server and in cluster.controlPlane.endpoint, which is a control plane
+	// nobody can reach if it names a host the node does not take.
+	if got := f.rec.input.Endpoint; got != fakeInstalledKubeEndpoint {
+		t.Errorf("GenerateConfig got Endpoint %q, want %q\n"+
+			"  reason: the kubeconfig's server and the control-plane endpoint are both baked\n"+
+			"  here, and neither can be repaired after the node has installed",
+			got, fakeInstalledKubeEndpoint)
 	}
 
 	if f.rec.input.Network == nil {
@@ -1573,6 +1592,85 @@ func TestUpRefusesAnUnreachableStaticAddressBeforeBooting(t *testing.T) {
 	}
 }
 
+// THE FOURTH ADDRESS, and the one nothing derives. KubeEndpoint stays a field
+// because under QEMU it is the host side of a forward and cannot be computed
+// from anything here — but a machine with a static block DOES know where the
+// node answers afterwards, and this string is written into the kubeconfig's
+// server AND into cluster.controlPlane.endpoint. Naming a host the node never
+// takes installs a control plane nobody can reach, and neither artifact can be
+// regenerated once the node has left maintenance mode.
+func TestUpRefusesAKubeEndpointTheStaticNodeWillNotAnswerAt(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		wantMsg  []string
+	}{
+		{
+			// The fixture's own loopback, which is right for a QEMU forward and
+			// is a control plane pointed at nothing on a machine that moves.
+			"another host entirely", "https://127.0.0.1:6443",
+			[]string{"127.0.0.1", "10.99.0.7", "https://10.99.0.7:6443"},
+		},
+		{
+			// The scheme omitted. It reaches the kubeconfig's server verbatim,
+			// where it is not a URL at all.
+			"not a URL", "10.99.0.7:6443",
+			[]string{"is not a URL with a host"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.opts.TalosEndpoint = fakeMaintenanceEndpoint
+			f.opts.KubeEndpoint = tc.endpoint
+			f.opts.Network = fakeStaticNetwork()
+
+			err := f.run(t)
+			if err == nil {
+				t.Fatal("Up accepted a Kubernetes endpoint naming an address this node never holds\n" +
+					"  reason: the kubeconfig's server and cluster.controlPlane.endpoint are both\n" +
+					"  baked at generation time, and an installed node cannot be reconfigured")
+			}
+
+			// BEFORE Boot, beside the three refusals that are already there.
+			// On hardware, reaching this later spends a node that has been told
+			// to install.
+			if f.booted != 0 {
+				t.Errorf("the machine was booted %d times before the endpoint was checked\n"+
+					"  reason: the verdict is provable from the options alone, and failing here costs nothing",
+					f.booted)
+			}
+
+			if f.rec.did("generateConfig") {
+				t.Error("a config was generated with an endpoint the node cannot answer at")
+			}
+
+			for _, want := range tc.wantMsg {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal does not contain %q, so it cannot be acted on:\n%s", want, redactErr(err))
+				}
+			}
+		})
+	}
+}
+
+// The other side of the gate: a machine with NO static block keeps today's
+// behaviour exactly. Every QEMU bring-up is here, and its KubeEndpoint is the
+// host side of a forward — an address the node itself never holds, on purpose.
+func TestUpDoesNotCheckTheKubeEndpointOfAMachineWithNoNetworkBlock(t *testing.T) {
+	f := newFixture(t)
+	// A forward on the host, to a node that answers at neither address.
+	f.opts.TalosEndpoint = "127.0.0.1:50000"
+	f.opts.KubeEndpoint = "https://127.0.0.1:6443"
+
+	f.mustRun(t)
+
+	if got := f.rec.input.Endpoint; got != "https://127.0.0.1:6443" {
+		t.Errorf("GenerateConfig got Endpoint %q, want the caller's forward untouched\n"+
+			"  reason: with no static block nothing here knows where the node is reached from,\n"+
+			"  and a forward's host side is SUPPOSED to be an address the node does not hold", got)
+	}
+}
+
 // A CLAIM ABOUT REALITY, printed only when it is one. On a segment with no DHCP
 // the operator typed the node's FINAL address at the GRUB prompt, so it is
 // adopted and answers at the same place — and a transcript announcing a move
@@ -1581,6 +1679,7 @@ func TestUpRefusesAnUnreachableStaticAddressBeforeBooting(t *testing.T) {
 func TestStep6AnnouncesTheMoveOnlyWhenTheNodeMoves(t *testing.T) {
 	moves := newFixture(t)
 	moves.opts.TalosEndpoint = fakeMaintenanceEndpoint
+	moves.opts.KubeEndpoint = fakeInstalledKubeEndpoint
 	moves.opts.Network = fakeStaticNetwork()
 
 	wants(t, moves.mustRun(t),
@@ -1591,6 +1690,7 @@ func TestStep6AnnouncesTheMoveOnlyWhenTheNodeMoves(t *testing.T) {
 	// Adopted at the address the static block already names.
 	stays := newFixture(t)
 	stays.opts.TalosEndpoint = fakeInstalledEndpoint
+	stays.opts.KubeEndpoint = fakeInstalledKubeEndpoint
 	stays.opts.Network = fakeStaticNetwork()
 
 	transcript := stays.mustRun(t)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -247,6 +248,21 @@ func Up(ctx context.Context, opts UpOptions) error {
 	installedAddr, installed, err := installedEndpoint(opts.TalosEndpoint, opts.Network)
 	if err != nil {
 		return err
+	}
+
+	// GATED ON THE STATIC BLOCK, and it has to be. With no block this package
+	// cannot know where the node's kube-apiserver is reached from: under QEMU
+	// KubeEndpoint is the host side of a port forward and is SUPPOSED to name
+	// an address the node never holds. Every machine that existed before this
+	// feature therefore reaches none of the refusal below.
+	//
+	// With a block the node's post-install address is known, and then the two
+	// cannot be allowed to disagree — see checkKubeEndpoint for what a
+	// disagreement costs.
+	if opts.Network != nil {
+		if err := checkKubeEndpoint(opts.KubeEndpoint, installedAddr); err != nil {
+			return err
+		}
 	}
 
 	p := &printer{w: out}
@@ -721,6 +737,52 @@ func installedEndpoint(endpoint string, n *Network) (addr, hostPort string, err 
 	}
 
 	return addr, net.JoinHostPort(addr, port), nil
+}
+
+// checkKubeEndpoint refuses a Kubernetes API endpoint whose host is not the
+// address the node answers on after the install.
+//
+// KubeEndpoint CANNOT BE DERIVED the way the Talos one is, which is why it
+// survives as a field: under QEMU it is the host side of a forward, and there
+// is nothing on this side that could compute one. What it can be is REFUSED,
+// once a static block makes the node's post-install address known — the same
+// defect the missing InstalledEndpoint field exists to avoid, caught rather
+// than made unrepresentable.
+//
+// And it is worth refusing because this URL is baked into two artifacts at
+// generation time: the kubeconfig's server, and cluster.controlPlane.endpoint
+// in the machine config the node installs from. Naming an address the node
+// never takes produces a node that installs, boots, and brings up a control
+// plane pointed at a host nobody answers on — with no way back, because
+// regenerating needs the maintenance API and an installed node never serves it
+// again.
+func checkKubeEndpoint(endpoint, installedAddr string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Hostname() == "" {
+		return fmt.Errorf("the Kubernetes API endpoint %q is not a URL with a host\n\n"+
+			"  it is written into the kubeconfig's server verbatim, so it has to be dialable "+
+			"as it\n  stands — e.g. https://%s:6443", endpoint, installedAddr)
+	}
+
+	if u.Hostname() == installedAddr {
+		return nil
+	}
+
+	fixed := *u
+	fixed.Host = installedAddr
+
+	if port := u.Port(); port != "" {
+		fixed.Host = net.JoinHostPort(installedAddr, port)
+	}
+
+	return fmt.Errorf("the Kubernetes API endpoint %s names %s, but this node answers at %s\n  "+
+		"from the install reboot onward\n\n  that host goes into the kubeconfig's server AND into "+
+		"cluster.controlPlane.endpoint in\n  the machine config, both baked at generation time. The "+
+		"node would install, boot and\n  serve a control plane at an address neither file names, and "+
+		"neither file can be\n  repaired afterwards: regenerating needs the maintenance API, and an "+
+		"installed node\n  never serves it again.\n\n  With spec.baremetal.network.address set to %s, "+
+		"this endpoint is %s",
+		endpoint, u.Hostname(), installedAddr, installedAddr, fixed.String())
 }
 
 // writeArtifacts writes generated material into the machine's state directory
