@@ -561,6 +561,16 @@ func TestRequireLinkRefusesALinkWithNoCarrier(t *testing.T) {
 	if !strings.Contains(err.Error(), "enp2s0") {
 		t.Errorf("the refusal does not name the link it found: %s", err)
 	}
+
+	// THE HEADLINE, not the whole error. Every refusal embeds FormatLinks, and
+	// that table prints "NO CARRIER" for enp2s0 whatever the refusal says — so
+	// both the assertion above and a whole-error carrier check are satisfied by
+	// the table alone. Collapsing this arm into the no-match text would leave a
+	// dark port reported as a typo, and a reader hunting a typo re-enters the
+	// same correct MAC while the wrong NIC stays chosen.
+	if headline, _, _ := strings.Cut(err.Error(), "\n"); !strings.Contains(headline, "NO CARRIER") {
+		t.Errorf("the refusal's first line does not say NO CARRIER, so it reads as a typo:\n%s", err)
+	}
 }
 
 func TestRequireLinkRefusesAMACThisNodeDoesNotHave(t *testing.T) {
@@ -575,6 +585,15 @@ func TestRequireLinkRefusesAMACThisNodeDoesNotHave(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not print %s, so it cannot be acted on:\n%s", want, err)
 		}
+	}
+
+	// THE OTHER SIDE of the carrier assertion, and on the headline for the same
+	// reason: the table below it prints "NO CARRIER" for enp2s0 in this refusal
+	// too. A no-match headline that blamed the carrier would send a reader to
+	// plug in a cable for a MAC this node does not have. Two operator mistakes,
+	// two remedies, and these two tests have to be able to tell them apart.
+	if headline, _, _ := strings.Cut(err.Error(), "\n"); strings.Contains(headline, "NO CARRIER") {
+		t.Errorf("a no-match refusal blames the carrier, sending the reader to the wrong remedy:\n%s", err)
 	}
 }
 

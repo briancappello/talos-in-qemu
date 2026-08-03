@@ -926,6 +926,47 @@ func TestAgainstARealNode(t *testing.T) {
 	// the evidence.
 	t.Logf("disks:\n%s", FormatDisks(toDisks(slices.Collect(disks.All()))))
 
+	// THE ONE ASSUMPTION THIS BRANCH COULD NOT PROVE FROM SOURCE. Whether
+	// maintenance mode serves LinkStatuses is a fact about the Talos server,
+	// and machinery holds no answer. If this fails, adopt cannot print a links
+	// table and spec.baremetal.network.hardwareAddr has to be copied off the
+	// node's own console instead.
+	//
+	// Not fatal, for the same reason the version question above is not: it has
+	// a documented fallback, and aborting here would cost the rest of the run.
+	//
+	// ASKED HERE, ahead of every t.Fatalf the disk questions below still make.
+	// Hardware access is transient and this gate gets one run; downstream of
+	// those fatals, an unrelated disk regression consumes the run and this
+	// question — the only one on the branch nothing else can answer — comes
+	// back unreported.
+	links, err := safe.StateListAll[*netres.LinkStatus](ctx, c.COSI)
+
+	switch {
+	case err != nil:
+		t.Errorf("listing LinkStatuses over COSI: %s\n"+
+			"  reason: adopt's links table and its carrier check both depend on this call",
+			redactErr(err))
+	default:
+		// toLinks' FILTERED output, not links.Len(). A node reporting nothing
+		// but loopback passes a raw COSI count, and this gate then logs a table
+		// header over no rows — green, with none of the evidence it exists to
+		// produce.
+		physical := toLinks(slices.Collect(links.All()))
+
+		if len(physical) == 0 {
+			t.Error("the node reports no physical links at all\n" +
+				"  reason: adopt chooses a NIC by MAC out of this list, and loopback " +
+				"is not one an operator can plug a cable into")
+
+			break
+		}
+
+		// Nothing here is generated material, so it is logged unredacted: this
+		// is the evidence.
+		t.Logf("links:\n%s", FormatLinks(physical))
+	}
+
 	in := testInput()
 
 	// config.go's actual selector, taken from the volume it builds rather than
@@ -1003,26 +1044,4 @@ func TestAgainstARealNode(t *testing.T) {
 			"for a selector nobody needs", matchedByElimination)
 	}
 
-	// THE ONE ASSUMPTION THIS BRANCH COULD NOT PROVE FROM SOURCE. Whether
-	// maintenance mode serves LinkStatuses is a fact about the Talos server,
-	// and machinery holds no answer. If this fails, adopt cannot print a links
-	// table and spec.baremetal.network.hardwareAddr has to be copied off the
-	// node's own console instead.
-	//
-	// Not fatal, for the same reason the version question above is not: it has
-	// a documented fallback, and aborting here would cost the rest of the run.
-	links, err := safe.StateListAll[*netres.LinkStatus](ctx, c.COSI)
-
-	switch {
-	case err != nil:
-		t.Errorf("listing LinkStatuses over COSI: %s\n"+
-			"  reason: adopt's links table and its carrier check both depend on this call",
-			redactErr(err))
-	case links.Len() == 0:
-		t.Error("the node reports no links at all")
-	default:
-		// Nothing here is generated material, so it is logged unredacted: this
-		// is the evidence.
-		t.Logf("links:\n%s", FormatLinks(toLinks(slices.Collect(links.All()))))
-	}
 }
