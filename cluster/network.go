@@ -150,6 +150,49 @@ func CheckNetwork(n *Network, maintenanceAddr string) error {
 			n.Gateway, n.Address)
 	}
 
+	// THE SAME THREE SHAPES THE ADDRESS IS REFUSED FOR, on the other field.
+	// Each of them is INSIDE the prefix, so the containment check above passes
+	// and nothing else here looks at the gateway at all — and 192.168.2.1 to
+	// 192.168.2.0 is one keystroke.
+	//
+	// The consequence is the one the address refusals exist for: the node
+	// installs, boots with a default route to something that routes nothing,
+	// cannot reach a registry, and cannot be repaired either, because an
+	// installed node never serves the maintenance API again.
+	//
+	// Three sentences rather than one, because they are three different
+	// mistakes and the remedy is only obvious if the message names the one
+	// that was made.
+	if gateway == prefix.Masked().Addr() {
+		return fmt.Errorf("spec.baremetal.network.gateway %s names the SEGMENT %s, not a router "+
+			"on it\n\n  the host part is all zeroes, so nothing answers there and the node's "+
+			"default route\n  leads nowhere. A router is a machine with its own address inside the "+
+			"prefix —\n  conventionally the first one, %s",
+			n.Gateway, prefix.Masked(), prefix.Masked().Addr().Next())
+	}
+
+	// The all-ones host part, tested the way the address's broadcast is: the
+	// last address in the prefix is the one whose successor has left it. A /31
+	// and a /32 have no distinct broadcast address and are left alone.
+	if prefix.Bits() < 31 && !prefix.Contains(gateway.Next()) {
+		return fmt.Errorf("spec.baremetal.network.gateway %s is the BROADCAST address of %s\n\n"+
+			"  the host part is all ones, so it reaches every node on the wire and routes for "+
+			"none\n  of them. A router is one machine with its own address inside the prefix —\n"+
+			"  conventionally the first one, %s",
+			n.Gateway, n.Address, prefix.Masked().Addr().Next())
+	}
+
+	// A DIFFERENT MISTAKE from the two above, and it has no suggested address:
+	// this one is not a typo in an octet, it is the belief that the gateway
+	// field names the interface it applies to.
+	if gateway == prefix.Addr() {
+		return fmt.Errorf("spec.baremetal.network.gateway %s is THIS NODE's own address\n\n"+
+			"  a node cannot be its own default route: every packet for another network would "+
+			"be\n  handed back to the machine that just sent it. This field names the ROUTER on "+
+			"the\n  segment — a different machine, and the one whose address you would type into "+
+			"a\n  laptop on the same wire", n.Gateway)
+	}
+
 	if len(n.Nameservers) == 0 {
 		return errors.New("spec.baremetal.network.nameservers is required alongside a static address\n\n" +
 			"  a segment with no DHCP offers no resolver either, and a node that cannot resolve\n" +

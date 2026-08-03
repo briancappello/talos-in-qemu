@@ -97,6 +97,16 @@ func TestCheckNetworkRefusesWhatItCannotParse(t *testing.T) {
 			`address "192.168.2.255/24" is the BROADCAST address`},
 		{"a gateway that is not an address", func(n *Network) { n.Gateway = "192.168.2" },
 			`gateway "192.168.2" is not an address`},
+		// The three shapes that sit INSIDE the prefix, so containment accepts
+		// them and nothing else looks at the field. One keystroke apart from
+		// the router, and each is a node that boots with a default route to
+		// nothing — unrepairable, because it never serves maintenance again.
+		{"a gateway that is the segment", func(n *Network) { n.Gateway = "192.168.2.0" },
+			"gateway 192.168.2.0 names the SEGMENT"},
+		{"a gateway that is the broadcast address", func(n *Network) { n.Gateway = "192.168.2.255" },
+			"gateway 192.168.2.255 is the BROADCAST address"},
+		{"a gateway that is the node itself", func(n *Network) { n.Gateway = "192.168.2.10" },
+			"gateway 192.168.2.10 is THIS NODE's own address"},
 		{"no nameservers", func(n *Network) { n.Nameservers = nil },
 			"nameservers is required"},
 		{"an empty nameserver", func(n *Network) { n.Nameservers = []string{""} },
