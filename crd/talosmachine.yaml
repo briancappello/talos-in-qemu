@@ -170,6 +170,63 @@ spec:
                       description: >-
                         Override for the version `adopt` reads from the node. Only needed
                         if a maintenance-mode node reports no version tag.
+                    network:
+                      type: object
+                      required: [address, gateway, nameservers, hardwareAddr]
+                      description: >-
+                        Static addressing for a segment that serves no DHCP. ABSENT
+                        MEANS DHCP, which is what every node had before this block
+                        existed and what every QEMU machine still uses. All four fields
+                        are required together: there is no useful half-configured
+                        state, and a static block with no nameservers is a node that
+                        cannot resolve a registry and so cannot pull the image it was
+                        just told to install.
+                      properties:
+                        address:
+                          type: string
+                          minLength: 1
+                          # A LOOSE PATTERN ON PURPOSE. It rejects the shapes that are
+                          # obviously not CIDR; whether the prefix actually CONTAINS
+                          # maintenanceEndpoint is the check that matters, it needs
+                          # arithmetic, and it lives in cluster.CheckNetwork — which is
+                          # also the only one that runs on the standalone path, where
+                          # no apiserver ever sees this schema.
+                          pattern: '^[0-9]+(\.[0-9]+){3}/[0-9]{1,2}$'
+                          description: >-
+                            Where the node answers AFTER the install, in CIDR —
+                            192.168.2.10/24. Its prefix MUST contain
+                            maintenanceEndpoint: inside it the node re-pins itself on
+                            the same wire and comes back reachable, outside it the node
+                            boots onto an address that does not exist on the wire it is
+                            plugged into, and adopt cannot resume because an installed
+                            node never serves the maintenance API again. This address
+                            becomes apid's certificate SAN, the talosconfig endpoint
+                            and the kubeconfig server.
+                        gateway:
+                          type: string
+                          minLength: 1
+                          pattern: '^[0-9]+(\.[0-9]+){3}$'
+                          description: >-
+                            The default route's next hop. Must be inside address's
+                            prefix — a node has no route to a gateway off its own
+                            segment.
+                        nameservers:
+                          type: array
+                          minItems: 1
+                          items: { type: string }
+                          description: >-
+                            At least one resolver. A segment with no DHCP offers no
+                            resolver either, and there is no other source of one.
+                        hardwareAddr:
+                          type: string
+                          pattern: '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'
+                          description: >-
+                            MAC of the NIC to configure. A MAC and not an interface
+                            name, for the reason the install disk is selected by serial
+                            and not by size: a stable identity rather than an
+                            enumeration artifact. Omit it and the first adopt prints
+                            this node's links and refuses, exactly as it does for a
+                            missing disk serial.
                 powerState:
                   type: string
                   enum: [Running, Stopped]

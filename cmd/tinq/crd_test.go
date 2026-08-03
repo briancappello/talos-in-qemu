@@ -123,10 +123,37 @@ func TestCRDGuardsWhatTheGoCodeAssumes(t *testing.T) {
 	// of these prunes it on the way through an apiserver, so the value the
 	// operator wrote never arrives.
 
-	for _, f := range []string{"maintenanceEndpoint", "systemDiskSerial", "dataDiskSerial", "consoleArg", "talosVersion"} {
+	for _, f := range []string{"maintenanceEndpoint", "systemDiskSerial", "dataDiskSerial", "consoleArg", "talosVersion", "network"} {
 		if _, ok := props[f]; !ok {
 			t.Errorf("spec.baremetal.%s is missing from the schema, but adopt.go reads it", f)
 		}
+	}
+
+	// The network block is ALL-OR-NOTHING. A schema that lets three of the four
+	// through produces a node with a static address and no resolver, or one
+	// whose NIC was never named — both of which install and then go silent.
+	network := crdMap(t, crdDig(t, props, "network"), "spec.baremetal.network")
+
+	if got, want := crdStrings(t, network["required"], "spec.baremetal.network.required"),
+		[]string{"address", "gateway", "nameservers", "hardwareAddr"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("spec.baremetal.network.required is %v, want %v — a half-configured static "+
+			"network is a node that installs and never answers", got, want)
+	}
+
+	netProps := crdMap(t, network["properties"], "spec.baremetal.network.properties")
+
+	for _, f := range []string{"address", "gateway", "nameservers", "hardwareAddr"} {
+		if _, ok := netProps[f]; !ok {
+			t.Errorf("spec.baremetal.network.%s is missing from the schema, but adopt.go reads it", f)
+		}
+	}
+
+	// nameservers is a LIST, and `required` on a list is satisfied by an empty
+	// one. minItems is what makes that line mean what it reads as — the same
+	// gap minLength closes on maintenanceEndpoint.
+	if got := fmt.Sprint(crdMap(t, netProps["nameservers"], "…network.nameservers")["minItems"]); got != "1" {
+		t.Errorf("spec.baremetal.network.nameservers minItems is %s, want 1 — `required` alone "+
+			"accepts an empty list, and a node with no resolver cannot pull an image", got)
 	}
 }
 
