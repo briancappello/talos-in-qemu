@@ -53,6 +53,17 @@ type Network struct {
 // endpoint and the kubeconfig server, so cmd/tinq uses it to build BOTH
 // post-install endpoints.
 func (n *Network) IP() (string, error) {
+	// A nil Network is the DHCP case, which this type documents as an answer
+	// rather than a missing field — CheckNetwork accepts it. A caller reaching
+	// here with one is asking a machine that named no address where it will
+	// answer after the install, and that has an answer: nowhere this side can
+	// know. Reported as an error it reads as the configuration it is; left to
+	// dereference n.Address it reads as a crash in tinq.
+	if n == nil {
+		return "", errors.New("this machine has no static address block, so it has no address " +
+			"after the install to build the certificate SAN and the endpoints from")
+	}
+
 	p, err := netip.ParsePrefix(n.Address)
 	if err != nil {
 		return "", fmt.Errorf("the static address %q is not an address with a prefix length: %w", n.Address, err)
@@ -105,6 +116,25 @@ func CheckNetwork(n *Network, maintenanceAddr string) error {
 			n.Address, netip.PrefixFrom(prefix.Masked().Addr().Next(), prefix.Bits()))
 	}
 
+	// A BROADCAST ADDRESS PASSES EVERY OTHER GATE HERE: it is v4, its host part
+	// is not all zeroes, and both the gateway and the maintenance address sit
+	// inside its prefix. A node given one answers at nothing after the reboot,
+	// which is as unrepairable as the segment mismatch below, so it is refused
+	// with its own sentence rather than folded into the all-zeroes one — the
+	// two are different mistakes and the remedy is only obvious if the message
+	// names the one that was made.
+	//
+	// The all-ones host part is the last address in the prefix, so the test is
+	// that the address after it has left the prefix. A /31 and a /32 have no
+	// distinct broadcast address — their last address is a host — so they are
+	// left alone; a /32 has already been refused above as all zeroes.
+	if prefix.Bits() < 31 && !prefix.Contains(prefix.Addr().Next()) {
+		return fmt.Errorf("spec.baremetal.network.address %q is the BROADCAST address of its "+
+			"segment\n\n  the host part is all ones. Every node on that wire answers to it, so no "+
+			"node answers\n  AS it — this one needs its own address inside the prefix, e.g. %s",
+			n.Address, netip.PrefixFrom(prefix.Masked().Addr().Next(), prefix.Bits()))
+	}
+
 	gateway, err := netip.ParseAddr(n.Gateway)
 	if err != nil {
 		return fmt.Errorf("spec.baremetal.network.gateway %q is not an address", n.Gateway)
@@ -152,6 +182,18 @@ func CheckNetwork(n *Network, maintenanceAddr string) error {
 		return fmt.Errorf("the maintenance address %q is not a bare address\n\n"+
 			"  a port does not belong here: what has to sit inside %s is a host",
 			maintenanceAddr, n.Address)
+	}
+
+	// Refused by NAME, for the same reason the v6 prefix above is, and on the
+	// other parameter. netip.Prefix.Contains is false across address families,
+	// so a v4-mapped literal like ::ffff:192.168.2.10 would fall through to the
+	// segment mismatch below and be told it is on another segment — said about
+	// an address that is literally the same host.
+	if !maintenance.Is4() {
+		return fmt.Errorf("the maintenance address %q is IPv6, which is not supported yet\n\n"+
+			"  it has to be a v4 literal even when it names the same host as %s: a v6 form is "+
+			"not\n  comparable to a v4 prefix, so nothing here could tell you whether the node "+
+			"comes\n  back on its own segment", maintenanceAddr, n.Address)
 	}
 
 	// THE REFUSAL THIS FEATURE IS BUILT AROUND, and it is last because every
