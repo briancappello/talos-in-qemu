@@ -279,6 +279,36 @@ func TestNodeVersionRefusesAnEmptyEndpoint(t *testing.T) {
 	}
 }
 
+// InstalledNodeVersion is reached on a RESUMED bring-up, where the whole point
+// is that nothing waits ten minutes. Both refusals below must therefore land
+// without a dial: an empty endpoint and a credential that does not parse are
+// both provable from the arguments alone.
+func TestInstalledNodeVersionRefusesBeforeDialling(t *testing.T) {
+	_, err := InstalledNodeVersion(t.Context(), []byte("not a talosconfig"), "")
+	if err == nil {
+		t.Fatal("InstalledNodeVersion accepted an empty endpoint\n" +
+			"  reason: an empty address spends the caller's whole timeout proving " +
+			"that \"\" is not an address")
+	}
+
+	if !strings.Contains(err.Error(), "host:port") {
+		t.Errorf("error does not say what shape an endpoint has: %s", redactErr(err))
+	}
+
+	// THE TALOSCONFIG IS A PRIVATE KEY. The parser's message can quote the
+	// document it failed on, so none of it may travel — the same rule
+	// AuthenticatedClient obeys, asserted here because this is a second caller
+	// of it and a wrap added later would silently break it.
+	_, err = InstalledNodeVersion(t.Context(), []byte("not a talosconfig"), "192.0.2.1:50000")
+	if err == nil {
+		t.Fatal("InstalledNodeVersion accepted a talosconfig it could not parse")
+	}
+
+	if strings.Contains(err.Error(), "not a talosconfig") {
+		t.Errorf("the error quotes the credential it was given: %s", redactErr(err))
+	}
+}
+
 // TestVersionTag pins the half of NodeVersion a real node cannot be asked to
 // demonstrate: that an unidentifiable version is ANSWERED with "" rather than
 // raised as an error. Every reply shape below is one a nil-safe getter chain

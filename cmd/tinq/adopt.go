@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -408,47 +409,29 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		return fmt.Errorf("state dir: %w", err)
 	}
 
-	log.Printf("waiting for the Talos maintenance API at %s", endpoint)
-
-	if err := cluster.WaitMaintenance(ctx, endpoint, adoptMaintenanceTimeout); err != nil {
-		return kernelCmdlineHint(err, network)
-	}
-
-	disks, err := cluster.ListDisks(ctx, endpoint)
-	if err != nil {
-		return err
-	}
-
 	systemSerial := str(spec["systemDiskSerial"], "")
-	if err := cluster.RequireDisk(disks, systemSerial, "install target"); err != nil {
-		return err
-	}
-
-	// Checked ONLY when asked for. An absent data disk is a legitimate choice
-	// and step 10 announces what it costs; an absent one that was MEANT to be
-	// present is a typo, which the same check catches.
 	dataSerial := str(spec["dataDiskSerial"], "")
-	if dataSerial != "" {
-		if err := cluster.RequireDisk(disks, dataSerial, "data disk"); err != nil {
-			return err
-		}
-	}
+	installed := baremetalInstalledEndpoint(m)
 
-	// ASKED ONLY WHEN THERE IS A STATIC BLOCK. A DHCP node's NIC is Talos's
-	// business and naming one for it would be a choice nobody asked for.
+	// A CREDENTIAL, NOT A STATUS — the same read Up makes at up.go:351 and for
+	// the same reason. Nothing about the node is believed on the strength of
+	// this file; an authenticated call is simply impossible without it, so
+	// having it is a precondition of asking rather than an answer.
 	//
-	// The refusal that matters here is CARRIER: this repo's target machine has
-	// two ports with one cable, and a config pointing at the empty one installs,
-	// reboots, brings up a link that cannot pass traffic, and goes silent.
-	if network != nil {
-		links, err := cluster.ListLinks(ctx, endpoint)
-		if err != nil {
-			return err
-		}
+	// What it decides here is which API this node can still serve. Everything
+	// in the maintenance pre-flight below — the wait, the disks, the links —
+	// needs an API that an installed node stopped serving at its first reboot,
+	// and running it anyway spends the whole ten-minute budget to discover
+	// that. Up is idempotent and its own failure message says to re-run; this
+	// is what makes that advice true.
+	talosconfig, err := os.ReadFile(filepath.Join(dir, "talosconfig"))
 
-		if err := cluster.RequireLink(links, network.HardwareAddr); err != nil {
-			return err
-		}
+	configured := err == nil
+
+	if !configured && !os.IsNotExist(err) {
+		// os.ReadFile's error quotes the PATH and never the contents, so it is
+		// safe to wrap. Nothing below may relax that.
+		return fmt.Errorf("reading this machine's talosconfig: %w", err)
 	}
 
 	// The node's own answer, with the spec as an override for the case Risk 1
@@ -456,11 +439,66 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 	version := str(spec["talosVersion"], "")
 	source := "spec.baremetal.talosVersion"
 
-	if version == "" {
-		if version, err = cluster.NodeVersion(ctx, endpoint); err != nil {
+	if configured {
+		log.Printf("this machine already has a talosconfig, so the maintenance pre-flight is skipped")
+
+		if version == "" {
+			if version, err = cluster.InstalledNodeVersion(ctx, talosconfig, installed); err != nil {
+				return err
+			}
+
+			source = "the node's authenticated API"
+		}
+	} else {
+		log.Printf("waiting for the Talos maintenance API at %s", endpoint)
+
+		if err := cluster.WaitMaintenance(ctx, endpoint, adoptMaintenanceTimeout); err != nil {
+			return kernelCmdlineHint(err, network)
+		}
+
+		disks, err := cluster.ListDisks(ctx, endpoint)
+		if err != nil {
 			return err
 		}
-		source = "the node's maintenance API"
+
+		if err := cluster.RequireDisk(disks, systemSerial, "install target"); err != nil {
+			return err
+		}
+
+		// Checked ONLY when asked for. An absent data disk is a legitimate
+		// choice and step 10 announces what it costs; an absent one that was
+		// MEANT to be present is a typo, which the same check catches.
+		if dataSerial != "" {
+			if err := cluster.RequireDisk(disks, dataSerial, "data disk"); err != nil {
+				return err
+			}
+		}
+
+		// ASKED ONLY WHEN THERE IS A STATIC BLOCK. A DHCP node's NIC is Talos's
+		// business and naming one for it would be a choice nobody asked for.
+		//
+		// The refusal that matters here is CARRIER: this repo's target machine
+		// has two ports with one cable, and a config pointing at the empty one
+		// installs, reboots, brings up a link that cannot pass traffic, and
+		// goes silent.
+		if network != nil {
+			links, err := cluster.ListLinks(ctx, endpoint)
+			if err != nil {
+				return err
+			}
+
+			if err := cluster.RequireLink(links, network.HardwareAddr); err != nil {
+				return err
+			}
+		}
+
+		if version == "" {
+			if version, err = cluster.NodeVersion(ctx, endpoint); err != nil {
+				return err
+			}
+
+			source = "the node's maintenance API"
+		}
 	}
 
 	return cluster.Up(ctx, cluster.UpOptions{

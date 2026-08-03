@@ -50,6 +50,32 @@ func NodeVersion(ctx context.Context, endpoint string) (string, error) {
 	return versionTag(resp), nil
 }
 
+// InstalledNodeVersion asks a node that has ALREADY TAKEN ITS CONFIG for its
+// Talos version, over the authenticated API.
+//
+// The same question NodeVersion asks and the same "" contract, differing only
+// in which client can reach the node. It exists because the version guard runs
+// at step 3, BEFORE Up's already-configured branch at step 5 — so a resumed
+// bring-up still needs a version, and the maintenance API that NodeVersion uses
+// is gone for good once a node has installed.
+//
+// talosconfig is secret and is neither logged nor placed in an error.
+func InstalledNodeVersion(ctx context.Context, talosconfig []byte, endpoint string) (string, error) {
+	c, err := AuthenticatedClient(ctx, talosconfig, endpoint)
+	if err != nil {
+		return "", err
+	}
+
+	defer c.Close() //nolint:errcheck
+
+	resp, err := c.Version(ctx)
+	if err != nil {
+		return "", fmt.Errorf("asking the installed node its Talos version: %w", err)
+	}
+
+	return versionTag(resp), nil
+}
+
 // versionTag picks a version tag out of a Version reply, or "" when the reply
 // carries none.
 //

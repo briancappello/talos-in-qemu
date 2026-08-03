@@ -687,3 +687,65 @@ func TestKernelCmdlineHintLeavesAMalformedAddressAlone(t *testing.T) {
 		t.Errorf("a malformed address replaced the failure it was meant to decorate:\n%s", got)
 	}
 }
+
+// A RE-RUN MUST NOT WAIT FOR MAINTENANCE MODE. Up is idempotent and its own
+// failure message says to re-run; a pre-flight that spends ten minutes proving
+// the node left maintenance mode forever makes that advice a trap.
+//
+// The talosconfig here is deliberately garbage: what is asserted is WHICH path
+// adopt took, and a fast failure on a credential it cannot parse proves it took
+// the authenticated one. A maintenance wait would still be running.
+func TestAdoptDoesNotWaitForMaintenanceOnAConfiguredMachine(t *testing.T) {
+	d := &hvf{stateRoot: t.TempDir(), imageRoot: t.TempDir()}
+
+	path := filepath.Join(t.TempDir(), "machine.yaml")
+	if err := os.WriteFile(path, []byte(`apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata: {name: bm0, namespace: default}
+spec:
+  site: lab
+  role: talos-cp
+  baremetal:
+    maintenanceEndpoint: 192.168.1.50
+    systemDiskSerial: S1
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// READ THROUGH readMachine, not built by hand. d.dir keys on the UID
+	// (main.go:507) and readMachine SYNTHESISES one for a manifest that carries
+	// none (main.go:347), so a hand-built machine keys a different directory
+	// and seeds a talosconfig adoptMachine never reads — a test that then
+	// passes for the wrong reason, or in this case cannot pass at all.
+	m, err := readMachine(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := d.dir(m)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "talosconfig"), []byte("not a talosconfig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	err = adoptMachine(context.Background(), d, path)
+
+	if err == nil {
+		t.Fatal("adopt succeeded against a node that does not exist")
+	}
+
+	if elapsed := time.Since(started); elapsed > 30*time.Second {
+		t.Errorf("adopt spent %s before failing, so it waited for maintenance mode\n"+
+			"  reason: an installed node never serves that API again, and Up's own failure\n"+
+			"  message tells the operator to re-run", elapsed)
+	}
+
+	if strings.Contains(err.Error(), "maintenance") {
+		t.Errorf("adopt failed on the maintenance API for a machine that already has a "+
+			"talosconfig:\n%s", err)
+	}
+}
