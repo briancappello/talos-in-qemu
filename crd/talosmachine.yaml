@@ -184,13 +184,17 @@ spec:
                       properties:
                         address:
                           type: string
-                          minLength: 1
-                          # A LOOSE PATTERN ON PURPOSE. It rejects the shapes that are
-                          # obviously not CIDR; whether the prefix actually CONTAINS
-                          # maintenanceEndpoint is the check that matters, it needs
+                          # A LOOSE PATTERN ON PURPOSE. All it asserts is the SHAPE —
+                          # four dot-separated numeric groups with a slash-suffix — so
+                          # 999.999.999.999/99 satisfies it. Whether the value parses at
+                          # all, and whether its prefix actually CONTAINS
+                          # maintenanceEndpoint, is the check that matters, it needs
                           # arithmetic, and it lives in cluster.CheckNetwork — which is
                           # also the only one that runs on the standalone path, where
-                          # no apiserver ever sees this schema.
+                          # no apiserver ever sees this schema. That shape is also what
+                          # refuses an empty string here, which is why this field carries
+                          # no minLength: maintenanceEndpoint above has no pattern, so
+                          # there minLength is the only thing standing in that gap.
                           pattern: '^[0-9]+(\.[0-9]+){3}/[0-9]{1,2}$'
                           description: >-
                             Where the node answers AFTER the install, in CIDR —
@@ -204,7 +208,6 @@ spec:
                             and the kubeconfig server.
                         gateway:
                           type: string
-                          minLength: 1
                           pattern: '^[0-9]+(\.[0-9]+){3}$'
                           description: >-
                             The default route's next hop. Must be inside address's
@@ -224,9 +227,14 @@ spec:
                             MAC of the NIC to configure. A MAC and not an interface
                             name, for the reason the install disk is selected by serial
                             and not by size: a stable identity rather than an
-                            enumeration artifact. Omit it and the first adopt prints
-                            this node's links and refuses, exactly as it does for a
-                            missing disk serial.
+                            enumeration artifact. OMITTING IT IS REFUSED FROM THE FILE,
+                            before any node is dialled, so there is no links table to
+                            print at that point — the node's own console lists its
+                            interfaces and their MACs, and you are already standing at
+                            it to type the ip= kernel argument. A MAC that is
+                            well-formed but WRONG passes that check and is refused
+                            later, once the node has answered, with this node's real
+                            links printed to copy from.
                 powerState:
                   type: string
                   enum: [Running, Stopped]
