@@ -635,18 +635,21 @@ spec:
 // machine, and it is exactly the arithmetic a human does in their head at a
 // GRUB prompt with a laptop balanced on a rack rail.
 func TestKernelCmdlineHintDerivesTheNetmask(t *testing.T) {
+	// The gateway varies in the /16 case so that a hint hard-coding one address
+	// cannot pass the whole table: the gateway must come from the file too.
 	cases := []struct {
 		address string
+		gateway string
 		want    string
 	}{
-		{"192.168.2.10/24", "ip=192.168.2.10::192.168.2.1:255.255.255.0::<your-nic>:off"},
-		{"192.168.2.10/26", "ip=192.168.2.10::192.168.2.1:255.255.255.192::<your-nic>:off"},
-		{"192.168.2.10/16", "ip=192.168.2.10::192.168.2.1:255.255.0.0::<your-nic>:off"},
+		{"192.168.2.10/24", "192.168.2.1", "ip=192.168.2.10::192.168.2.1:255.255.255.0::<your-nic>:off"},
+		{"192.168.2.10/26", "192.168.2.1", "ip=192.168.2.10::192.168.2.1:255.255.255.192::<your-nic>:off"},
+		{"192.168.2.10/16", "192.168.0.1", "ip=192.168.2.10::192.168.0.1:255.255.0.0::<your-nic>:off"},
 	}
 
 	for _, c := range cases {
 		t.Run(c.address, func(t *testing.T) {
-			n := &cluster.Network{Address: c.address, Gateway: "192.168.2.1"}
+			n := &cluster.Network{Address: c.address, Gateway: c.gateway}
 
 			got := kernelCmdlineHint(errors.New("gave up waiting"), n)
 			if !strings.Contains(got.Error(), c.want) {
@@ -669,5 +672,18 @@ func TestKernelCmdlineHintLeavesADHCPFailureAlone(t *testing.T) {
 
 	if got := kernelCmdlineHint(want, nil); got != want {
 		t.Errorf("the failure was decorated for a machine with no network block:\n%s", got)
+	}
+}
+
+func TestKernelCmdlineHintLeavesAMalformedAddressAlone(t *testing.T) {
+	// An address this broken has no prefix to derive a netmask from, so there
+	// is no hint to give. A DECORATION MUST NEVER REPLACE THE ERROR IT
+	// DECORATES: if this regresses, a maintenance timeout is reported as an
+	// address parse failure, and the operator debugs the manifest instead of
+	// the node that never answered.
+	want := errors.New("gave up waiting")
+
+	if got := kernelCmdlineHint(want, &cluster.Network{Address: "nonsense"}); got != want {
+		t.Errorf("a malformed address replaced the failure it was meant to decorate:\n%s", got)
 	}
 }

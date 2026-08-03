@@ -293,10 +293,14 @@ func observeBaremetal(m *unstructured.Unstructured, dir string) (driverkit.State
 // already typed correctly — printing it on a successful run is noise on every
 // run where nothing is wrong.
 //
-// The device field is left blank on purpose. The kernel wants an interface
-// NAME and the manifest holds a MAC, which is the one cost of selecting the NIC
-// by a stable identity. Three of the four values still come from the file,
-// including the netmask, whose arithmetic is what gets typed wrong on a /26.
+// The device field renders as the placeholder `<your-nic>` for the operator to
+// replace, and the HOSTNAME field is the one left blank. The kernel wants an
+// interface NAME and the manifest holds a MAC, which is the one cost of
+// selecting the NIC by a stable identity. Blanking the device instead would
+// apply the line to EVERY interface, which on this repo's two-port target
+// configures the port with no cable in it. Three of the four values still come
+// from the file, including the netmask, whose arithmetic is what gets typed
+// wrong on a /26.
 func kernelCmdlineHint(err error, n *cluster.Network) error {
 	if n == nil {
 		return err
