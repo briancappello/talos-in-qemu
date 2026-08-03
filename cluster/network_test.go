@@ -111,6 +111,11 @@ func TestCheckNetworkRefusesWhatItCannotParse(t *testing.T) {
 			"nameservers is required"},
 		{"an empty nameserver", func(n *Network) { n.Nameservers = []string{""} },
 			`nameservers[0] "" is not an address`},
+		// A well-formed address that this node cannot reach. It parses, so
+		// only a family check catches it — and the node it produces is the one
+		// the empty-list refusal exists to prevent: no resolver, no image.
+		{"an IPv6 nameserver", func(n *Network) { n.Nameservers = []string{"2001:4860:4860::8888"} },
+			`nameservers[0] "2001:4860:4860::8888" is IPv6`},
 		{"no hardware address", func(n *Network) { n.HardwareAddr = "" },
 			"hardwareAddr is required"},
 		{"a hardware address that is not a MAC", func(n *Network) { n.HardwareAddr = "84:47:09" },

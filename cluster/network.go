@@ -200,8 +200,21 @@ func CheckNetwork(n *Network, maintenanceAddr string) error {
 	}
 
 	for i, ns := range n.Nameservers {
-		if _, err := netip.ParseAddr(ns); err != nil {
+		resolver, err := netip.ParseAddr(ns)
+		if err != nil {
 			return fmt.Errorf("spec.baremetal.network.nameservers[%d] %q is not an address", i, ns)
+		}
+
+		// Refused by NAME, like the two v6 refusals above, and here it is the
+		// EMPTY list's refusal that it completes: a v4-only node whose only
+		// resolver is a v6 address has no route to it and cannot resolve at
+		// all, which is exactly the node that cannot pull the image it was
+		// just told to install.
+		if !resolver.Is4() {
+			return fmt.Errorf("spec.baremetal.network.nameservers[%d] %q is IPv6, which is not "+
+				"supported yet\n\n  this node is configured v4-only — %s and its default route "+
+				"are both v4 — so it has\n  no way to reach a v6 resolver, and a node that cannot "+
+				"resolve cannot pull an image", i, ns, n.Address)
 		}
 	}
 

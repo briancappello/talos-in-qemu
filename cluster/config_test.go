@@ -563,21 +563,44 @@ func TestGenerateConfigTargetsTheRequestedContract(t *testing.T) {
 	}
 }
 
+// BOTH PATHS, because machinery is what decides whether either one boots.
+//
+// The static arm is a guard rather than a live defect: v1alpha1.NetworkConfig's
+// fields are already marked Deprecated in machinery v1.13.7, and a bump that
+// turned deprecation into rejection would otherwise surface on a real node
+// mid-boot — the unrepairable failure this whole block exists to prevent —
+// instead of here. The DHCP arm is every machine that existed before it.
 func TestGenerateConfigProducesAConfigMachineryAcceptsBack(t *testing.T) {
-	cfg, err := configloader.NewFromBytes(mustGenerateDefault(t).ControlPlane)
-	if err != nil {
-		t.Fatalf("generated config does not parse: %s\n"+
-			"  reason: an unparseable config is discovered by the NODE, minutes into a boot", redactErr(err))
+	accepted := func(t *testing.T, cp []byte) {
+		t.Helper()
+
+		cfg, err := configloader.NewFromBytes(cp)
+		if err != nil {
+			t.Fatalf("generated config does not parse: %s\n"+
+				"  reason: an unparseable config is discovered by the NODE, minutes into a boot", redactErr(err))
+		}
+
+		warnings, err := cfg.Validate(metalMode{})
+		if err != nil {
+			t.Fatalf("generated config does not validate: %s", redactErr(err))
+		}
+
+		// Logged on the PASSING path too, so this is the one line in the
+		// package that prints on every run — the last place a raw secret
+		// should reach.
+		t.Logf("validation warnings: %s", redact(fmt.Sprint(warnings)))
 	}
 
-	warnings, err := cfg.Validate(metalMode{})
-	if err != nil {
-		t.Fatalf("generated config does not validate: %s", redactErr(err))
-	}
+	t.Run("dhcp", func(t *testing.T) {
+		accepted(t, mustGenerateDefault(t).ControlPlane)
+	})
 
-	// Logged on the PASSING path too, so this is the one line in the package
-	// that prints on every run — the last place a raw secret should reach.
-	t.Logf("validation warnings: %s", redact(fmt.Sprint(warnings)))
+	t.Run("static", func(t *testing.T) {
+		in := testInput()
+		in.Network = testNetwork()
+
+		accepted(t, mustGenerate(t, in).ControlPlane)
+	})
 }
 
 func TestGenerateConfigProducesATalosconfigPointingAtTheHostForward(t *testing.T) {
