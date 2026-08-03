@@ -881,3 +881,71 @@ func TestGenerateConfigLeavesKexecAloneByDefault(t *testing.T) {
 			"  for the hosts that need it, not for everyone\n%s", redact(doc))
 	}
 }
+
+// testNetwork is the block the target machine uses. Its values are deliberately
+// unlike anything else in this file: a fixture that reused 127.0.0.1 could pass
+// on a config that carried the loopback endpoint and no network at all.
+func testNetwork() *Network {
+	return &Network{
+		Address:      "192.168.2.10/24",
+		Gateway:      "192.168.2.1",
+		Nameservers:  []string{"1.1.1.1"},
+		HardwareAddr: "84:47:09:47:35:f9",
+	}
+}
+
+// EVERY assertion here is against v1alpha1Doc, never the raw bytes. Machinery's
+// encoder emits commented-out examples, several of which mention hardwareAddr
+// and addresses, so a Contains against the raw config matches a comment and
+// reports a field that was never set.
+func TestGenerateConfigWritesTheStaticNetwork(t *testing.T) {
+	in := testInput()
+	in.Network = testNetwork()
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	for _, want := range []string{
+		"hardwareAddr: 84:47:09:47:35:f9",
+		"192.168.2.10/24",
+		"gateway: 192.168.2.1",
+		"1.1.1.1",
+		"dhcp: false",
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("the generated config does not carry %q\n"+
+				"  reason: the installed system writes its own kernel cmdline and inherits\n"+
+				"  nothing from the ISO, so an address that is not in this config is gone\n"+
+				"  the moment the node reboots", want)
+		}
+	}
+
+	// The DEFAULT ROUTE, not merely a gateway value. A gateway on a route to
+	// some other network reads identically field by field and leaves the node
+	// with no way off its segment.
+	if !defaultRoute.MatchString(doc) {
+		t.Errorf("no default route through the gateway:\n%s", redact(doc))
+	}
+}
+
+// defaultRoute matches a route whose destination is everything. The pairing is
+// the point: `gateway:` anywhere in the file proves nothing about which
+// destination it serves.
+var defaultRoute = regexp.MustCompile(`network: 0\.0\.0\.0/0\n\s+gateway: 192\.168\.2\.1`)
+
+// REQUIREMENT 2, and the regression target for every machine that existed
+// before this feature. Absent means DHCP, which means machinery's own defaults
+// and not one byte from this branch.
+func TestGenerateConfigEmitsNoNetworkWithoutABlock(t *testing.T) {
+	doc := v1alpha1Doc(t, mustGenerateDefault(t).ControlPlane)
+
+	// Three markers that can ONLY come from networkOption. A `network:` key by
+	// itself is machinery's, and asserting on that would fail for a reason
+	// this branch never caused.
+	for _, never := range []string{"hardwareAddr:", "dhcp: false", "0.0.0.0/0"} {
+		if strings.Contains(doc, never) {
+			t.Errorf("a machine with no network block still got %q in its config\n"+
+				"  reason: every QEMU machine and every DHCP node takes this path, and a\n"+
+				"  static interface appearing in it is a node that stops answering", never)
+		}
+	}
+}

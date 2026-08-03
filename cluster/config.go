@@ -88,6 +88,17 @@ type ConfigInput struct {
 	// stopped holding a platform when cluster/ stopped importing one.
 	// cmd/tinq's upOptions makes that call, from the host it detected.
 	DisableKexec bool
+	// Network is the node's static addressing, or nil for DHCP.
+	//
+	// NIL IS A REAL ANSWER, not a missing field: with nil, no machine.network
+	// section is emitted at all and the node behaves exactly as every machine
+	// did before this field existed.
+	//
+	// Its address is NOT the same question as APIAddress, and the caller is
+	// what resolves one to the other. This package is handed the address a
+	// client dials; whether that address came from a static block or from the
+	// endpoint the node already answers on is the caller's knowledge.
+	Network *Network
 }
 
 // Generated holds the three artifacts bring-up needs. All three contain
@@ -211,6 +222,14 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 	// default, it is a guess that boots the node with a dead console.
 	if in.ConsoleArg != "" {
 		genOpts = append(genOpts, generate.WithInstallExtraKernelArgs([]string{in.ConsoleArg}))
+	}
+
+	// OPTIONAL, like the console argument above and for the same shape of
+	// reason: a machine on a segment that serves DHCP needs nothing here, and
+	// emitting a network section for it would replace working defaults with a
+	// guess about its NIC.
+	if in.Network != nil {
+		genOpts = append(genOpts, networkOption(in.Network))
 	}
 
 	input, err := generate.NewInput(in.ClusterName, in.Endpoint, k8sVersion, genOpts...)

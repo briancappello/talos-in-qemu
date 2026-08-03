@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+
+	"github.com/siderolabs/talos/pkg/machinery/config/generate"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 )
 
 // A NODE HAS TWO ADDRESSES IN ITS LIFE, and this file is what keeps them from
@@ -217,4 +220,45 @@ func CheckNetwork(n *Network, maintenanceAddr string) error {
 	}
 
 	return nil
+}
+
+// networkOption renders a Network into the one generate option that reaches
+// machine.network.
+//
+// generate.WithNetworkOptions is machinery's supported entry point, so this
+// needs no PatchV1Alpha1 — unlike the install disk selector, which has no
+// generate option at all and is why that patch exists.
+//
+// The fields of v1alpha1.NetworkConfig are marked deprecated in favour of a
+// multi-doc network config. They are deprecated, not removed, machine.network
+// is still honoured, and the multi-doc form is not reachable from
+// generate.Options at all. When it becomes reachable, this function is the one
+// place that has to change.
+func networkOption(n *Network) generate.Option {
+	// A POINTER TO FALSE, not a nil pointer. Nil omits the key, and the config
+	// then says nothing about DHCP on an interface whose whole purpose is not
+	// using it — true in effect, silent in the artifact an operator reads.
+	dhcp := false
+
+	return generate.WithNetworkOptions(v1alpha1.WithNetworkConfig(&v1alpha1.NetworkConfig{
+		NameServers: n.Nameservers,
+		NetworkInterfaces: v1alpha1.NetworkDeviceList{{
+			// A SELECTOR rather than DeviceInterface. The two are mutually
+			// exclusive in machinery, and the name is the identity that moves
+			// when the card does.
+			DeviceSelector: &v1alpha1.NetworkDeviceSelector{
+				NetworkDeviceHardwareAddress: n.HardwareAddr,
+			},
+			DeviceAddresses: []string{n.Address},
+			DeviceDHCP:      &dhcp,
+			// The DEFAULT route. Talos derives the on-link route from the
+			// address's prefix by itself; what it cannot derive is the way off
+			// the segment, and that is the half that makes a node able to pull
+			// an image.
+			DeviceRoutes: []*v1alpha1.Route{{
+				RouteNetwork: "0.0.0.0/0",
+				RouteGateway: n.Gateway,
+			}},
+		}},
+	}))
 }
