@@ -364,14 +364,13 @@ func Up(ctx context.Context, opts UpOptions) error {
 	// explain a failed apply survive it — so the file can outlive an apply that
 	// never landed. Nothing on this side can tell that apart from a machine
 	// that was stopped, and asking the node is what the wait is for.
-	talosconfig, err := os.ReadFile(filepath.Join(opts.StateDir, "talosconfig"))
-
-	configured := err == nil
-
-	if !configured && !os.IsNotExist(err) {
-		// os.ReadFile's error quotes the PATH and never the contents, so it is
-		// safe to wrap. Nothing below may relax that.
-		return fail(fmt.Errorf("reading this machine's talosconfig: %w", err))
+	//
+	// SHARED WITH adopt, which gates its whole maintenance pre-flight on the
+	// same answer. See ReadTalosconfig for why the two must not each have
+	// their own copy of this read.
+	talosconfig, configured, err := ReadTalosconfig(opts.StateDir)
+	if err != nil {
+		return fail(err)
 	}
 
 	if configured {
@@ -783,6 +782,38 @@ func checkKubeEndpoint(endpoint, installedAddr string) error {
 		"installed node\n  never serves it again.\n\n  With spec.baremetal.network.address set to %s, "+
 		"this endpoint is %s",
 		endpoint, u.Hostname(), installedAddr, installedAddr, fixed.String())
+}
+
+// ReadTalosconfig reads a machine's talosconfig out of its state directory and
+// reports whether there was one.
+//
+// A CREDENTIAL, NOT A STATUS, and ONE function because both readers depend on
+// the same reading of it. Nothing about the node is believed on the strength of
+// this file: an authenticated call is impossible without it, so having it is a
+// precondition of ASKING, and the claim still comes from whether the node
+// completes the handshake — which a node in maintenance mode cannot.
+//
+// Up gates steps 5 to 7 on the answer; adopt gates its entire maintenance
+// pre-flight on it. Two copies of this read would compile and agree on the day
+// they were written, and the day they stopped agreeing the symptom would be
+// adopt spending its full ten-minute budget on an API an installed node never
+// serves again, with nothing in the output pointing at the cause.
+//
+// A missing file is (nil, false, nil): never configured is an ANSWER, not a
+// failure. Anything else is returned, wrapped with the operation and never the
+// contents — os.ReadFile's own error quotes the PATH only, which is what makes
+// it safe to wrap at all.
+func ReadTalosconfig(stateDir string) (talosconfig []byte, configured bool, err error) {
+	talosconfig, err = os.ReadFile(filepath.Join(stateDir, "talosconfig"))
+
+	switch {
+	case err == nil:
+		return talosconfig, true, nil
+	case os.IsNotExist(err):
+		return nil, false, nil
+	default:
+		return nil, false, fmt.Errorf("reading this machine's talosconfig: %w", err)
+	}
 }
 
 // writeArtifacts writes generated material into the machine's state directory

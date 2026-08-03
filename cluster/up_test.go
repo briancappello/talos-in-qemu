@@ -1140,6 +1140,49 @@ func writeTalosconfig(t *testing.T, dir string) {
 	}
 }
 
+// The read BOTH `up` and `adopt` gate on. It is one function because the two
+// must agree on what "configured" means: a disagreement is adopt waiting out
+// its full maintenance budget for an API an installed node never serves again,
+// with nothing in the output naming the cause.
+//
+// The three outcomes are not two: a missing file is an ANSWER — never
+// configured — and everything else is a failure that must not be read as one.
+func TestReadTalosconfigTellsTheThreeCasesApart(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, configured, err := ReadTalosconfig(dir); err != nil || configured {
+		t.Errorf("an empty state dir read as configured=%v, err=%v; want false and no error\n"+
+			"  reason: never configured is an answer, and an error here would refuse every "+
+			"fresh machine", configured, err)
+	}
+
+	writeTalosconfig(t, dir)
+
+	got, configured, err := ReadTalosconfig(dir)
+	if err != nil || !configured {
+		t.Fatalf("a state dir holding a talosconfig read as configured=%v, err=%v", configured, err)
+	}
+
+	// Compared, never printed: it is a cluster CA and a client key.
+	if string(got) != existingTalosconfig {
+		t.Errorf("ReadTalosconfig returned %d bytes, want the %d-byte credential on disk",
+			len(got), len(existingTalosconfig))
+	}
+
+	// A directory in its place. Read as "not configured" this becomes a
+	// maintenance wait against a node that may well be installed.
+	blocked := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(blocked, "talosconfig", "occupied"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, configured, err := ReadTalosconfig(blocked); err == nil || configured {
+		t.Errorf("an unreadable talosconfig read as configured=%v, err=%v; want a refusal\n"+
+			"  reason: silently reading it as absent sends adopt into a ten-minute wait for "+
+			"maintenance mode", configured, err)
+	}
+}
+
 // A machine that has been configured before must not be sent back through
 // maintenance mode, config generation or apply-config: the first waits for a
 // state the node has left forever, and the other two mint a NEW secrets bundle
@@ -1555,6 +1598,17 @@ func TestUpDialsOneAddressForAMachineWithNoNetworkBlock(t *testing.T) {
 	f := newFixture(t)
 
 	f.mustRun(t)
+
+	// A FLOOR, because the loop below asserts NOTHING against an empty map —
+	// and this test is the designated regression guard for every machine that
+	// existed before this feature. The five are the hooks that take an
+	// endpoint: waitMaintenance, applyConfig, waitBootstrapReady, bootstrap
+	// and kubeconfig.
+	if len(f.rec.endpoint) != 5 {
+		t.Fatalf("%d operations recorded an endpoint, want 5 (%v)\n"+
+			"  reason: a bring-up that dialled nothing would pass the loop below in silence",
+			len(f.rec.endpoint), f.rec.endpoint)
+	}
 
 	for op, got := range f.rec.endpoint {
 		if got != f.opts.TalosEndpoint {

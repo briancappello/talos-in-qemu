@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -127,8 +126,11 @@ func baremetalNetwork(m *unstructured.Unstructured) (*cluster.Network, error) {
 // The parse error is DISCARDED and the maintenance address stands in, which is
 // safe for exactly one reason: adopt refuses an unparseable block up front, so
 // the only caller that can reach the fallback is Observe — on a manifest adopt
-// would never have accepted. Returning an error here instead would put a
-// refusal in a status reporter, which has no way to state one.
+// would never have accepted. Observe COULD carry an error — it returns one —
+// and that is exactly why this must not: an error out of a driver method is
+// retried on every tick forever and, on the delete path, wedges a finalizer.
+// See the three guards below, which exist for the same reason. A typo in a
+// manifest is not consent to make a TalosMachine undeletable.
 func baremetalInstalledAddr(m *unstructured.Unstructured) string {
 	maintenance := str(baremetalFields(m)["maintenanceEndpoint"], "")
 
@@ -413,25 +415,22 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 	dataSerial := str(spec["dataDiskSerial"], "")
 	installed := baremetalInstalledEndpoint(m)
 
-	// A CREDENTIAL, NOT A STATUS — the same read Up makes at up.go:351 and for
-	// the same reason. Nothing about the node is believed on the strength of
-	// this file; an authenticated call is simply impossible without it, so
-	// having it is a precondition of asking rather than an answer.
+	// A CREDENTIAL, NOT A STATUS — literally the same read Up makes, which is
+	// why it is one function in cluster/ rather than a copy here. Nothing about
+	// the node is believed on the strength of this file; an authenticated call
+	// is simply impossible without it, so having it is a precondition of asking
+	// rather than an answer.
 	//
 	// What it decides here is which API this node can still serve. Everything
 	// in the maintenance pre-flight below — the wait, the disks, the links —
 	// needs an API that an installed node stopped serving at its first reboot,
 	// and running it anyway spends the whole ten-minute budget to discover
 	// that. Up is idempotent and its own failure message says to re-run; this
-	// is what makes that advice true.
-	talosconfig, err := os.ReadFile(filepath.Join(dir, "talosconfig"))
-
-	configured := err == nil
-
-	if !configured && !os.IsNotExist(err) {
-		// os.ReadFile's error quotes the PATH and never the contents, so it is
-		// safe to wrap. Nothing below may relax that.
-		return fmt.Errorf("reading this machine's talosconfig: %w", err)
+	// is what makes that advice true, and it stays true only while the two
+	// sides agree on what "configured" means.
+	talosconfig, configured, err := cluster.ReadTalosconfig(dir)
+	if err != nil {
+		return err
 	}
 
 	// The node's own answer, with the spec as an override for the case Risk 1

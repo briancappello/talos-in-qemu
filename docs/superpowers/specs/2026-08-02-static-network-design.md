@@ -215,8 +215,9 @@ type Network struct {
 }
 
 // IP is the host part of Address, with the prefix stripped. cmd/tinq uses it
-// to build BOTH post-install endpoints: InstalledEndpoint (:50000) and
-// KubeEndpoint (https://…:6443).
+// to build BOTH post-install endpoints, through baremetalInstalledAddr:
+// baremetalInstalledEndpoint (:50000) and baremetalKubeEndpoint
+// (https://…:6443).
 func (n *Network) IP() (string, error)
 
 // CheckNetwork is refusals 1-3. A nil Network passes: no block is the DHCP
@@ -327,9 +328,15 @@ match or no carrier.
 ### `cmd/tinq/adopt.go`
 
 The renamed readers, `network` parsing, `CheckNetwork` before the maintenance
-wait, the links table beside the disks table, `InstalledEndpoint` and
+wait, the links table beside the disks table, `baremetalInstalledEndpoint` and
 `baremetalKubeEndpoint` derived from `network.address`, and the `ip=` line in
 the timeout error.
+
+`UpOptions` gains no field for the post-install Talos endpoint — `Up` derives it
+— so `adopt` passes only `TalosEndpoint` and `KubeEndpoint`. `KubeEndpoint`
+survives as a field because under QEMU it is the host side of a forward and
+nothing here could derive one; with a static block present it is instead
+REFUSED when its host is not the address the node takes.
 
 ### `crd/talosmachine.yaml`, `examples/adopt-node.yaml`, docs
 
