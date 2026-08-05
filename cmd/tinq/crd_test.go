@@ -155,6 +155,34 @@ func TestCRDGuardsWhatTheGoCodeAssumes(t *testing.T) {
 		t.Errorf("spec.baremetal.network.nameservers minItems is %s, want 1 — `required` alone "+
 			"accepts an empty list, and a node with no resolver cannot pull an image", got)
 	}
+
+	// spec.registries is the ONLY way to configure a mirror — there is no flag
+	// for it — so a field pruned by the apiserver is not a validation error, it
+	// is a node that silently pulls from the internet and a config that looks
+	// applied. Same failure as the baremetal block above, one field over.
+	items := crdMap(t, crdDig(t, specSchema, "properties", "registries", "items"), "spec.registries.items")
+
+	if got, want := crdStrings(t, items["required"], "spec.registries.items.required"),
+		[]string{"host", "endpoint"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("spec.registries.items.required is %v, want %v — a mirror with no endpoint "+
+			"redirects a host to nothing, and every pull for it fails", got, want)
+	}
+
+	regProps := crdMap(t, items["properties"], "spec.registries.items.properties")
+
+	for _, f := range []string{"host", "endpoint", "insecureSkipVerify", "overridePath"} {
+		if _, ok := regProps[f]; !ok {
+			t.Errorf("spec.registries.items.%s is missing from the schema, but main.go reads it", f)
+		}
+	}
+
+	// The scheme is the plain-HTTP switch, and containerd only complains about a
+	// scheme-less endpoint at PULL time — on a node that has already installed
+	// and booted. The pattern is what moves that refusal to submission.
+	if got := fmt.Sprint(crdMap(t, regProps["endpoint"], "…registries.endpoint")["pattern"]); got != "^https?://" {
+		t.Errorf("spec.registries.items.endpoint pattern is %s, want ^https?:// — an endpoint "+
+			"with no scheme is accepted here and fails at image pull, hours later", got)
+	}
 }
 
 func crdDig(t *testing.T, m map[string]interface{}, path ...string) interface{} {
