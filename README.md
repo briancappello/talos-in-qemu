@@ -159,6 +159,35 @@ they cannot disagree. **Mind the unit**: `dataDisk: 40` is not a size, decodes
 as a number and reads as unset. `up` announces the resulting skip rather than
 letting the first sign of it be a `Pending` PVC an hour later.
 
+`spec.registries` is optional and is how a cluster pulls images that exist
+nowhere on the internet — a registry on your own workstation, or one on the LAN:
+
+```yaml
+  registries:
+    - host: 10.0.2.2:5000                 # the image reference's FIRST SEGMENT
+      endpoint: http://10.0.2.2:5000      # the scheme is the cleartext switch
+```
+
+Three things about it are load-bearing:
+
+- **`host` must match the image reference byte for byte, port included.** An
+  image tagged `10.0.2.2:5000/app:v1` is looked up under `10.0.2.2:5000`; an
+  entry of `10.0.2.2` alone never matches it, and the result is a mirror that is
+  configured, accepted, and never consulted.
+- **The scheme is the plain-HTTP switch, not decoration.** `http://` is what
+  makes containerd speak cleartext to a registry that has no certificate, and no
+  boolean anywhere does that job. `insecureSkipVerify` is a *different*
+  decision about a *different* failure — an `https://` endpoint whose
+  certificate is self-signed — and it does nothing at all for `http://`.
+- **`10.0.2.2` needs no `hostForwards` entry.** It is QEMU user-mode
+  networking's alias for the host, and a forward is the other direction
+  (host → guest). A registry bound to the host's `127.0.0.1:5000` is reachable
+  there with nothing forwarded.
+
+The same field is read for an adopted hardware node, where only the address
+differs. Omit it and the node pulls from upstream, exactly as every machine did
+before the field existed.
+
 Both `hostForwards` entries are load-bearing for `up`: 50000 is where it
 applies config and bootstraps etcd, and 6443 is written into both the generated
 machine config's control-plane endpoint and the kubeconfig, so it has to be an
@@ -792,6 +821,17 @@ Not yet exercised:
   The second run is the transcript shown above, verbatim; it also bound a PVC
   through the pinned `busybox:1.38.0` helper pod, which wrote and read a file
   on it.
+
+- **`spec.registries`, end to end, on Linux/KVM.** A `distribution` v3.0.0
+  registry bound to the host's `127.0.0.1:5000`, an image built with `crane
+  append` and pushed there and nowhere else, and a Pod with
+  `imagePullPolicy: Always` reaching `Ready` off it inside a v1.13.7 guest —
+  which is the only thing that proves both halves, since a `curl` from the host
+  proves the registry is up and says nothing about containerd. The generated
+  config carried `machine.registries.mirrors` keyed `10.0.2.2:5000`, and the
+  guest reached the host's loopback listener at that alias with no forward
+  configured. Verified with libslirp on one host; a libslirp that does not
+  remap `10.0.2.2` would need the registry bound wider.
 
 Not done yet — stated plainly rather than implied:
 
