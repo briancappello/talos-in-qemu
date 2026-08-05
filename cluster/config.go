@@ -22,6 +22,29 @@ import (
 	blockres "github.com/siderolabs/talos/pkg/machinery/resources/block"
 )
 
+// RegistryMirror redirects one registry host to one endpoint, so the cluster
+// can pull images that exist nowhere on the internet.
+//
+// It is FLAT — one host, one endpoint — while Talos's own shape is a map of
+// host to a list of endpoints. The fold happens in registriesConfig, in one
+// place, because the CRD publishes a list to stay shaped like hostForwards
+// beside it and a contract that mixes list and map for the same kind of thing
+// is one nobody can predict.
+type RegistryMirror struct {
+	// Host is the first segment of an image reference, INCLUDING the port.
+	// "10.0.2.2:5000/app:v1" is looked up under "10.0.2.2:5000"; the bare host
+	// never matches it, and the failure is a pull from the real internet.
+	Host string
+	// Endpoint is the mirror URL. The SCHEME is the plain-HTTP switch: http://
+	// makes containerd speak cleartext, and no boolean anywhere does that job.
+	Endpoint string
+	// InsecureSkipVerify stops certificate verification for an https://
+	// endpoint. Meaningless for http://, where there is no certificate.
+	InsecureSkipVerify bool
+	// OverridePath uses the endpoint path verbatim instead of appending /v2/.
+	OverridePath bool
+}
+
 // ConfigInput is everything the generated machine config depends on that this
 // package cannot know for itself.
 //
@@ -99,6 +122,11 @@ type ConfigInput struct {
 	// client dials; whether that address came from a static block or from the
 	// endpoint the node already answers on is the caller's knowledge.
 	Network *Network
+	// Registries are image registry mirrors. Empty means the node pulls only
+	// from upstream, which is the correct default: a mirror that is not
+	// running turns every image pull into a timeout, so one is configured only
+	// when the caller knows there is something at the other end.
+	Registries []RegistryMirror
 }
 
 // Generated holds the three artifacts bring-up needs. All three contain
@@ -288,6 +316,15 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 			c.MachineConfig.MachineSysctls["kernel.kexec_load_disabled"] = "1"
 		}
 
+		// NOT A generate.Option — there is none for registries, so this goes
+		// in beside the disk selector through machinery's own supported patch.
+		// Guarded on len so an empty input leaves the field absent rather than
+		// emitting `registries: {}`, which is noise in every diff of a
+		// generated config.
+		if len(in.Registries) > 0 {
+			c.MachineConfig.MachineRegistries = registriesConfig(in.Registries)
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -405,6 +442,57 @@ the image's. Walking down from it found nothing machinery accepts: %s
   boot an image this build has compatibility data for, or rebuild tinq against
   a machinery that covers %s`,
 		talosVersion, constants.DefaultKubernetesVersion, unsupported, talosVersion)
+}
+
+// registriesConfig folds the flat mirror list into the two maps Talos wants.
+//
+// SEPARATE FROM GenerateConfig so it can be tested without generating a
+// cluster's secrets: this is the part with branching in it, and the rest of
+// GenerateConfig needs a real Talos version and produces a different answer
+// every run.
+func registriesConfig(mirrors []RegistryMirror) v1alpha1.RegistriesConfig {
+	var out v1alpha1.RegistriesConfig
+
+	for _, m := range mirrors {
+		if out.RegistryMirrors == nil {
+			out.RegistryMirrors = map[string]*v1alpha1.RegistryMirrorConfig{}
+		}
+
+		entry := out.RegistryMirrors[m.Host]
+		if entry == nil {
+			entry = &v1alpha1.RegistryMirrorConfig{}
+			out.RegistryMirrors[m.Host] = entry
+		}
+
+		entry.MirrorEndpoints = append(entry.MirrorEndpoints, m.Endpoint)
+
+		if m.OverridePath {
+			entry.MirrorOverridePath = new(true)
+		}
+
+		if !m.InsecureSkipVerify {
+			continue
+		}
+
+		// TLS CONFIG IS A SECOND MAP, not a field on the mirror, and Talos
+		// refuses "*" as a key there. Emitting it would make the whole config
+		// fail validation on apply, which costs a boot to discover.
+		if m.Host == "*" {
+			continue
+		}
+
+		if out.RegistryConfig == nil {
+			out.RegistryConfig = map[string]*v1alpha1.RegistryConfig{}
+		}
+
+		out.RegistryConfig[m.Host] = &v1alpha1.RegistryConfig{
+			RegistryTLS: &v1alpha1.RegistryTLSConfig{
+				TLSInsecureSkipVerify: new(true),
+			},
+		}
+	}
+
+	return out
 }
 
 // userVolume describes the PVC volume on the data disk.
