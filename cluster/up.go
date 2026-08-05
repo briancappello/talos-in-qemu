@@ -130,6 +130,13 @@ type UpOptions struct {
 	// address the node will never hold — which is the defect CheckNetwork
 	// exists to refuse, reintroduced one layer down.
 	Network *Network
+	// Registries are the node's image registry mirrors, or nil for none.
+	//
+	// It is carried through UNVALIDATED, because there is nothing here to
+	// validate against: whether something answers at the endpoint is a fact
+	// about the caller's host, and the only honest test of a mirror is a pull.
+	// The shape is refused where it is read — cmd/tinq's registryMirrors.
+	Registries []RegistryMirror
 
 	// Boot starts the VM, or adopts one already running, and returns its pid.
 	// Owned by package main: this package knows nothing about qemu.
@@ -534,6 +541,11 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 		// block by the caller, so the certificate above and the address below
 		// cannot name two different hosts.
 		Network: opts.Network,
+		// Dropped here, the node pulls every image from the internet and
+		// succeeds at doing it — which is why nothing downstream would notice:
+		// the failure is an image that exists ONLY on the mirror, days later,
+		// in another repository's deploy.
+		Registries: opts.Registries,
 	})
 	if err != nil {
 		return nil, err

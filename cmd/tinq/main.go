@@ -410,6 +410,66 @@ func kubeEndpoint(m *unstructured.Unstructured) string {
 	return ""
 }
 
+// registryMirrors reads spec.registries, the node's image registry mirrors.
+//
+// IT REFUSES RATHER THAN SKIPS. The CRD already constrains this list, but the
+// apiserver is not in the path a bootstrap run takes: `up` and `adopt` read a
+// file straight off disk, so every schema guarantee is absent exactly where
+// this is read. A malformed entry silently dropped here is a node that pulls
+// from the internet instead — which SUCCEEDS for every public image and fails
+// only on the one image that exists nowhere else, long after this file was
+// accepted.
+//
+// The scheme check is the same one the CRD's pattern makes, for the same
+// reason and in the other half of the world: containerd rejects a scheme-less
+// endpoint at PULL time, on a node that has already installed and rebooted.
+func registryMirrors(m *unstructured.Unstructured) ([]cluster.RegistryMirror, error) {
+	var out []cluster.RegistryMirror
+
+	for i, raw := range nestedSlice(m, "spec", "registries") {
+		e, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("spec.registries[%d] is not a block of fields\n\n"+
+				"  each entry must be a mapping:\n\n    registries:\n"+
+				"      - host: 10.0.2.2:5000\n        endpoint: http://10.0.2.2:5000\n\n  (%s)",
+				i, m.GetName())
+		}
+
+		mirror := cluster.RegistryMirror{
+			Host:     str(e["host"], ""),
+			Endpoint: str(e["endpoint"], ""),
+			// A non-bool reads as false, which is the safe answer for both:
+			// one weakens TLS and the other suppresses /v2/, and neither is a
+			// thing to switch on because a value could not be parsed.
+			InsecureSkipVerify: e["insecureSkipVerify"] == true,
+			OverridePath:       e["overridePath"] == true,
+		}
+
+		// THE PORT IS PART OF THE HOST. An image tagged 10.0.2.2:5000/app:v1
+		// is looked up under "10.0.2.2:5000"; an entry of "10.0.2.2" alone
+		// never matches it, and that is a mirror configured, accepted, and
+		// never consulted. Not checkable here — a registry on :443 is written
+		// without a port, correctly — so it is said rather than enforced.
+		if mirror.Host == "" {
+			return nil, fmt.Errorf("spec.registries[%d] has no host: it is the FIRST SEGMENT of an "+
+				"image reference, port included, e.g. 10.0.2.2:5000 (%s)", i, m.GetName())
+		}
+
+		if !strings.HasPrefix(mirror.Endpoint, "http://") && !strings.HasPrefix(mirror.Endpoint, "https://") {
+			return nil, fmt.Errorf("spec.registries[%d].endpoint is %q, which has no http:// or "+
+				"https:// scheme\n\n"+
+				"  the scheme is the plain-HTTP switch, not decoration: http:// is what makes\n"+
+				"  containerd speak cleartext to a registry that has no certificate, and there\n"+
+				"  is no boolean anywhere that does it instead\n\n  (%s)",
+				i, mirror.Endpoint, m.GetName())
+		}
+
+		out = append(out, mirror)
+	}
+
+	return out, nil
+}
+
 // bringUp is the -up verb: create (or adopt) the VM, then hand everything after
 // that to cluster.Up, which owns all ten steps and every line of output.
 func bringUp(ctx context.Context, d *hvf, m *unstructured.Unstructured, state driverkit.State,
@@ -452,6 +512,14 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		return cluster.UpOptions{}, err
 	}
 
+	// Refused BEFORE the VM is created. A malformed mirror is provable from the
+	// file, and discovering it after the boot costs a state dir and a
+	// maintenance wait for a verdict this line gives for free.
+	mirrors, err := registryMirrors(m)
+	if err != nil {
+		return cluster.UpOptions{}, err
+	}
+
 	// The MACHINE's state dir, never the state root: the artifacts carry the
 	// identity they belong to, which is the property that makes -destroy sweep
 	// them. Written one level up they would outlive the cluster whose keys
@@ -477,6 +545,10 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		// for another platform's bug. Upstream gates its own workaround on the
 		// target ARCHITECTURE, so an Intel Mac has nothing to work around.
 		DisableKexec: host.OS == "darwin" && host.ImageArch == "arm64",
+		// spec.registries is NOT in the baremetal exclusion rule, so this same
+		// list is read the same way by adopt: a mirror is a property of the
+		// node, and only its address differs between a guest and a machine.
+		Registries: mirrors,
 
 		Boot: func() (int, error) {
 			// The same already-running rule `apply` applies, and it is what

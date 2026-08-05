@@ -1756,3 +1756,41 @@ func TestStep6AnnouncesTheMoveOnlyWhenTheNodeMoves(t *testing.T) {
 			redact(transcript))
 	}
 }
+
+// ── the mirror list is carried, not interpreted ─────────────────────────────
+//
+// WHERE a mirror lives is the caller's knowledge (a QEMU host alias, a LAN
+// address), and WHETHER anything answers there is not knowable from here at
+// all. What this package owes is that the list it is handed is the list it
+// asks for — a field dropped between UpOptions and ConfigInput is a node that
+// pulls every public image from the internet perfectly well, and fails only on
+// the one image that exists nowhere but the mirror.
+
+func TestUpCarriesTheRegistryMirrorsToConfig(t *testing.T) {
+	f := newFixture(t)
+	f.opts.Registries = []RegistryMirror{{
+		Host:     "10.0.2.2:5000",
+		Endpoint: "http://10.0.2.2:5000",
+	}}
+
+	f.mustRun(t)
+
+	if !reflect.DeepEqual(f.rec.input.Registries, f.opts.Registries) {
+		t.Errorf("ConfigInput.Registries = %+v, want %+v\n"+
+			"  reason: dropped here the node still pulls every public image, so nothing\n"+
+			"  downstream notices until an image that exists ONLY on the mirror is deployed",
+			f.rec.input.Registries, f.opts.Registries)
+	}
+}
+
+func TestUpAsksForNoMirrorsWhenTheCallerNamedNone(t *testing.T) {
+	f := newFixture(t)
+
+	f.mustRun(t)
+
+	if f.rec.input.Registries != nil {
+		t.Errorf("ConfigInput.Registries = %+v, want nil — a mirror nobody asked for is an\n"+
+			"  endpoint nothing is listening on, and every image pull then waits it out",
+			f.rec.input.Registries)
+	}
+}

@@ -8,11 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/coglative/talos-in-qemu/cluster"
 	"github.com/coglative/talos-in-qemu/driverkit"
 	"github.com/coglative/talos-in-qemu/platform"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1895,5 +1897,104 @@ func TestEndpointsDefaultToLoopbackWithoutHostAddr(t *testing.T) {
 
 	if got := talosEndpoint(m); got != "127.0.0.1:50000" {
 		t.Errorf("talosEndpoint = %q, want 127.0.0.1:50000", got)
+	}
+}
+
+// ── spec.registries ─────────────────────────────────────────────────────────
+//
+// The apiserver is NOT in this path. `up` and `adopt` read a machine file off
+// disk, so the CRD's schema — which is where this field's shape is published —
+// guarantees nothing at all here. registryMirrors is the only thing standing
+// between a typo and a node configured to mirror nothing.
+
+func TestRegistryMirrorsReadsTheList(t *testing.T) {
+	m := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"registries": []interface{}{
+			map[string]interface{}{
+				"host":     "10.0.2.2:5000",
+				"endpoint": "http://10.0.2.2:5000",
+			},
+			map[string]interface{}{
+				"host":               "registry.lan",
+				"endpoint":           "https://registry.lan/mirror",
+				"insecureSkipVerify": true,
+				"overridePath":       true,
+			},
+		}},
+	}}
+
+	got, err := registryMirrors(m)
+	if err != nil {
+		t.Fatalf("registryMirrors: %v", err)
+	}
+
+	want := []cluster.RegistryMirror{
+		{Host: "10.0.2.2:5000", Endpoint: "http://10.0.2.2:5000"},
+		{
+			Host: "registry.lan", Endpoint: "https://registry.lan/mirror",
+			InsecureSkipVerify: true, OverridePath: true,
+		},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("registryMirrors = %+v, want %+v", got, want)
+	}
+}
+
+// nil, not an empty slice, and it must not be an error: a machine with no
+// mirrors is the normal case and cluster/config.go reads len() == 0 as "emit no
+// registries section at all".
+func TestRegistryMirrorsAbsentIsNotAnError(t *testing.T) {
+	m := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"site": "testsite"},
+	}}
+
+	got, err := registryMirrors(m)
+	if err != nil || got != nil {
+		t.Errorf("registryMirrors = %+v, %v; want nil, nil — no mirrors is the default, "+
+			"not a malformed file", got, err)
+	}
+}
+
+// Each refusal is pinned to its own text. A single "invalid registries" error
+// would pass this table while telling the operator nothing about WHICH of the
+// three mistakes they made, and these three fail in three different ways: a
+// scalar entry is a YAML indentation slip, a missing host is a key typo, and a
+// scheme-less endpoint is the one that looks right and fails at image pull.
+func TestRegistryMirrorsRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry interface{}
+		says  string
+	}{
+		{"scalar-entry", "10.0.2.2:5000", "not a block of fields"},
+		{"no-host", map[string]interface{}{"endpoint": "http://10.0.2.2:5000"}, "has no host"},
+		{"empty-host", map[string]interface{}{"host": "", "endpoint": "http://x:5000"}, "has no host"},
+		{
+			"no-endpoint",
+			map[string]interface{}{"host": "10.0.2.2:5000"},
+			"has no http:// or https:// scheme",
+		},
+		{
+			"scheme-less-endpoint",
+			map[string]interface{}{"host": "10.0.2.2:5000", "endpoint": "10.0.2.2:5000"},
+			"has no http:// or https:// scheme",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &unstructured.Unstructured{Object: map[string]interface{}{
+				"spec": map[string]interface{}{"registries": []interface{}{tc.entry}},
+			}}
+
+			_, err := registryMirrors(m)
+			if err == nil {
+				t.Fatalf("registryMirrors accepted %v — a mirror the node cannot use is "+
+					"worse than none, because it looks configured", tc.entry)
+			}
+
+			if !strings.Contains(err.Error(), tc.says) {
+				t.Errorf("error does not say %q:\n%v", tc.says, err)
+			}
+		})
 	}
 }

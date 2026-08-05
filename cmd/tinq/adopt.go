@@ -406,6 +406,15 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		return err
 	}
 
+	// Read with the guest's own reader, from the same top-level field: a mirror
+	// is a property of the NODE, and hardware needs one for the same reason a
+	// VM does. Refused here, before the maintenance wait, for the same reason
+	// the network block above is.
+	mirrors, err := registryMirrors(m)
+	if err != nil {
+		return err
+	}
+
 	dir := d.dir(m)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("state dir: %w", err)
@@ -521,6 +530,10 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		// The address the node answers on AFTERWARDS is derived from this by
 		// cluster.Up, never configured beside it — see installedEndpoint.
 		Network: network,
+		// Same field, same reader as a guest's. On hardware the endpoint is a
+		// real address with a real certificate, so it is https:// and possibly
+		// insecureSkipVerify; the mechanism underneath is identical.
+		Registries: mirrors,
 		// ALREADY RUNNING, by definition — that is what adopt means. Returning
 		// a pid of 0 is honest: this process did not start it and has no
 		// handle on it.
