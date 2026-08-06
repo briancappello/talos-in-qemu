@@ -60,6 +60,11 @@ const (
 	// installTimeout covers install, reboot and the installed system's apid
 	// coming back with the cluster PKI. It is the longest wait in a bring-up.
 	installTimeout = 10 * time.Minute
+	// bootstrapTimeout covers the gap between apid serving the cluster PKI and
+	// the node being able to accept a bootstrap — containerd starting, and the
+	// clock coming into sync. Both are usually seconds; this is generous
+	// because the failure it replaces was a bring-up that died outright.
+	bootstrapTimeout = 5 * time.Minute
 	// kubeconfigTimeout covers the apiserver starting far enough to mint an
 	// admin kubeconfig, which is not immediate after bootstrap.
 	kubeconfigTimeout = 5 * time.Minute
@@ -434,7 +439,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 		p.step("apply-config", "skipped (already applied), authenticated api answered after %s", took(started))
 		p.detail("that answer IS the proof, and it is the gate a fresh bring-up passes here too:")
 		p.detail("a node in maintenance mode cannot satisfy the cluster PKI, so an authenticated")
-		p.detail("call completing means the config is on disk and the installed system is serving")
+		p.detail("call completing means the config is on disk and apid is serving it")
 	} else {
 		// ── 5/10 maintenance ────────────────────────────────────────────
 		// A REAL Talos API call, never a dial: a qemu hostfwd is accepted by
@@ -966,11 +971,50 @@ func bootstrapEtcd(ctx context.Context, talosconfig []byte, endpoint string) err
 
 	defer c.Close() //nolint:errcheck
 
-	if err := c.Bootstrap(ctx, &machineapi.BootstrapRequest{}); err != nil {
-		return fmt.Errorf("bootstrapping etcd: %w", err)
-	}
+	return bootstrapWithRetry(ctx, bootstrapTimeout, func(ctx context.Context) error {
+		return c.Bootstrap(ctx, &machineapi.BootstrapRequest{})
+	})
+}
 
-	return nil
+// bootstrapWithRetry issues call until the node stops saying "not yet".
+//
+// THE FIRST BOOTSTRAP ON REAL HARDWARE ROUTINELY LANDS TOO EARLY, and that is
+// what this exists for. Step 7's gate is an authenticated API call, and apid
+// serves the cluster PKI as soon as the config is on disk — before containerd
+// has finished starting. Talos then refuses with FailedPrecondition, because
+// Bootstrap checks IsBootstrapAllowed() (v1.13.7,
+// v1alpha1_server.go:442), which v1alpha1_runtime.go:248 documents as "checks
+// for CRI to be up". A SECOND transient refusal shares the code and the shape,
+// four lines further down: "time is not in sync yet".
+//
+// Measured: an adopt of a baremetal node passed the authenticated gate after 2s
+// and died here; re-running it bootstrapped immediately. Both refusals clear on
+// their own, so the only thing the old single-shot call proved was that the
+// gate above cannot see far enough — and NOTHING can make it see far enough,
+// because the two conditions are about services this side never observes.
+//
+// ONLY FailedPrecondition IS RETRIED. AlreadyExists is the caller's success
+// signal (see alreadyBootstrapped) and cannot clear, so retrying it would turn
+// a healthy re-run into a full-budget hang ending in a timeout. Everything else
+// is a real failure that waiting cannot improve.
+func bootstrapWithRetry(ctx context.Context, timeout time.Duration, call func(context.Context) error) error {
+	return waitFor(ctx, timeout, "the node to accept a bootstrap", func(ctx context.Context) error {
+		err := call(ctx)
+
+		switch {
+		case err == nil:
+			return nil
+
+		// NOT YET: keep asking until the budget runs out.
+		case client.StatusCode(err) == codes.FailedPrecondition:
+			return fmt.Errorf("bootstrapping etcd: %w", err)
+
+		// NOT EVER: hand it straight back, wrapped exactly as this function
+		// has always wrapped it, so alreadyBootstrapped still reads the code.
+		default:
+			return stopWaiting{fmt.Errorf("bootstrapping etcd: %w", err)}
+		}
+	})
 }
 
 // fetchKubeconfig asks the node for an admin kubeconfig.

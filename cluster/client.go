@@ -204,7 +204,13 @@ func WaitMaintenance(ctx context.Context, endpoint string, timeout time.Duration
 //
 // Same probe, same discarded response. What differs is what a success PROVES:
 // maintenance mode cannot produce one, so this returning nil means the applied
-// config is on disk and the installed system's apid is serving.
+// config is on disk and apid is serving with the cluster PKI.
+//
+// THAT IS ALL IT PROVES, and the boundary is load-bearing. apid comes up early;
+// the node's other services are still starting behind it, and this probe cannot
+// see any of them. A caller that needs one of them needs its own wait — see
+// bootstrapWithRetry, which exists because containerd is routinely NOT up when
+// this returns.
 //
 // talosconfig is secret and is neither logged nor placed in an error.
 func WaitAPI(ctx context.Context, talosconfig []byte, endpoint string, timeout time.Duration) error {
@@ -231,10 +237,16 @@ func WaitAPI(ctx context.Context, talosconfig []byte, endpoint string, timeout t
 // `running` and you wait forever, with a node that looks healthy on the console
 // and a tool that looks hung.
 //
-// So the signal is the AUTHENTICATED API answering, and nothing else. That
-// already proves everything bootstrap needs — the config is applied, the
-// installed system booted, apid serves with the cluster PKI — while the node
-// is still, correctly, `booting`.
+// So the signal is the AUTHENTICATED API answering, and nothing else: the
+// config is applied and apid serves with the cluster PKI, while the node is
+// still, correctly, `booting`.
+//
+// IT DOES NOT PROVE BOOTSTRAP WILL BE ACCEPTED, and the name oversells that by
+// one step. Talos gates Bootstrap on containerd being up and on the clock being
+// in sync, neither of which this probe observes — measured on hardware, this
+// returned after 2s and the bootstrap that followed was refused. Nothing here
+// can close that gap, because the two conditions are invisible from this side;
+// bootstrapWithRetry absorbs it by outlasting the refusal instead.
 //
 // This is a thin alias for WaitAPI and stays a separate function on purpose:
 // the name is the artifact. It is what a caller reaches for instead of
@@ -303,8 +315,27 @@ func nodeIsReady(node *corev1.Node) bool {
 	return false
 }
 
-// waitFor polls probe until it succeeds, the timeout expires or ctx is
-// cancelled, whichever comes first.
+// stopWaiting wraps an error a probe wants waitFor to STOP on rather than
+// retry, and waitFor returns the wrapped error unchanged.
+//
+// It exists because a probe has two kinds of failure and one return value could
+// not tell them apart: "not yet" and "not ever". Without it, the only way to
+// end a wait early is for the probe to report success, which is a lie the
+// caller then has to un-tell — and the only way to report a permanent failure
+// is to let the wait burn its whole budget first, so an operator watches five
+// minutes elapse to be told something the first attempt already knew.
+//
+// The error comes back UNWRAPPED on purpose: callers match on gRPC codes
+// through it (see alreadyBootstrapped), and a "gave up waiting" sentence
+// around a refusal the node gave instantly would describe a timeout that never
+// happened.
+type stopWaiting struct{ err error }
+
+func (s stopWaiting) Error() string { return s.err.Error() }
+func (s stopWaiting) Unwrap() error { return s.err }
+
+// waitFor polls probe until it succeeds, the timeout expires, ctx is cancelled
+// or the probe returns a stopWaiting, whichever comes first.
 //
 // It honours BOTH deadlines because they answer different questions: timeout
 // is "how long is this step allowed to take", ctx is "has the whole operation
@@ -344,6 +375,15 @@ func waitFor(ctx context.Context, timeout time.Duration, what string, probe func
 
 		if err == nil {
 			return nil
+		}
+
+		// BEFORE the last-error bookkeeping below, because none of it applies:
+		// there is no next attempt to preserve an error for, and the caller
+		// wants the node's own refusal rather than this function's wording
+		// about a budget it did not spend.
+		var stop stopWaiting
+		if errors.As(err, &stop) {
+			return stop.err
 		}
 
 		// An attempt cut short by the deadline reports the CLOCK rather than

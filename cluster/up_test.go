@@ -1329,6 +1329,109 @@ func alreadyBootstrappedError() error {
 		status.Error(codes.AlreadyExists, "etcd data directory is not empty"))
 }
 
+// preconditionError is the node's OTHER refusal, and unlike AlreadyExists it is
+// TRANSIENT. Talos v1.13.7 raises it from two places that both clear on their
+// own — v1alpha1_server.go:443, gated on IsBootstrapAllowed(), which
+// v1alpha1_runtime.go:249 documents as "checks for CRI to be up"; and
+// v1alpha1_server.go:454, "time is not in sync yet".
+//
+// MEASURED ON HARDWARE: a first adopt of the 192.168.1.170 node passed the
+// authenticated-API gate after 2s and then died here, because apid serves the
+// cluster PKI before containerd has finished starting. Re-running adopt
+// bootstrapped fine, which is the definition of transient.
+func preconditionError() error {
+	return status.Error(codes.FailedPrecondition, "bootstrap is not available yet")
+}
+
+func TestBootstrapWithRetryOutlastsATransientPrecondition(t *testing.T) {
+	var calls int
+
+	err := bootstrapWithRetry(context.Background(), 30*time.Second, func(context.Context) error {
+		calls++
+		if calls < 3 {
+			return preconditionError()
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("bootstrapWithRetry gave up on a precondition that cleared: %v\n"+
+			"  reason: apid answers before containerd is up, so the FIRST bootstrap on real "+
+			"hardware routinely lands too early", err)
+	}
+
+	if calls != 3 {
+		t.Errorf("the bootstrap call was made %d times, want 3", calls)
+	}
+}
+
+// AlreadyExists is the caller's SUCCESS signal, so retrying it would spend the
+// whole budget and then return a timeout — turning the idempotent path into a
+// five-minute hang followed by a failure against a healthy cluster.
+func TestBootstrapWithRetryReturnsAlreadyExistsImmediately(t *testing.T) {
+	var calls int
+
+	started := time.Now()
+	err := bootstrapWithRetry(context.Background(), 30*time.Second, func(context.Context) error {
+		calls++
+
+		return status.Error(codes.AlreadyExists, "etcd data directory is not empty")
+	})
+
+	if calls != 1 {
+		t.Errorf("the bootstrap call was made %d times, want 1 — AlreadyExists cannot clear", calls)
+	}
+
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Errorf("bootstrapWithRetry spent %s on AlreadyExists, want an immediate return", elapsed)
+	}
+
+	// The whole point of returning early: Up's idempotent path still recognises it.
+	if !alreadyBootstrapped(err) {
+		t.Errorf("alreadyBootstrapped could not see the code through the retry wrapper: %v\n"+
+			"  reason: step 8 reads this to tell a healthy re-run from a real failure", err)
+	}
+}
+
+// Everything that is not a precondition is a real failure, and spending the
+// budget on it delays the report without changing it.
+func TestBootstrapWithRetryDoesNotRetryOrdinaryFailures(t *testing.T) {
+	var calls int
+
+	started := time.Now()
+	err := bootstrapWithRetry(context.Background(), 30*time.Second, func(context.Context) error {
+		calls++
+
+		return errors.New("connection refused")
+	})
+	if err == nil {
+		t.Fatal("bootstrapWithRetry reported a connection failure as success")
+	}
+
+	if calls != 1 {
+		t.Errorf("the bootstrap call was made %d times, want 1", calls)
+	}
+
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Errorf("bootstrapWithRetry spent %s on an ordinary failure, want an immediate return", elapsed)
+	}
+}
+
+// A precondition that never clears is a real failure too, and the message has
+// to carry the node's own words rather than a bare timeout.
+func TestBootstrapWithRetryGivesUpOnAPreconditionThatNeverClears(t *testing.T) {
+	err := bootstrapWithRetry(context.Background(), 3*time.Second, func(context.Context) error {
+		return preconditionError()
+	})
+	if err == nil {
+		t.Fatal("bootstrapWithRetry reported a permanently blocked bootstrap as success")
+	}
+
+	if !strings.Contains(err.Error(), "bootstrap is not available yet") {
+		t.Errorf("the give-up does not quote the node's refusal: %v", err)
+	}
+}
+
 func TestUpTreatsAnAlreadyBootstrappedNodeAsSuccess(t *testing.T) {
 	f := newFixture(t)
 	writeTalosconfig(t, f.dir)
@@ -1357,8 +1460,13 @@ func TestUpFailsOnABootstrapErrorThatIsNotAlreadyBootstrapped(t *testing.T) {
 	}{
 		{
 			// The node's OTHER refusal: apid is up but the runtime is not ready
-			// to bootstrap yet. Same shape, different code, and retrying is not
-			// the answer.
+			// to bootstrap yet. RETRYING IS THE ANSWER, and it has already
+			// happened by the time an error reaches this layer —
+			// bootstrapWithRetry sits inside the hook and spends its whole
+			// budget on exactly this code. One arriving HERE is therefore a
+			// precondition that never cleared, which is a real failure: Up must
+			// not treat it as success and leave step 9 waiting on a node that
+			// can never report Ready.
 			"another gRPC code",
 			fmt.Errorf("bootstrapping etcd: %w",
 				status.Error(codes.FailedPrecondition, "bootstrap is not available yet")),
