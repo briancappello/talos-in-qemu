@@ -20,6 +20,7 @@ import (
 	coreconfig "github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate"
+	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/block"
 	v1alpha1 "github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
@@ -160,6 +161,21 @@ type ConfigInput struct {
 	// running turns every image pull into a timeout, so one is configured only
 	// when the caller knows there is something at the other end.
 	Registries []RegistryMirror
+	// SecretsBundle is an EXISTING secrets.yaml to generate against, or nil to
+	// mint a fresh one.
+	//
+	// NIL IS THE BOOTSTRAP CASE and non-nil is the only way to regenerate a
+	// config for a node that already exists. A fresh bundle is five new
+	// certificate authorities and a new machine token: the node would reject
+	// the config as signed by a CA it does not trust, and the talosconfig
+	// beside it could not authenticate to the node it was generated for. There
+	// is no way back from that on hardware, because the node never serves the
+	// maintenance API again.
+	//
+	// It is BYTES rather than a *secrets.Bundle so callers keep handling it as
+	// the opaque secret it is — read from the state dir, passed through, never
+	// inspected. It is SECRET and is neither logged nor placed in an error.
+	SecretsBundle []byte
 }
 
 // Generated holds the three artifacts bring-up needs. All three contain
@@ -297,6 +313,19 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 	// guess about its NIC.
 	if in.Network != nil {
 		genOpts = append(genOpts, networkOption(in.Network))
+	}
+
+	// THE EXISTING PKI, when there is one. Everything above describes a machine
+	// that could be built from scratch; this is what makes the same description
+	// apply to a machine that already exists and must keep the identity it was
+	// installed with.
+	if len(in.SecretsBundle) > 0 {
+		bundle, err := parseSecretsBundle(in.SecretsBundle)
+		if err != nil {
+			return nil, err
+		}
+
+		genOpts = append(genOpts, generate.WithSecretsBundle(bundle))
 	}
 
 	input, err := generate.NewInput(in.ClusterName, in.Endpoint, k8sVersion, genOpts...)
@@ -531,6 +560,39 @@ func registriesConfig(mirrors []RegistryMirror) v1alpha1.RegistriesConfig {
 	}
 
 	return out
+}
+
+// parseSecretsBundle reads a secrets.yaml back into the bundle generation
+// wants.
+//
+// The CLOCK is restored explicitly because yaml skips it (`yaml:"-"` on
+// secrets.Bundle.Clock) and generation dereferences it when it issues
+// certificates — so a bundle round-tripped through disk without this line
+// panics rather than failing.
+//
+// The bytes are SECRET: five certificate authorities and the machine token.
+// Nothing here quotes them, and the parse failure goes through errSecretParse
+// for the reason every other secret parse does — the parser's message can
+// contain the document.
+func parseSecretsBundle(b []byte) (*secrets.Bundle, error) {
+	var bundle secrets.Bundle
+
+	if err := yaml.Unmarshal(b, &bundle); err != nil {
+		return nil, errSecretParse("secrets bundle")
+	}
+
+	// A file that is valid YAML but not a bundle — an empty document, or the
+	// wrong file entirely — unmarshals into a struct of nils and would be
+	// noticed as a nil dereference deep inside machinery.
+	if bundle.Certs == nil || bundle.Secrets == nil || bundle.Cluster == nil {
+		return nil, errors.New("the secrets bundle is missing its certificates, cluster or " +
+			"machine secrets, so a config generated from it could not be trusted by the node " +
+			"it is for")
+	}
+
+	bundle.Clock = secrets.NewClock()
+
+	return &bundle, nil
 }
 
 // installDiskSelector turns a DiskRef into machinery's install selector.

@@ -217,6 +217,29 @@ func newRootCmd() *cobra.Command {
 		},
 	}
 
+	reconfigure := &cobra.Command{
+		Use:   "reconfigure <machine.yaml>",
+		Short: "Apply an edited manifest to a machine that is already running",
+		Long: "Regenerates this machine's config from its manifest, against the SECRETS\n" +
+			"BUNDLE it already has, and applies it over the authenticated API.\n\n" +
+			"`up` and `adopt` skip config generation once a machine has a talosconfig,\n" +
+			"because regenerating there would mint new certificate authorities and take\n" +
+			"away the only credential that reaches the node. This is where a manifest\n" +
+			"edit goes instead — adding a registry mirror no longer means wiping a disk.\n\n" +
+			"Refuses anything decided when the disk was PARTITIONED: the install target,\n" +
+			"the EPHEMERAL cap and the user volume's disk. Talos accepts a config saying\n" +
+			"otherwise and does nothing about it, so those still need a wipe.\n\n" +
+			"Talos decides per change whether a reboot is required.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			d, err := newDriver()
+			if err != nil {
+				return err
+			}
+			return reconfigureMachine(cmd.Context(), d, args[0])
+		},
+	}
+
 	controller := &cobra.Command{
 		Use:   "controller",
 		Short: "Watch TalosMachine resources in a cluster and reconcile them",
@@ -239,7 +262,7 @@ func newRootCmd() *cobra.Command {
 	}
 	controller.Flags().DurationVar(&interval, "interval", 5*time.Second, "reconcile interval")
 
-	root.AddCommand(apply, stop, destroy, up, adopt, controller)
+	root.AddCommand(apply, stop, destroy, up, adopt, reconfigure, controller)
 	return root
 }
 

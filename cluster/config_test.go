@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -124,9 +125,10 @@ func mustGenerateDefault(t *testing.T) *Generated {
 // A Talos machine config is a MULTI-DOCUMENT YAML: v1alpha1 first, then any
 // number of separate documents. Asserting on the whole blob cannot tell which
 // document a string landed in, which is exactly how a swapped serial survives.
-func splitDocs(cp []byte) []string {
-	return strings.Split(string(cp), "\n---\n")
-}
+//
+// The splitter itself lives in reconfigure.go, because the refusals there
+// compare documents for real and a second copy of "what is a document" would
+// let the tests and the production comparison disagree about it.
 
 // The encoder documents every field it sets AND emits a commented-out example
 // of most fields it did not. Asserting against that text is how a test for
@@ -185,16 +187,15 @@ func v1alpha1Doc(t *testing.T, cp []byte) string {
 	return doc
 }
 
-func docOfKind(t *testing.T, cp []byte, kind string) (string, bool) {
+// docOfKindT is docOfKind with the encoder's commented-out examples stripped,
+// which every assertion in this file needs and the production comparison must
+// NOT have: a comment changing is still the document changing.
+func docOfKindT(t *testing.T, cp []byte, kind string) (string, bool) {
 	t.Helper()
 
-	for _, doc := range splitDocs(cp) {
-		if doc = code(doc); strings.Contains(doc, "kind: "+kind) {
-			return doc, true
-		}
-	}
+	doc, ok := docOfKind(cp, kind)
 
-	return "", false
+	return code(doc), ok
 }
 
 // installSelector matches an install block that selects BY SERIAL. The
@@ -236,7 +237,7 @@ func TestGenerateConfigUsesTheCallersSerials(t *testing.T) {
 			"  reason: the serials are main.go's constants; a literal copied into this package drifts silently", m)
 	}
 
-	vol, ok := docOfKind(t, cp, "UserVolumeConfig")
+	vol, ok := docOfKindT(t, cp, "UserVolumeConfig")
 	if !ok || !strings.Contains(vol, `disk.serial == "data-9000"`) {
 		t.Errorf("user volume does not select data-9000\n"+
 			"  reason: same drift, other half — the volume would match no disk and never appear\n%s", redact(vol))
@@ -294,7 +295,7 @@ func TestGenerateConfigCarvesTheSystemDiskWhenEphemeralIsCapped(t *testing.T) {
 
 	cp := mustGenerate(t, in).ControlPlane
 
-	eph, ok := docOfKind(t, cp, "VolumeConfig")
+	eph, ok := docOfKindT(t, cp, "VolumeConfig")
 	if !ok {
 		t.Fatalf("no VolumeConfig document\n"+
 			"  reason: uncapped, EPHEMERAL grows to the size of the disk and the user "+
@@ -307,7 +308,7 @@ func TestGenerateConfigCarvesTheSystemDiskWhenEphemeralIsCapped(t *testing.T) {
 		}
 	}
 
-	vol, ok := docOfKind(t, cp, "UserVolumeConfig")
+	vol, ok := docOfKindT(t, cp, "UserVolumeConfig")
 	if !ok {
 		t.Fatalf("no UserVolumeConfig beside the EPHEMERAL cap\n" +
 			"  reason: the cap alone frees space nothing then uses, and step 10 would " +
@@ -332,7 +333,7 @@ func TestGenerateConfigCarvesTheSystemDiskWhenEphemeralIsCapped(t *testing.T) {
 func TestGenerateConfigLeavesEphemeralAloneWithADedicatedDataDisk(t *testing.T) {
 	cp := mustGenerateDefault(t).ControlPlane
 
-	if _, ok := docOfKind(t, cp, "VolumeConfig"); ok {
+	if _, ok := docOfKindT(t, cp, "VolumeConfig"); ok {
 		t.Error("a machine with a dedicated data disk still caps EPHEMERAL\n" +
 			"  reason: nothing needs the space, and a cap is set at install time and " +
 			"cannot be undone without a wipe")
@@ -346,7 +347,7 @@ func TestGenerateConfigEmitsNoVolumeDocumentsWithNeither(t *testing.T) {
 	cp := mustGenerate(t, in).ControlPlane
 
 	for _, kind := range []string{"VolumeConfig", "UserVolumeConfig"} {
-		if _, ok := docOfKind(t, cp, kind); ok {
+		if _, ok := docOfKindT(t, cp, kind); ok {
 			t.Errorf("a machine with no data disk and no cap still emits a %s\n"+
 				"  reason: it must behave exactly as every machine did before either field existed", kind)
 		}
@@ -366,6 +367,95 @@ func TestEphemeralCapRefusesASizeTalosCannotParse(t *testing.T) {
 				t.Errorf("ephemeralCap(%q) was accepted\n"+
 					"  reason: a cap that does not bound EPHEMERAL leaves the user volume "+
 					"nowhere to grow, and nothing fails to say so", tc.size)
+			}
+		})
+	}
+}
+
+// THE PROPERTY RECONFIGURE IS BUILT ON, and the one whose failure cannot be
+// undone on hardware: regenerating a config for a node that already exists must
+// keep the PKI that node was installed with. A fresh bundle is five new
+// certificate authorities and a new machine token — the node rejects the config
+// as signed by a CA it does not trust, and the talosconfig generated beside it
+// cannot authenticate to the node it is for. An installed node never serves the
+// maintenance API again, so there is no way back.
+func TestGenerateConfigReusesAnExistingSecretsBundle(t *testing.T) {
+	first := mustGenerateDefault(t)
+
+	in := testInput()
+	in.SecretsBundle = first.Secrets
+	// Something has to CHANGE, or this passes against a function that ignores
+	// its input entirely.
+	in.Registries = []RegistryMirror{{Host: "reg.lan:5000", Endpoint: "http://reg.lan:5000"}}
+
+	second := mustGenerate(t, in)
+
+	if !bytes.Equal(first.Secrets, second.Secrets) {
+		t.Error("regenerating with an existing bundle minted a new one\n" +
+			"  reason: new CAs mean the node rejects the config and the talosconfig cannot " +
+			"reach it — unrecoverable on hardware")
+	}
+
+	// NOT byte equality: the client certificate is MINTED at generation time,
+	// so a second run issues a different one with a different key and validity
+	// window. That is fine — what has to hold is that it is signed by the CA
+	// the node already trusts, which is the CA itself being unchanged.
+	//
+	// (Reconfigure never writes this file anyway; see writeArtifacts there. The
+	// assertion is about the CA, not about the file's fate.)
+	if a, b := talosconfigCA(t, first.Talosconfig), talosconfigCA(t, second.Talosconfig); a != b {
+		t.Error("the regenerated talosconfig carries a DIFFERENT CA\n" +
+			"  reason: the node authenticates against the CA it was installed with; a new one " +
+			"locks us out of a machine that never serves the maintenance API again")
+	}
+
+	// And the change asked for actually landed, so the reuse is not simply
+	// returning the first result.
+	if !strings.Contains(v1alpha1Doc(t, second.ControlPlane), "reg.lan:5000") {
+		t.Error("the regenerated config does not contain the new registry mirror")
+	}
+}
+
+// talosconfigCA returns the CA a talosconfig verifies nodes against. It is a
+// public certificate, so unlike the rest of the file it is safe to compare and
+// to fail on.
+func talosconfigCA(t *testing.T, talosconfig []byte) string {
+	t.Helper()
+
+	cfg, err := clientconfig.FromBytes(talosconfig)
+	if err != nil {
+		t.Fatalf("parsing a generated talosconfig: %v", err)
+	}
+
+	ctx, ok := cfg.Contexts[cfg.Context]
+	if !ok {
+		t.Fatalf("the talosconfig has no context named %q", cfg.Context)
+	}
+
+	return ctx.CA
+}
+
+// A secrets bundle that parses as YAML but is not a bundle would otherwise be
+// noticed as a nil dereference inside machinery.
+func TestGenerateConfigRefusesAnUnusableSecretsBundle(t *testing.T) {
+	for _, tc := range []struct{ name, bundle string }{
+		{"not yaml at all", "\tnot: [a bundle"},
+		{"valid yaml, wrong document", "hello: world\n"},
+		{"an empty document", "{}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := testInput()
+			in.SecretsBundle = []byte(tc.bundle)
+
+			_, err := GenerateConfig(in)
+			if err == nil {
+				t.Fatal("GenerateConfig accepted a secrets bundle it cannot have generated from")
+			}
+
+			// Same rule as every other secret parse: the message must not
+			// quote the document, because the document is private keys.
+			if strings.Contains(err.Error(), tc.bundle) {
+				t.Errorf("the refusal quotes the bundle it was given: %v", err)
 			}
 		})
 	}
@@ -578,7 +668,7 @@ func TestGenerateConfigRefusesAnEmptyAPIAddress(t *testing.T) {
 func TestGenerateConfigCreatesUserVolumeOnTheDataDisk(t *testing.T) {
 	cp := mustGenerateDefault(t).ControlPlane
 
-	vol, ok := docOfKind(t, cp, "UserVolumeConfig")
+	vol, ok := docOfKindT(t, cp, "UserVolumeConfig")
 	if !ok {
 		t.Fatalf("no UserVolumeConfig document\n"+
 			"  reason: PVCs would land on EPHEMERAL beside etcd, where a runaway PVC wedges the only control-plane node\n%s", redact(string(cp)))
@@ -621,7 +711,7 @@ func TestGenerateConfigOmitsUserVolumeWithoutDataDisk(t *testing.T) {
 
 	cp := mustGenerate(t, in).ControlPlane
 
-	if _, ok := docOfKind(t, cp, "UserVolumeConfig"); ok {
+	if _, ok := docOfKindT(t, cp, "UserVolumeConfig"); ok {
 		t.Errorf("user volume emitted with no data disk\n"+
 			"  reason: the volume would wait forever for a disk that was never attached, and the node never reaches ready\n%s", redact(string(cp)))
 	}
