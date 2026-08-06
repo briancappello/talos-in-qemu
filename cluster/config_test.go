@@ -84,13 +84,13 @@ func redactErr(err error) string {
 // matches no disk at all.
 func testInput() ConfigInput {
 	return ConfigInput{
-		ClusterName:      "probe",
-		Endpoint:         "https://127.0.0.1:6443",
-		APIAddress:       "127.0.0.1",
-		TalosVersion:     "v1.13.7",
-		ConsoleArg:       "console=ttyS0",
-		SystemDiskSerial: "talos-system",
-		DataDiskSerial:   "talos-data",
+		ClusterName:    "probe",
+		Endpoint:       "https://127.0.0.1:6443",
+		APIAddress:     "127.0.0.1",
+		TalosVersion:   "v1.13.7",
+		ConsoleArg:     "console=ttyS0",
+		SystemDisk:     DiskRef{Serial: "talos-system"},
+		DataDiskSerial: "talos-data",
 	}
 }
 
@@ -226,7 +226,7 @@ func TestGenerateConfigInstallsToTheSystemDiskBySerial(t *testing.T) {
 // two halves drift the moment main.go renames one — and the failure is silent.
 func TestGenerateConfigUsesTheCallersSerials(t *testing.T) {
 	in := testInput()
-	in.SystemDiskSerial = "sys-9000"
+	in.SystemDisk = DiskRef{Serial: "sys-9000"}
 	in.DataDiskSerial = "data-9000"
 
 	cp := mustGenerate(t, in).ControlPlane
@@ -240,6 +240,134 @@ func TestGenerateConfigUsesTheCallersSerials(t *testing.T) {
 	if !ok || !strings.Contains(vol, `disk.serial == "data-9000"`) {
 		t.Errorf("user volume does not select data-9000\n"+
 			"  reason: same drift, other half — the volume would match no disk and never appear\n%s", redact(vol))
+	}
+}
+
+// installSelectorWWID is installSelector's other half. Two regexps rather than
+// one with an alternation, because the pairing is the whole point: a test that
+// accepted `serial:` OR `wwid:` would pass on a config that selects by the
+// field the caller did NOT ask for.
+var installSelectorWWID = regexp.MustCompile(`(?m)^ {8}diskSelector:\n {12}wwid: (.+)$`)
+
+// THE DISK THIS WHOLE PATH EXISTS FOR: a USB bridge that reports no serial, so
+// the only identity it has is a WWID — including the runs of spaces a real one
+// contains.
+func TestGenerateConfigInstallsByWWIDWhenThatIsTheIdentityGiven(t *testing.T) {
+	const wwid = "t10.SSK     PCIe581         DD0000000000000C"
+
+	in := testInput()
+	in.SystemDisk = DiskRef{WWID: wwid}
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	m := installSelectorWWID.FindStringSubmatch(doc)
+	if m == nil {
+		t.Fatalf("install has no diskSelector.wwid\n"+
+			"  reason: a disk with no serial cannot be named any other way, and a selector "+
+			"matching nothing installs nowhere while Talos reports a hang\n%s", redact(doc))
+	}
+
+	// The encoder may quote it — it contains spaces — but the VALUE has to
+	// survive intact either way.
+	if got := strings.Trim(m[1], `"'`); got != wwid {
+		t.Errorf("install selects wwid %q, want %q\n"+
+			"  reason: collapsed or truncated, it names no disk on the node", got, wwid)
+	}
+
+	// The two fields are ALTERNATIVES: machinery ANDs every non-empty field of
+	// an InstallDiskSelector, so an emitted `serial:` beside the wwid would
+	// demand one disk reporting both and match nothing.
+	if installSelector.MatchString(doc) {
+		t.Error("install emits a serial selector beside the wwid\n" +
+			"  reason: machinery ANDs the fields, so both together match no disk at all")
+	}
+}
+
+// SINGLE-DISK LAYOUT. EPHEMERAL is capped so there is free space at all, and
+// the user volume takes the rest of the same disk. Both halves or neither: a
+// cap with no user volume wastes the space, and a user volume with no cap has
+// nowhere to go because EPHEMERAL grew to fill the disk.
+func TestGenerateConfigCarvesTheSystemDiskWhenEphemeralIsCapped(t *testing.T) {
+	in := testInput()
+	in.DataDiskSerial = ""
+	in.EphemeralMaxSize = "120GB"
+
+	cp := mustGenerate(t, in).ControlPlane
+
+	eph, ok := docOfKind(t, cp, "VolumeConfig")
+	if !ok {
+		t.Fatalf("no VolumeConfig document\n"+
+			"  reason: uncapped, EPHEMERAL grows to the size of the disk and the user "+
+			"volume below has no free space to claim\n%s", redact(string(cp)))
+	}
+
+	for _, want := range []string{"name: EPHEMERAL", "maxSize: 120GB", "match: system_disk"} {
+		if !strings.Contains(eph, want) {
+			t.Errorf("the EPHEMERAL cap does not contain %q:\n%s", want, redact(eph))
+		}
+	}
+
+	vol, ok := docOfKind(t, cp, "UserVolumeConfig")
+	if !ok {
+		t.Fatalf("no UserVolumeConfig beside the EPHEMERAL cap\n" +
+			"  reason: the cap alone frees space nothing then uses, and step 10 would " +
+			"install a StorageClass provisioning into a mount point that does not exist")
+	}
+
+	if !strings.Contains(vol, "match: system_disk") {
+		t.Errorf("the user volume does not select the system disk:\n%s\n"+
+			"  reason: the install target may have been named by WWID, and re-deriving that "+
+			"identity here is how the two drift apart", redact(vol))
+	}
+
+	if !strings.Contains(vol, "grow: true") {
+		t.Errorf("the user volume does not grow:\n%s\n"+
+			"  reason: without it the volume takes minSize and the space the cap freed is wasted", redact(vol))
+	}
+}
+
+// The two routes to a user volume are alternatives, and the DEDICATED DISK one
+// must not start capping EPHEMERAL as a side effect — that would repartition
+// the system disk of every machine that already has a data disk.
+func TestGenerateConfigLeavesEphemeralAloneWithADedicatedDataDisk(t *testing.T) {
+	cp := mustGenerateDefault(t).ControlPlane
+
+	if _, ok := docOfKind(t, cp, "VolumeConfig"); ok {
+		t.Error("a machine with a dedicated data disk still caps EPHEMERAL\n" +
+			"  reason: nothing needs the space, and a cap is set at install time and " +
+			"cannot be undone without a wipe")
+	}
+}
+
+func TestGenerateConfigEmitsNoVolumeDocumentsWithNeither(t *testing.T) {
+	in := testInput()
+	in.DataDiskSerial = ""
+
+	cp := mustGenerate(t, in).ControlPlane
+
+	for _, kind := range []string{"VolumeConfig", "UserVolumeConfig"} {
+		if _, ok := docOfKind(t, cp, kind); ok {
+			t.Errorf("a machine with no data disk and no cap still emits a %s\n"+
+				"  reason: it must behave exactly as every machine did before either field existed", kind)
+		}
+	}
+}
+
+func TestEphemeralCapRefusesASizeTalosCannotParse(t *testing.T) {
+	for _, tc := range []struct{ name, size string }{
+		{"a bare number with no unit", "120"},
+		{"words", "lots"},
+		// "" reaches ephemeralCap only through a caller that has stopped
+		// gating on non-empty — which would emit a cap that caps nothing.
+		{"the empty string", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ephemeralCap(tc.size); err == nil {
+				t.Errorf("ephemeralCap(%q) was accepted\n"+
+					"  reason: a cap that does not bound EPHEMERAL leaves the user volume "+
+					"nowhere to grow, and nothing fails to say so", tc.size)
+			}
+		})
 	}
 }
 

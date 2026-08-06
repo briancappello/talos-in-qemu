@@ -14,7 +14,12 @@ import (
 func testDisks() []Disk {
 	return []Disk{
 		{ID: "sda", Serial: "S1", Model: "Samsung SSD", Size: "500 GB", Transport: "sata"},
-		{ID: "sdb", Serial: "", Model: "SanDisk Cruzer", Size: "32 GB", Transport: "usb", Readonly: true},
+		// NO SERIAL, ONLY A WWID, and the WWID has RUNS OF SPACES in it —
+		// copied from a real USB-to-NVMe bridge, because that is the disk this
+		// whole DiskRef path exists for and a tidy fixture would not pin the
+		// quoting that makes it copyable.
+		{ID: "sdb", Serial: "", Model: "SanDisk Cruzer", Size: "32 GB", Transport: "usb", Readonly: true,
+			WWID: "t10.SSK     PCIe581         DD0000000000000C"},
 	}
 }
 
@@ -138,7 +143,7 @@ func TestToDisksOnANodeWithNoDisks(t *testing.T) {
 }
 
 func TestRequireDiskRefusesAnEmptySerialAndShowsTheTable(t *testing.T) {
-	err := RequireDisk(testDisks(), "", "install target")
+	err := RequireDisk(testDisks(), DiskRef{}, "install target")
 	if err == nil {
 		t.Fatal("RequireDisk accepted an empty serial\n" +
 			"  reason: nothing may install until a human has chosen a disk")
@@ -154,7 +159,7 @@ func TestRequireDiskRefusesAnEmptySerialAndShowsTheTable(t *testing.T) {
 }
 
 func TestRequireDiskRefusesAnUnmatchedSerialAsATypo(t *testing.T) {
-	err := RequireDisk(testDisks(), "S9", "install target")
+	err := RequireDisk(testDisks(), DiskRef{Serial: "S9"}, "install target")
 	if err == nil {
 		t.Fatal("RequireDisk accepted a serial matching no disk\n" +
 			"  reason: this is the realistic failure — a typo installs nowhere, and " +
@@ -167,8 +172,69 @@ func TestRequireDiskRefusesAnUnmatchedSerialAsATypo(t *testing.T) {
 }
 
 func TestRequireDiskAcceptsAMatch(t *testing.T) {
-	if err := RequireDisk(testDisks(), "S1", "install target"); err != nil {
+	if err := RequireDisk(testDisks(), DiskRef{Serial: "S1"}, "install target"); err != nil {
 		t.Fatalf("RequireDisk rejected a serial that matches: %s", err)
+	}
+}
+
+// THE DISK THIS PATH EXISTS FOR: no serial at all, nameable only by WWID.
+// Before DiskRef this machine could not be adopted, because the only identity
+// RequireDisk would match on was one the disk does not report.
+func TestRequireDiskAcceptsAWWIDWhenTheDiskHasNoSerial(t *testing.T) {
+	const wwid = "t10.SSK     PCIe581         DD0000000000000C"
+
+	if err := RequireDisk(testDisks(), DiskRef{WWID: wwid}, "install target"); err != nil {
+		t.Fatalf("RequireDisk rejected a wwid that matches: %s", err)
+	}
+
+	// The spaces are LOAD-BEARING. A caller that collapsed them selects
+	// nothing, and Talos reports selecting nothing as a hang.
+	collapsed := DiskRef{WWID: "t10.SSK PCIe581 DD0000000000000C"}
+	if err := RequireDisk(testDisks(), collapsed, "install target"); err == nil {
+		t.Error("RequireDisk accepted a wwid with its internal spacing collapsed\n" +
+			"  reason: it names no disk on this node, and Talos does not report that as an error")
+	}
+}
+
+// Both fields set is not "try one, then the other": machinery ANDs every
+// non-empty field of an InstallDiskSelector, so a config carrying both demands
+// ONE disk reporting BOTH values and matches nothing.
+func TestRequireDiskRefusesADiskNamedTwice(t *testing.T) {
+	ref := DiskRef{Serial: "S1", WWID: "t10.SSK     PCIe581         DD0000000000000C"}
+
+	err := RequireDisk(testDisks(), ref, "install target")
+	if err == nil {
+		t.Fatal("RequireDisk accepted a ref naming a disk by serial AND wwid")
+	}
+
+	if !strings.Contains(err.Error(), "named twice") {
+		t.Errorf("the refusal does not say the disk is named twice:\n%s", err)
+	}
+}
+
+// The empty-ref refusal is the FIRST RUN's remedy, and on a machine whose disks
+// report no serials a table offering only serials is a dead end.
+func TestRequireDiskOffersTheWWIDColumnWhenNothingIsGiven(t *testing.T) {
+	err := RequireDisk(testDisks(), DiskRef{}, "install target")
+	if err == nil {
+		t.Fatal("RequireDisk accepted an empty ref")
+	}
+
+	if !strings.Contains(err.Error(), "wwid") {
+		t.Errorf("the refusal never mentions the wwid alternative:\n%s\n"+
+			"  reason: a disk whose SERIAL reads (none) cannot be named any other way", err)
+	}
+}
+
+// A WWID is the one value in the table that can contain runs of spaces, so the
+// table has to show where it starts and stops.
+func TestFormatDisksQuotesTheWWID(t *testing.T) {
+	got := FormatDisks(testDisks())
+
+	if !strings.Contains(got, `wwid "t10.SSK     PCIe581         DD0000000000000C"`) {
+		t.Errorf("FormatDisks does not quote the wwid:\n%s\n"+
+			"  reason: unquoted, nothing distinguishes the value's own spaces from the "+
+			"table's padding", got)
 	}
 }
 
@@ -177,14 +243,15 @@ func TestRequireDiskAcceptsAMatch(t *testing.T) {
 // a serial out of the table — which here is a header over nothing.
 func TestRequireDiskSaysWhenTheNodeHasNoDisksAtAll(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		serial string
+		name string
+		ref  DiskRef
 	}{
-		{"with no serial given", ""},
-		{"with a serial that cannot possibly match", "S1"},
+		{"with nothing given", DiskRef{}},
+		{"with a serial that cannot possibly match", DiskRef{Serial: "S1"}},
+		{"with a wwid that cannot possibly match", DiskRef{WWID: "naa.1"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := RequireDisk(nil, tc.serial, "install target")
+			err := RequireDisk(nil, tc.ref, "install target")
 			if err == nil {
 				t.Fatal("RequireDisk accepted a node with no disks")
 			}
@@ -225,7 +292,7 @@ func TestFormatDisksNotesEveryDistinguishingFact(t *testing.T) {
 		{
 			name:    "no serial, but a wwid to name it by",
 			disk:    Disk{ID: "vda", WWID: "naa.5000c500a1b2c3d4"},
-			want:    []string{"(none)", "no serial; wwid naa.5000c500a1b2c3d4"},
+			want:    []string{"(none)", `no serial; wwid "naa.5000c500a1b2c3d4"`},
 			notWant: []string{"readonly", "cdrom", "rotational"},
 		},
 		{

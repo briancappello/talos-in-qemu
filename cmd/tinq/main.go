@@ -527,12 +527,15 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 	dir := d.dir(m)
 
 	return cluster.UpOptions{
-		ClusterName:      m.GetName(),
-		StateDir:         dir,
-		TalosEndpoint:    talosEndpoint(m),
-		KubeEndpoint:     kubeEndpoint(m),
-		SystemDiskSerial: DiskSerialSystem,
-		DataDiskSerial:   dataDiskSerial(spec),
+		ClusterName:   m.GetName(),
+		StateDir:      dir,
+		TalosEndpoint: talosEndpoint(m),
+		KubeEndpoint:  kubeEndpoint(m),
+		// A SERIAL, ALWAYS, on this path: main.go sets `serial=` on the QEMU
+		// devices itself, so a guest's disks are named by construction and the
+		// WWID alternative a DiskRef also carries has nothing to describe here.
+		SystemDisk:     cluster.DiskRef{Serial: DiskSerialSystem},
+		DataDiskSerial: dataDiskSerial(spec),
 
 		TalosVersion:  platform.InspectImageVersion(image),
 		VersionSource: fmt.Sprintf("%s (ISO volume id)", filepath.Base(image)),

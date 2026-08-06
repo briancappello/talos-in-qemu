@@ -1018,7 +1018,7 @@ func TestAgainstARealNode(t *testing.T) {
 			"disk": spec,
 			// What the node itself would set, emulated from the same serial the
 			// install selector uses.
-			"system_disk": d.TypedSpec().Serial == in.SystemDiskSerial,
+			"system_disk": d.TypedSpec().Serial == in.SystemDisk.Serial,
 		})
 		if err != nil {
 			t.Fatalf("evaluating the fallback against %s: %s", d.Metadata().ID(), redactErr(err))

@@ -415,13 +415,41 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		return err
 	}
 
+	systemDisk := cluster.DiskRef{
+		Serial: str(spec["systemDiskSerial"], ""),
+		WWID:   str(spec["systemDiskWWID"], ""),
+	}
+	dataSerial := str(spec["dataDiskSerial"], "")
+	ephemeralMaxSize := str(spec["ephemeralMaxSize"], "")
+
+	// STILL ABOVE MkdirAll, with the endpoint and network refusals, because
+	// both of these are provable from the FILE. A refusal that has already
+	// carved out a state directory leaves residue named after a typo, and
+	// TestAdoptRefusesAnEndpointCarryingAPort pins that property for the
+	// refusals that came before these.
+	if err := systemDisk.Validate("install target"); err != nil {
+		return err
+	}
+
+	// TWO ANSWERS TO ONE QUESTION. A data disk puts PVCs on a disk of their
+	// own; an EPHEMERAL cap puts them on a slice of the system disk. Silently
+	// preferring one would install a layout the operator did not ask for onto
+	// a disk they cannot un-overwrite.
+	if dataSerial != "" && ephemeralMaxSize != "" {
+		return fmt.Errorf("spec.baremetal names TWO places for PVCs to live: dataDiskSerial %q and "+
+			"ephemeralMaxSize %q\n\n"+
+			"  dataDiskSerial gives PVCs a disk of their own — separate device, separate I/O,\n"+
+			"  and it survives the system disk dying.\n\n"+
+			"  ephemeralMaxSize carves the SYSTEM disk in two instead. Use it only when there\n"+
+			"  is no second disk to give.\n\n"+
+			"  delete whichever one you did not mean", dataSerial, ephemeralMaxSize)
+	}
+
 	dir := d.dir(m)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("state dir: %w", err)
 	}
 
-	systemSerial := str(spec["systemDiskSerial"], "")
-	dataSerial := str(spec["dataDiskSerial"], "")
 	installed := baremetalInstalledEndpoint(m)
 
 	// A CREDENTIAL, NOT A STATUS — literally the same read Up makes, which is
@@ -469,7 +497,7 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 			return err
 		}
 
-		if err := cluster.RequireDisk(disks, systemSerial, "install target"); err != nil {
+		if err := cluster.RequireDisk(disks, systemDisk, "install target"); err != nil {
 			return err
 		}
 
@@ -477,7 +505,7 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		// choice and step 10 announces what it costs; an absent one that was
 		// MEANT to be present is a typo, which the same check catches.
 		if dataSerial != "" {
-			if err := cluster.RequireDisk(disks, dataSerial, "data disk"); err != nil {
+			if err := cluster.RequireDisk(disks, cluster.DiskRef{Serial: dataSerial}, "data disk"); err != nil {
 				return err
 			}
 		}
@@ -514,8 +542,9 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		StateDir:         dir,
 		TalosEndpoint:    endpoint,
 		KubeEndpoint:     baremetalKubeEndpoint(m),
-		SystemDiskSerial: systemSerial,
+		SystemDisk:       systemDisk,
 		DataDiskSerial:   dataSerial,
+		EphemeralMaxSize: ephemeralMaxSize,
 		TalosVersion:     version,
 		VersionSource:    source,
 		Substrate:        fmt.Sprintf("baremetal, %s", str(spec["maintenanceEndpoint"], "")),

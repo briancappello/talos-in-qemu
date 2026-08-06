@@ -792,10 +792,10 @@ func TestUpOptions(t *testing.T) {
 	if opts.KubeEndpoint != "https://127.0.0.1:6443" {
 		t.Errorf("KubeEndpoint = %q, want https://127.0.0.1:6443", opts.KubeEndpoint)
 	}
-	if opts.SystemDiskSerial != DiskSerialSystem || opts.DataDiskSerial != DiskSerialData {
-		t.Errorf("serials = %q/%q, want %q/%q\n"+
+	if opts.SystemDisk != (cluster.DiskRef{Serial: DiskSerialSystem}) || opts.DataDiskSerial != DiskSerialData {
+		t.Errorf("disks = %v/%q, want serial %q/%q\n"+
 			"  reason: swapped, the install target and the PVC volume trade places and the OS lands on the data disk",
-			opts.SystemDiskSerial, opts.DataDiskSerial, DiskSerialSystem, DiskSerialData)
+			opts.SystemDisk, opts.DataDiskSerial, DiskSerialSystem, DiskSerialData)
 	}
 	if opts.ClusterName != "cp0" {
 		t.Errorf("ClusterName = %q, want the machine's name cp0", opts.ClusterName)

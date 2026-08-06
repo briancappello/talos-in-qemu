@@ -152,13 +152,35 @@ spec:
                       description: >-
                         Serial of the install target. Omit on the first run and `adopt`
                         prints the node's disks and refuses — a size matcher is a coin
-                        flip, and losing it overwrites a disk that may hold data.
+                        flip, and losing it overwrites a disk that may hold data. Use
+                        systemDiskWWID instead for a disk whose SERIAL column reads
+                        (none); setting both is refused.
+                    systemDiskWWID:
+                      type: string
+                      description: >-
+                        WWID of the install target, for a disk that reports NO SERIAL —
+                        USB bridges commonly do not. It is the value `adopt` prints in
+                        that disk's NOTES column, quoted because a real one contains runs
+                        of spaces that are part of the value. Alternative to
+                        systemDiskSerial, never a companion: Talos ANDs the two, so both
+                        together select no disk at all.
                     dataDiskSerial:
                       type: string
                       description: >-
-                        Serial of the PVC disk. Absent means no user volume AND no
-                        StorageClass; one field gates both halves so they cannot
-                        disagree.
+                        Serial of a SEPARATE disk for PVCs. Absent means no user volume
+                        AND no StorageClass unless ephemeralMaxSize is set; the two are
+                        alternatives and setting both is refused.
+                    ephemeralMaxSize:
+                      type: string
+                      description: >-
+                        Cap Talos's EPHEMERAL volume so the user volume can take the rest
+                        of the SYSTEM disk — the single-disk alternative to dataDiskSerial.
+                        Needs a unit: 120GB, 100GiB or 60%; a bare number means BYTES.
+                        EPHEMERAL is /var, so this is the partition etcd, container images
+                        and kubelet state share. It buys ONE property a second disk buys —
+                        a runaway PVC cannot ENOSPC etcd — and not the other two, because
+                        it is the same device. FIXED AT INSTALL: changing it later means a
+                        wipe and a reinstall.
                     consoleArg:
                       type: string
                       description: >-

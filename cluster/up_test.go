@@ -213,16 +213,16 @@ func newFixture(t *testing.T) *upFixture {
 	}
 
 	f.opts = UpOptions{
-		ClusterName:      "probe",
-		StateDir:         f.dir,
-		TalosEndpoint:    "127.0.0.1:50000",
-		KubeEndpoint:     "https://127.0.0.1:6443",
-		SystemDiskSerial: "talos-system",
-		DataDiskSerial:   "talos-data",
-		TalosVersion:     imageTalosVersion,
-		VersionSource:    fakeVersionSource,
-		Substrate:        fakeSubstrate,
-		ConsoleArg:       fakeConsoleArg,
+		ClusterName:    "probe",
+		StateDir:       f.dir,
+		TalosEndpoint:  "127.0.0.1:50000",
+		KubeEndpoint:   "https://127.0.0.1:6443",
+		SystemDisk:     DiskRef{Serial: "talos-system"},
+		DataDiskSerial: "talos-data",
+		TalosVersion:   imageTalosVersion,
+		VersionSource:  fakeVersionSource,
+		Substrate:      fakeSubstrate,
+		ConsoleArg:     fakeConsoleArg,
 		Boot: func() (int, error) {
 			f.booted++
 
@@ -460,7 +460,7 @@ func TestUpAnnouncesStorageWasSkippedWithoutADataDisk(t *testing.T) {
 
 	wants(t, transcript,
 		"[10/10] storage",
-		"skipped (spec.dataDisk not set)",
+		"skipped (no dataDisk and no ephemeralMaxSize)",
 	)
 
 	if f.rec.did("installStorage") {
@@ -493,7 +493,7 @@ func TestUpAnnouncesTheReasonForEveryNonObviousDecision(t *testing.T) {
 	}{
 		{
 			"diskSelector by serial",
-			[]string{"diskSelector: serial talos-system", "coin flip"},
+			[]string{`diskSelector: serial "talos-system"`, "coin flip"},
 			"a size matcher picks between the OS target and the data disk once both are large",
 		},
 		{
@@ -542,9 +542,9 @@ func TestUpCarriesTheCallersNodeFactsIntoTheConfig(t *testing.T) {
 			f.rec.input.ConsoleArg)
 	}
 
-	if f.rec.input.SystemDiskSerial != "talos-system" || f.rec.input.DataDiskSerial != "talos-data" {
-		t.Errorf("GenerateConfig got serials %q/%q, want the caller's talos-system/talos-data",
-			f.rec.input.SystemDiskSerial, f.rec.input.DataDiskSerial)
+	if f.rec.input.SystemDisk != (DiskRef{Serial: "talos-system"}) || f.rec.input.DataDiskSerial != "talos-data" {
+		t.Errorf("GenerateConfig got disks %v/%q, want the caller's talos-system/talos-data",
+			f.rec.input.SystemDisk, f.rec.input.DataDiskSerial)
 	}
 
 	if f.rec.input.TalosVersion != imageTalosVersion {
@@ -903,13 +903,13 @@ func TestUpDefaultsToStdoutAndTheRealOperations(t *testing.T) {
 		ClusterName: "probe",
 		StateDir:    t.TempDir(),
 		// Nothing is listening here and nothing needs to be.
-		TalosEndpoint:    "127.0.0.1:1",
-		KubeEndpoint:     "https://127.0.0.1:6443",
-		SystemDiskSerial: "talos-system",
-		TalosVersion:     imageTalosVersion,
-		VersionSource:    fakeVersionSource,
-		Substrate:        fakeSubstrate,
-		ConsoleArg:       fakeConsoleArg,
+		TalosEndpoint: "127.0.0.1:1",
+		KubeEndpoint:  "https://127.0.0.1:6443",
+		SystemDisk:    DiskRef{Serial: "talos-system"},
+		TalosVersion:  imageTalosVersion,
+		VersionSource: fakeVersionSource,
+		Substrate:     fakeSubstrate,
+		ConsoleArg:    fakeConsoleArg,
 		Boot: func() (int, error) {
 			booted = true
 

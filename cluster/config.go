@@ -13,6 +13,11 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/cel/celenv"
 	"github.com/siderolabs/talos/pkg/machinery/compatibility"
 	"github.com/siderolabs/talos/pkg/machinery/config"
+	// The DOCUMENT interface lives in machinery's inner config/config package,
+	// not the outer one already imported above as `config`. Aliased rather than
+	// renaming that import, which is used for ParseContractFromVersion and has
+	// nothing to do with documents.
+	coreconfig "github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
@@ -95,11 +100,39 @@ type ConfigInput struct {
 	// console. The CALLER decides which case it is in; this package cannot
 	// know, and no longer has a way to ask.
 	ConsoleArg string
-	// SystemDiskSerial is the serial of the install target.
-	SystemDiskSerial string
+	// SystemDisk names the install target, by serial or by WWID.
+	//
+	// A DiskRef where DataDiskSerial below is a bare string, and the asymmetry
+	// is the actual capability rather than an oversight: the install target is
+	// the one disk a caller may be UNABLE to name by serial, because a USB
+	// bridge often reports none and refusing that would refuse the machine. A
+	// data disk is chosen from what is left, and every path that has one today
+	// picks a disk with a serial.
+	SystemDisk DiskRef
 	// DataDiskSerial is the serial of the PVC disk. Empty means there is no
-	// data disk, and then no user volume is emitted at all.
+	// SEPARATE data disk — see EphemeralMaxSize for the other way to get a
+	// user volume, and note that with neither, no user volume is emitted.
 	DataDiskSerial string
+	// EphemeralMaxSize caps Talos's EPHEMERAL volume so the user volume can
+	// have the REST OF THE SAME DISK. Empty means EPHEMERAL is left alone.
+	//
+	// It exists for a single-disk machine. EPHEMERAL is where /var lives —
+	// etcd, container images, kubelet state — and machinery documents that a
+	// volume with no maxSize "can grow to the size of the disk", so by default
+	// it takes everything and there is no free space a user volume could be
+	// cut from. Capping it is what creates that space.
+	//
+	// WHAT IT BUYS IS ONE PROPERTY, and it is worth being exact because the
+	// two-disk case buys three: a PVC that runs away hits the user volume's
+	// partition boundary instead of filling /var and taking etcd down with it.
+	// It does NOT isolate I/O and it does NOT survive the disk dying, because
+	// it is the same disk. Anyone reaching for this on a machine that HAS a
+	// second disk should use the second disk.
+	//
+	// SET AT INSTALL TIME AND ONLY THEN. Partition sizes are not renegotiated
+	// on a running node, so a value that turns out wrong costs a wipe and a
+	// reinstall — which is why it is an explicit field and not a default.
+	EphemeralMaxSize string
 	// DisableKexec asks the node not to kexec when it reboots, via
 	// kernel.kexec_load_disabled. It exists for ONE host platform — QEMU on
 	// macOS, where the kexec path dies in the guest on arm64 — and the caller
@@ -142,6 +175,12 @@ type Generated struct {
 // filesystem is read-only, so the manifest's stock /opt path cannot work; the
 // two must agree, and this constant is the agreement.
 const userVolumeName = "local-path-provisioner"
+
+// ephemeralFloor is the smallest EPHEMERAL cap ephemeralCap will accept, and it
+// is a TYPO DETECTOR rather than a recommendation — a real one wants tens of
+// gigabytes. 1 GiB is simply below anything a working node could use, so
+// refusing under it cannot refuse a deliberate choice.
+const ephemeralFloor = 1 << 30
 
 // errUnknownTalosVersion is the refusal for an image whose Talos version could
 // not be determined.
@@ -270,14 +309,13 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 		return nil, fmt.Errorf("generating control plane config: %w", err)
 	}
 
-	// The install disk is selected by SERIAL, and there is no generate.Option
-	// that reaches the selector — WithInstallDisk takes a device path, which is
-	// exactly the identity we are avoiding. PatchV1Alpha1 is machinery's own
-	// supported way in, and it preserves the other documents.
+	// The install disk is selected by a STABLE IDENTITY — serial or WWID — and
+	// there is no generate.Option that reaches the selector: WithInstallDisk
+	// takes a device path, which is exactly the identity we are avoiding.
+	// PatchV1Alpha1 is machinery's own supported way in, and it preserves the
+	// other documents.
 	cfg, err = cfg.PatchV1Alpha1(func(c *v1alpha1.Config) error {
-		c.MachineConfig.MachineInstall.InstallDiskSelector = &v1alpha1.InstallDiskSelector{
-			Serial: in.SystemDiskSerial,
-		}
+		c.MachineConfig.MachineInstall.InstallDiskSelector = installDiskSelector(in.SystemDisk)
 
 		// GATED ON A CONSOLE ARG ACTUALLY BEING PASSED. A 1.12+ contract turns
 		// grubUseUKICmdline ON, which makes GRUB take its cmdline from the
@@ -331,20 +369,20 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 		return nil, fmt.Errorf("patching the install section: %w", err)
 	}
 
-	if in.DataDiskSerial != "" {
-		volume, err := userVolume(in.DataDiskSerial)
+	// The two ways to get a user volume, and they are MUTUALLY EXCLUSIVE by the
+	// caller's construction — a separate data disk, or a slice of the system
+	// disk. Both land here as documents of their own rather than v1alpha1
+	// patches, so they are appended together or not at all.
+	//
+	// Documents() builds its result with make() on every call (container.go:693),
+	// so appending to it cannot alias the container's own storage and there is
+	// nothing to clone.
+	if docs, err := volumeDocuments(in); err != nil {
+		return nil, err
+	} else if len(docs) > 0 {
+		cfg, err = container.New(append(cfg.Documents(), docs...)...)
 		if err != nil {
-			return nil, err
-		}
-
-		// A UserVolumeConfig is a document of its own, not part of v1alpha1, so
-		// it is appended to the container rather than patched in.
-		// Documents() builds its result with make() on every call
-		// (container.go:693), so appending to it cannot alias the container's
-		// own storage and there is nothing to clone.
-		cfg, err = container.New(append(cfg.Documents(), volume)...)
-		if err != nil {
-			return nil, fmt.Errorf("adding the user volume: %w", err)
+			return nil, fmt.Errorf("adding the volume documents: %w", err)
 		}
 	}
 
@@ -495,17 +533,132 @@ func registriesConfig(mirrors []RegistryMirror) v1alpha1.RegistriesConfig {
 	return out
 }
 
-// userVolume describes the PVC volume on the data disk.
+// installDiskSelector turns a DiskRef into machinery's install selector.
 //
-// It is a partition rather than a whole-disk volume, and it grows to fill the
-// disk: the disk is dedicated, but a partitioned volume is the path Talos's own
-// storage guide documents, and `grow` makes the distinction moot in practice.
-func userVolume(serial string) (*block.UserVolumeConfigV1Alpha1, error) {
-	// Selected by serial for the same reason the install disk is. `!system_disk`
-	// is not enough: the boot ISO is a virtio-blk device too.
-	match, err := cel.ParseBooleanExpression(fmt.Sprintf("disk.serial == %q", serial), celenv.DiskLocator())
+// The two fields are ALTERNATIVES, not a pair: machinery ANDs every non-empty
+// field of an InstallDiskSelector, so setting both would demand one disk
+// reporting both values and match nothing when the caller meant "either". That
+// is why DiskRef.Validate refuses both, and why this switch never falls through
+// to setting two.
+func installDiskSelector(ref DiskRef) *v1alpha1.InstallDiskSelector {
+	switch {
+	case ref.WWID != "":
+		return &v1alpha1.InstallDiskSelector{WWID: ref.WWID}
+	default:
+		return &v1alpha1.InstallDiskSelector{Serial: ref.Serial}
+	}
+}
+
+// volumeDocuments builds the volume documents this machine needs, in the order
+// Talos should read them: the EPHEMERAL cap before the user volume that depends
+// on the space it frees.
+//
+// NIL IS THE COMMON ANSWER. A machine with no data disk and no EPHEMERAL cap
+// gets no documents at all and behaves exactly as every machine did before
+// either field existed.
+func volumeDocuments(in ConfigInput) ([]coreconfig.Document, error) {
+	switch {
+	// A DEDICATED DATA DISK. The user volume is selected by that disk's serial
+	// for the same reason the install disk is selected by identity.
+	// `!system_disk` is not enough: the boot ISO is a virtio-blk device too.
+	case in.DataDiskSerial != "":
+		volume, err := userVolume(fmt.Sprintf("disk.serial == %q", in.DataDiskSerial))
+		if err != nil {
+			return nil, err
+		}
+
+		return []coreconfig.Document{volume}, nil
+
+	// ONE DISK, CUT IN TWO. EPHEMERAL is capped so there is free space at all,
+	// and the user volume takes what is left of the same disk.
+	//
+	// BOTH SELECT `system_disk`, which is the only expression that stays true
+	// here: the install target may have been named by WWID, and re-deriving
+	// that identity in two more places is how the three drift apart. Talos
+	// already knows which disk it installed to.
+	case in.EphemeralMaxSize != "":
+		ephemeral, err := ephemeralCap(in.EphemeralMaxSize)
+		if err != nil {
+			return nil, err
+		}
+
+		volume, err := userVolume("system_disk")
+		if err != nil {
+			return nil, err
+		}
+
+		return []coreconfig.Document{ephemeral, volume}, nil
+
+	default:
+		return nil, nil
+	}
+}
+
+// ephemeralCap bounds Talos's EPHEMERAL volume, which is what leaves free space
+// on the system disk for anything else.
+//
+// NO `grow`, on purpose. EPHEMERAL grows to fill the disk when nothing stops
+// it, and the whole point here is to stop it; setting maxSize AND grow would be
+// asking for both.
+func ephemeralCap(maxSize string) (*block.VolumeConfigV1Alpha1, error) {
+	// UnmarshalText rather than MustSize: machinery's constructor PANICS on a
+	// bad value, and this one comes from a hand-written manifest. A typo in a
+	// YAML field is a refusal, never a stack trace.
+	var size block.Size
+	if err := size.UnmarshalText([]byte(maxSize)); err != nil {
+		return nil, fmt.Errorf("ephemeralMaxSize %q is not a size Talos accepts (try 120GB, or 60%%): %w", maxSize, err)
+	}
+
+	// "" unmarshals CLEANLY into a zero Size, so a blank string would sail
+	// through above and emit an EPHEMERAL document that caps nothing — leaving
+	// the user volume with no free space to grow into and no error to explain
+	// it. The caller gates on non-empty; this is the assertion that it did.
+	if size.IsZero() {
+		return nil, fmt.Errorf("ephemeralMaxSize %q parses to no size at all, so EPHEMERAL would still "+
+			"take the whole disk and the user volume would have nowhere to go", maxSize)
+	}
+
+	// A UNIT-OMISSION GUARD, and it is the same failure this repo already
+	// documents for `dataDisk: 40`: a bare number is VALID here and means
+	// BYTES, so `ephemeralMaxSize: 120` asks for a 120-byte /var. Nobody means
+	// that, and nothing downstream would say so — the install simply produces a
+	// node that cannot hold a container image.
+	//
+	// The floor is deliberately far below any workable value rather than a
+	// guess at one: this refuses typos, not informed choices. A percentage has
+	// no unit to omit and is exempt.
+	if !size.IsRelative() && size.Value() < ephemeralFloor {
+		return nil, fmt.Errorf("ephemeralMaxSize %q is %d bytes, which cannot hold /var — etcd, "+
+			"container images and kubelet state all live there\n\n"+
+			"  a bare number means BYTES. Did you mean %sGB? Sizes need a unit: 120GB, 100GiB, or 60%%",
+			maxSize, size.Value(), maxSize)
+	}
+
+	match, err := cel.ParseBooleanExpression("system_disk", celenv.DiskLocator())
 	if err != nil {
-		return nil, fmt.Errorf("building a disk selector for serial %q: %w", serial, err)
+		return nil, fmt.Errorf("building the EPHEMERAL disk selector: %w", err)
+	}
+
+	volume := block.NewVolumeConfigV1Alpha1()
+	volume.MetaName = constants.EphemeralPartitionLabel
+	volume.ProvisioningSpec = block.ProvisioningSpec{
+		DiskSelectorSpec:    block.DiskSelector{Match: match},
+		ProvisioningMaxSize: size,
+	}
+
+	return volume, nil
+}
+
+// userVolume describes the PVC volume, on whichever disk `expr` selects.
+//
+// It is a partition rather than a whole-disk volume, and it grows: on a
+// dedicated data disk the disk is its own anyway and a partitioned volume is
+// the path Talos's own storage guide documents; on a shared system disk `grow`
+// is what makes it claim the space the EPHEMERAL cap left behind.
+func userVolume(expr string) (*block.UserVolumeConfigV1Alpha1, error) {
+	match, err := cel.ParseBooleanExpression(expr, celenv.DiskLocator())
+	if err != nil {
+		return nil, fmt.Errorf("building a disk selector from %q: %w", expr, err)
 	}
 
 	volume := block.NewUserVolumeConfigV1Alpha1()

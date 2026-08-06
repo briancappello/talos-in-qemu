@@ -89,13 +89,22 @@ type UpOptions struct {
 	// KubeEndpoint is the same address for kube-apiserver, as a URL: a
 	// forward's host side under QEMU, the node's own address on hardware.
 	KubeEndpoint string
-	// SystemDiskSerial is the install target's serial.
-	SystemDiskSerial string
-	// DataDiskSerial is the PVC disk's serial. Empty means there is no data
-	// disk, and then step 6 emits no user volume AND step 10 installs no
-	// storage — the two halves cannot disagree because they read this one
-	// field.
+	// SystemDisk names the install target, by serial or by WWID.
+	SystemDisk DiskRef
+	// DataDiskSerial is the PVC disk's serial, when PVCs get a disk of their
+	// own. Empty means they do not.
 	DataDiskSerial string
+	// EphemeralMaxSize caps EPHEMERAL so the user volume can take the rest of
+	// the SYSTEM disk — the single-disk alternative to DataDiskSerial above.
+	// See ConfigInput.EphemeralMaxSize for what that does and does not buy.
+	//
+	// It and DataDiskSerial are two answers to "where do PVCs live", so setting
+	// both is refused by the caller that reads them from a manifest, before
+	// anything is dialled.
+	EphemeralMaxSize string
+
+	// (hasUserVolume below is how the two halves of storage stay in agreement;
+	// see its comment.)
 
 	// TalosVersion is the node's Talos version, e.g. "v1.13.7". RESOLVED BY THE
 	// CALLER, and that is what lets one sequence serve two substrates: a QEMU
@@ -149,6 +158,20 @@ type UpOptions struct {
 	// means the real ones. It is UNEXPORTED on purpose: it is a test seam, not
 	// an API, and package main has no business substituting a bring-up.
 	hooks *upHooks
+}
+
+// hasUserVolume reports whether this machine gets a PVC volume at all, by
+// EITHER route: a dedicated data disk, or a slice carved out of the system
+// disk.
+//
+// IT IS ONE METHOD BECAUSE STORAGE HAS TWO HALVES that must never disagree —
+// step 6 emits the user volume, step 10 installs the StorageClass that provisions
+// into it, and a machine with one and not the other has PVCs that hang Pending
+// forever with nothing failing to say so. When there was a single field they
+// simply read it; with two there has to be one place that decides, and this is
+// it. Do not inline the `||`.
+func (o UpOptions) hasUserVolume() bool {
+	return o.DataDiskSerial != "" || o.EphemeralMaxSize != ""
 }
 
 // upHooks is the seam that makes the transcript testable without booting
@@ -487,16 +510,18 @@ func Up(ctx context.Context, opts UpOptions) error {
 	// Re-applying is one round trip; not applying is a cluster that cannot bind
 	// a volume.
 	//
-	// Gated on the SAME field as the user volume in step 6, so the two halves
-	// of storage cannot disagree. The skip is ANNOUNCED because the way a data
-	// disk goes missing is a typo: `dataDisk: 40` omits the unit, decodes as a
-	// number, reads as "not set" and produces no disk and no error. Silence
-	// here means the first sign of it is a Pending PVC an hour later.
-	if opts.DataDiskSerial == "" {
-		p.step("storage", "skipped (spec.dataDisk not set)")
-		p.detail("no data disk means no user volume and no StorageClass, so a PVC with no")
-		p.detail("storageClassName stays Pending forever. If you meant to have one, check")
-		p.detail("the unit: `dataDisk: 40` is not a size and reads as unset, `dataDisk: 40Gi` is.")
+	// Gated on the SAME predicate as the user volume in step 6, so the two
+	// halves of storage cannot disagree. The skip is ANNOUNCED because the way
+	// a data disk goes missing is a typo: `dataDisk: 40` omits the unit,
+	// decodes as a number, reads as "not set" and produces no disk and no
+	// error. Silence here means the first sign of it is a Pending PVC an hour
+	// later.
+	if !opts.hasUserVolume() {
+		p.step("storage", "skipped (no dataDisk and no ephemeralMaxSize)")
+		p.detail("neither a data disk nor an EPHEMERAL cap means no user volume and no")
+		p.detail("StorageClass, so a PVC with no storageClassName stays Pending forever.")
+		p.detail("If you meant to have one, check the unit: `dataDisk: 40` is not a size and")
+		p.detail("reads as unset, `dataDisk: 40Gi` is.")
 	} else {
 		if err := hooks.installStorage(ctx, kubeconfig); err != nil {
 			return fail(err)
@@ -508,7 +533,7 @@ func Up(ctx context.Context, opts UpOptions) error {
 		p.detail("namespace local-path-storage labelled privileged")
 	}
 
-	p.summary(opts.StateDir, opts.DataDiskSerial != "")
+	p.summary(opts.StateDir, opts.hasUserVolume())
 
 	return nil
 }
@@ -529,8 +554,9 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 		APIAddress:       installedAddr,
 		TalosVersion:     opts.TalosVersion,
 		ConsoleArg:       opts.ConsoleArg,
-		SystemDiskSerial: opts.SystemDiskSerial,
+		SystemDisk:       opts.SystemDisk,
 		DataDiskSerial:   opts.DataDiskSerial,
+		EphemeralMaxSize: opts.EphemeralMaxSize,
 		// WHETHER kexec is disabled is the CALLER's decision, and the reason
 		// is that it is a fact about the host rather than about the node: the
 		// one substrate it applies to is QEMU on macOS/arm64. See
@@ -562,7 +588,11 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 	}
 
 	p.step("config", "wrote controlplane.yaml, talosconfig, secrets.yaml")
-	p.detail("diskSelector: serial %s", opts.SystemDiskSerial)
+	// DiskRef.String() names WHICH identity, because on a machine whose install
+	// target has no serial this line printed "serial " and nothing else — a
+	// transcript claiming the selector is a blank serial, on the one run where
+	// the reader most wants to check what is about to be overwritten.
+	p.detail("diskSelector: %s", opts.SystemDisk)
 	p.detail("  a size matcher is a coin flip once there are two large disks, and losing")
 	p.detail("  it installs the OS over your PVCs")
 	// opts.TalosVersion is non-empty by construction: step 3 refuses an
@@ -607,9 +637,23 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 		}
 	}
 
-	if opts.DataDiskSerial != "" {
+	// TWO ARMS, TWO CLAIMS, and they are not the same claim. The second one is
+	// weaker on purpose: sharing a disk contains a runaway PVC at a partition
+	// boundary but shares the device, so promising what the dedicated-disk arm
+	// promises would be a transcript telling the reader they have isolation
+	// they do not have.
+	switch {
+	case opts.DataDiskSerial != "":
 		p.detail("userVolume: %s on serial %s", userVolumeName, opts.DataDiskSerial)
 		p.detail("  PVCs get their own disk, so a runaway one cannot wedge etcd on EPHEMERAL")
+
+	case opts.EphemeralMaxSize != "":
+		p.detail("EPHEMERAL: capped at %s on the system disk", opts.EphemeralMaxSize)
+		p.detail("userVolume: %s on the REST of that same disk", userVolumeName)
+		p.detail("  one disk, two partitions: a runaway PVC fills its own and cannot ENOSPC")
+		p.detail("  etcd — but it shares the device, so this buys no I/O isolation and no")
+		p.detail("  survival if the disk dies. A second disk buys all three.")
+		p.detail("  SIZES ARE FIXED AT INSTALL: changing them later means a wipe and reinstall")
 	}
 
 	// ── 7/10 apply-config ───────────────────────────────────────────────────

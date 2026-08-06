@@ -123,7 +123,7 @@ func TestCRDGuardsWhatTheGoCodeAssumes(t *testing.T) {
 	// of these prunes it on the way through an apiserver, so the value the
 	// operator wrote never arrives.
 
-	for _, f := range []string{"maintenanceEndpoint", "systemDiskSerial", "dataDiskSerial", "consoleArg", "talosVersion", "network"} {
+	for _, f := range []string{"maintenanceEndpoint", "systemDiskSerial", "systemDiskWWID", "dataDiskSerial", "ephemeralMaxSize", "consoleArg", "talosVersion", "network"} {
 		if _, ok := props[f]; !ok {
 			t.Errorf("spec.baremetal.%s is missing from the schema, but adopt.go reads it", f)
 		}

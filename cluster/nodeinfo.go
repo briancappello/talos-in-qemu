@@ -193,8 +193,14 @@ func FormatDisks(disks []Disk) string {
 			notes = append(notes, d.Transport)
 		}
 
+		// QUOTED, because a WWID is the one value in this table a human is
+		// asked to copy that can contain RUNS OF SPACES — a real one off a USB
+		// bridge reads `t10.SSK     PCIe581         DD0000000000000C`, and
+		// unquoted there is nothing to say whether the gaps are part of the
+		// value or the table's own padding. Collapsing them yields a selector
+		// that matches nothing, which Talos reports as a hang.
 		if d.Serial == "" && d.WWID != "" {
-			notes = append(notes, "no serial; wwid "+d.WWID)
+			notes = append(notes, fmt.Sprintf("no serial; wwid %q", d.WWID))
 		}
 
 		serial := d.Serial
@@ -209,7 +215,75 @@ func FormatDisks(disks []Disk) string {
 	return b.String()
 }
 
-// RequireDisk refuses unless serial names a disk this node actually has.
+// DiskRef names ONE disk by an identity that disk actually reports.
+//
+// IT EXISTS BECAUSE A SERIAL IS NOT UNIVERSAL. USB bridges routinely report
+// none — on this repo's own target machine exactly one disk of six has a
+// serial, and the install target is not it. A node whose install target cannot
+// be named is a node this tool cannot adopt, so the WWID beside it in
+// FormatDisks's NOTES column has to be nameable too.
+//
+// A STRUCT RATHER THAN TWO ADJACENT STRING PARAMETERS, for the reason toDisks
+// gives about its own literal: `RequireDisk(disks, serial, wwid, what)` is
+// three strings in a row, a transposed pair still compiles, and the result is a
+// selector that matches nothing — which Talos reports as a hang, not an error.
+// Naming the fields is what makes that transposition unwriteable.
+//
+// EXACTLY ONE is set. Validate says so, and the callers that read a manifest
+// call it before a node is dialled, so "both" and "neither" are refusals over
+// the file rather than ten minutes spent discovering them.
+type DiskRef struct {
+	Serial string
+	WWID   string
+}
+
+func (r DiskRef) IsZero() bool { return r.Serial == "" && r.WWID == "" }
+
+// Validate refuses a ref that names a disk twice or not at all.
+//
+// `what` is the caller's word for this disk ("install target"), so the refusal
+// reads in the caller's terms rather than this type's.
+func (r DiskRef) Validate(what string) error {
+	if r.Serial != "" && r.WWID != "" {
+		return fmt.Errorf("the %s is named twice — serial %q AND wwid %q — and the two select "+
+			"differently\n\n  keep the one you copied out of this node's disk table and delete the other",
+			what, r.Serial, r.WWID)
+	}
+
+	return nil
+}
+
+// String renders the ref the way the disk table labels it, so a refusal quoting
+// it can be matched against a column by eye.
+func (r DiskRef) String() string {
+	switch {
+	case r.Serial != "":
+		return fmt.Sprintf("serial %q", r.Serial)
+	case r.WWID != "":
+		return fmt.Sprintf("wwid %q", r.WWID)
+	default:
+		return "no serial or wwid"
+	}
+}
+
+// Match reports whether d is the disk this ref names.
+//
+// EXACT, not EqualFold, and deliberately unlike RequireLink's MAC comparison: a
+// MAC has one canonical form and differs only in case between a switch UI and
+// the kernel, while a serial and a WWID are opaque vendor strings whose case
+// carries meaning. Folding them would let two distinct disks compare equal.
+func (r DiskRef) Match(d Disk) bool {
+	switch {
+	case r.Serial != "":
+		return d.Serial == r.Serial
+	case r.WWID != "":
+		return d.WWID == r.WWID
+	default:
+		return false
+	}
+}
+
+// RequireDisk refuses unless ref names a disk this node actually has.
 //
 // TWO refusals share ONE table, because they are the same remedy. The empty
 // case is a first run. The unmatched case is a TYPO, which is the realistic
@@ -222,7 +296,7 @@ func FormatDisks(disks []Disk) string {
 // flip once there are two large disks", and on hardware the losing side
 // overwrites a disk that may hold data, which is the one failure here that
 // re-running cannot repair.
-func RequireDisk(disks []Disk, serial, what string) error {
+func RequireDisk(disks []Disk, ref DiskRef, what string) error {
 	// Before either refusal, because both of them end by telling the reader to
 	// pick a serial out of the table — and with no disks the table is a header
 	// over nothing. The remedy is not "choose one", it is "this node has
@@ -233,24 +307,32 @@ func RequireDisk(disks []Disk, serial, what string) error {
 			"  drive its kernel can see, then run adopt again", what)
 	}
 
-	if serial == "" {
-		return fmt.Errorf("no serial given for the %s, and one cannot be guessed\n\n"+
+	// BOTH COLUMNS ARE OFFERED, because on some machines only one of them is
+	// populated: a disk with no serial can still be named by the WWID printed
+	// in its NOTES, and that is the only way to name it at all.
+	if ref.IsZero() {
+		return fmt.Errorf("nothing given to name the %s, and it cannot be guessed\n\n"+
 			"this node's disks:\n\n%s\n"+
-			"  put one of those serials in the machine file, then run adopt again",
+			"  put one of those serials in the machine file, then run adopt again — or, for a\n"+
+			"  disk whose SERIAL reads (none), the wwid printed in its NOTES instead",
 			what, FormatDisks(disks))
 	}
 
+	if err := ref.Validate(what); err != nil {
+		return err
+	}
+
 	for _, d := range disks {
-		if d.Serial == serial {
+		if ref.Match(d) {
 			return nil
 		}
 	}
 
-	return fmt.Errorf("the %s serial %q matches none of this node's disks\n\n"+
+	return fmt.Errorf("the %s %s matches none of this node's disks\n\n"+
 		"this node's disks:\n\n%s\n"+
-		"  a serial that matches nothing is almost always a typo. Talos does not "+
+		"  an identity that matches nothing is almost always a typo. Talos does not "+
 		"report it as one:\n  it installs nowhere and the bring-up hangs.",
-		what, serial, FormatDisks(disks))
+		what, ref, FormatDisks(disks))
 }
 
 // Link is one of a node's network interfaces, reduced to what CHOOSING one

@@ -327,6 +327,87 @@ spec:
 	}
 }
 
+// adoptRefusalFromTheFile runs adopt against a manifest that is wrong in a way
+// the FILE proves, and asserts three things at once: it refused, it refused
+// without dialling (the deadline), and it refused without carving out a state
+// directory for a machine it rejected.
+//
+// The deadline is 5s against a maintenance budget of ten MINUTES, so a check
+// that slipped below the dial cannot pass this by being fast.
+func adoptRefusalFromTheFile(t *testing.T, baremetal string) error {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "machine.yaml")
+	if err := os.WriteFile(path, []byte(`apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata: {name: bm0, namespace: default}
+spec:
+  site: lab
+  baremetal:
+`+baremetal), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	d := &hvf{stateRoot: root, imageRoot: t.TempDir()}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := adoptMachine(ctx, d, path)
+	if err == nil {
+		t.Fatal("adopt accepted a manifest the file alone proves wrong")
+	}
+
+	if ctx.Err() != nil {
+		t.Fatalf("adopt dialled before reading what it was given: %v", err)
+	}
+
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatalf("state root: %v", readErr)
+	}
+
+	if len(entries) != 0 {
+		t.Errorf("a refused adopt created %d entries under the state root, want 0\n"+
+			"  reason: residue named after a typo, left for the operator to find", len(entries))
+	}
+
+	return err
+}
+
+// Machinery ANDs every non-empty field of an InstallDiskSelector, so a config
+// carrying a serial AND a wwid demands ONE disk reporting both and selects
+// nothing. Talos does not report selecting nothing as an error: it installs
+// nowhere and the bring-up hangs.
+func TestAdoptRefusesAnInstallTargetNamedTwice(t *testing.T) {
+	err := adoptRefusalFromTheFile(t, `    maintenanceEndpoint: 192.168.1.50
+    systemDiskSerial: S1
+    systemDiskWWID: naa.5000c5001b82df21
+`)
+
+	if !strings.Contains(err.Error(), "named twice") {
+		t.Errorf("the refusal does not say the install target is named twice: %v", err)
+	}
+}
+
+// A data disk and an EPHEMERAL cap are two answers to "where do PVCs live".
+// Choosing between them silently would repartition a disk the operator cannot
+// un-overwrite.
+func TestAdoptRefusesTwoPlacesForPVCs(t *testing.T) {
+	err := adoptRefusalFromTheFile(t, `    maintenanceEndpoint: 192.168.1.50
+    systemDiskSerial: S1
+    dataDiskSerial: S2
+    ephemeralMaxSize: 120GB
+`)
+
+	for _, want := range []string{"TWO places", "dataDiskSerial", "ephemeralMaxSize"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q: %v", want, err)
+		}
+	}
+}
+
 // THE CONTROLLER REACHES Destroy WITH NO SUBSTRATE CHECK IN FRONT OF IT.
 // refuseWrongSubstrate guards the CLI verbs only, and driverkit's reconcile
 // handles a deletion timestamp before it Observes — so `kubectl delete
