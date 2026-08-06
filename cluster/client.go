@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
+	runtimeres "github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -36,6 +38,13 @@ import (
 // (3) BOOTSTRAP FIRES WHILE THE NODE IS `booting`, NOT `running`. See
 // WaitBootstrapReady. There is no wait-for-stage-running function in this
 // package, and that absence is deliberate.
+//
+// (4) AN AUTHENTICATED CALL DOES NOT PROVE THE INSTALLED SYSTEM IS SERVING.
+// Once a config has been applied, the node's MAINTENANCE boot holds the cluster
+// CA too, and answers with it while it installs. The credentials stop being a
+// discriminator at exactly the moment the only wait that needed them runs; the
+// machine's STAGE is what tells the two apart. Also see WaitBootstrapReady —
+// this one cost two failed hardware bring-ups.
 
 const (
 	// probeInterval is the pause between attempts. Bring-up waits run for
@@ -237,23 +246,64 @@ func WaitAPI(ctx context.Context, talosconfig []byte, endpoint string, timeout t
 // `running` and you wait forever, with a node that looks healthy on the console
 // and a tool that looks hung.
 //
-// So the signal is the AUTHENTICATED API answering, and nothing else: the
-// config is applied and apid serves with the cluster PKI, while the node is
-// still, correctly, `booting`.
+// So the gate cannot be `running`. But it also cannot be "an authenticated call
+// succeeded", which is what it used to be:
 //
-// IT DOES NOT PROVE BOOTSTRAP WILL BE ACCEPTED, and the name oversells that by
-// one step. Talos gates Bootstrap on containerd being up and on the clock being
-// in sync, neither of which this probe observes — measured on hardware, this
-// returned after 2s and the bootstrap that followed was refused. Nothing here
-// can close that gap, because the two conditions are invisible from this side;
-// bootstrapWithRetry absorbs it by outlasting the refusal instead.
+// TRAP 4, MEASURED ON HARDWARE TWICE. `apply-config` returns, and the
+// MAINTENANCE BOOT restarts apid with the cluster PKI it was just handed — then
+// keeps installing. An authenticated probe succeeds against that node in about
+// two seconds, minutes before the machine reboots into anything. Both hardware
+// bring-ups reported "api back after 2s" and both then raced the reboot: one
+// bootstrapped into a node whose containerd was not up, the next got
+// `connection refused` as apid went down to reboot.
 //
-// This is a thin alias for WaitAPI and stays a separate function on purpose:
-// the name is the artifact. It is what a caller reaches for instead of
-// inventing a wait-for-`running`, and this package has no such wait to reach
-// for by design.
+// The claim that maintenance mode cannot satisfy the cluster PKI is true only
+// BEFORE a config is applied. Afterwards it holds the CA, and this wait runs
+// entirely in the window where it does — so the credentials cannot be the
+// discriminator here, and the stage is.
+//
+// `booting` and `running` are the two stages the INSTALLED system reports, and
+// accepting both is what keeps this reachable at bootstrap time while still
+// excluding `maintenance`, `installing` and `rebooting`. Under QEMU the old
+// gate happened to work, because a VM's install and reboot are fast enough that
+// the race almost always resolved the right way — which is exactly why this was
+// never seen until real hardware ran it.
 func WaitBootstrapReady(ctx context.Context, talosconfig []byte, endpoint string, timeout time.Duration) error {
-	return WaitAPI(ctx, talosconfig, endpoint, timeout)
+	c, err := AuthenticatedClient(ctx, talosconfig, endpoint)
+	if err != nil {
+		return err
+	}
+
+	defer c.Close() //nolint:errcheck
+
+	return waitFor(ctx, timeout, "the installed system to boot at "+endpoint, func(ctx context.Context) error {
+		// EVERY failure here is a retry, and the two that matter look nothing
+		// alike: a node mid-reboot refuses the connection, and a node still in
+		// its maintenance boot answers perfectly and reports the wrong stage.
+		status, err := safe.StateGet[*runtimeres.MachineStatus](ctx, c.COSI,
+			runtimeres.NewMachineStatus().Metadata())
+		if err != nil {
+			return err
+		}
+
+		return checkBootstrapStage(status.TypedSpec().Stage)
+	})
+}
+
+// checkBootstrapStage decides whether a stage is the installed system's own
+// boot. Split out so the decision is testable without a node, because it is the
+// entire content of the gate above and every other line there is plumbing.
+func checkBootstrapStage(stage runtimeres.MachineStage) error {
+	switch stage {
+	// The installed system is up. `booting` is the normal answer and `running`
+	// is what a re-run finds, and REFUSING `running` would break `up`'s
+	// idempotency: step 8 has to reach the node to be told AlreadyExists.
+	case runtimeres.MachineStageBooting, runtimeres.MachineStageRunning:
+		return nil
+
+	default:
+		return fmt.Errorf("the node reports stage %s, which is not the installed system serving", stage)
+	}
 }
 
 // WaitNodeReady waits for every registered Kubernetes node to report Ready.

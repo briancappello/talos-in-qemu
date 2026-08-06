@@ -25,6 +25,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/proto"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	netres "github.com/siderolabs/talos/pkg/machinery/resources/network"
+	runtimeres "github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -171,6 +172,58 @@ func TestWaitBootstrapReadyRejectsAnAcceptOnlyListener(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("a socket that accepts but never speaks Talos was reported READY")
+	}
+}
+
+// THE GATE'S WHOLE JOB, reduced to the one decision it makes.
+//
+// MEASURED ON HARDWARE, TWICE: step 7 reported "api back after 2s". An install
+// to a USB SSD plus a firmware reboot cannot happen in two seconds, so what
+// answered was the node that had NOT rebooted yet — the maintenance boot, which
+// restarts apid with the cluster PKI as soon as the config lands and goes on
+// installing behind it. Everything after that raced the reboot: one run
+// bootstrapped into a node whose containerd was not up (FailedPrecondition),
+// the next got `connection refused` because apid had gone down for the reboot.
+//
+// So "an authenticated call succeeded" does NOT mean the installed system is
+// serving, and the stage is what does. `maintenance` is the state this gate
+// exists to exclude and it is reachable WITH the cluster PKI, which is exactly
+// what made the old gate look sound.
+func TestBootstrapStageAcceptsOnlyTheInstalledSystem(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		stage runtimeres.MachineStage
+		want  bool
+		why   string
+	}{
+		{runtimeres.MachineStageBooting, true,
+			"a control-plane node stays in booting until etcd exists, and bootstrap is what creates etcd — waiting for running is the deadlock this gate must not reintroduce"},
+		{runtimeres.MachineStageRunning, true,
+			"a re-run against an already-bootstrapped node finds it running, and step 8 needs to reach the AlreadyExists that makes it idempotent"},
+		{runtimeres.MachineStageMaintenance, false,
+			"THE BUG: after apply-config the maintenance boot serves the cluster PKI while it installs, so an authenticated probe passes against a node that has not rebooted"},
+		{runtimeres.MachineStageInstalling, false,
+			"the installer is still writing the disk; the reboot has not happened"},
+		{runtimeres.MachineStageRebooting, false,
+			"apid is about to go away, which is the connection-refused this gate exists to sit through"},
+		{runtimeres.MachineStageResetting, false, "the node is being wiped, not brought up"},
+		{runtimeres.MachineStageUpgrading, false, "not a bring-up at all"},
+	} {
+		t.Run(tc.stage.String(), func(t *testing.T) {
+			err := checkBootstrapStage(tc.stage)
+
+			if got := err == nil; got != tc.want {
+				t.Errorf("checkBootstrapStage(%s) accepted = %v, want %v\n  reason: %s",
+					tc.stage, got, tc.want, tc.why)
+			}
+
+			// The refusal is what waitFor prints as "last attempt", so it has
+			// to say which stage the node was actually in.
+			if err != nil && !strings.Contains(err.Error(), tc.stage.String()) {
+				t.Errorf("the refusal does not name the stage it saw: %v", err)
+			}
+		})
 	}
 }
 

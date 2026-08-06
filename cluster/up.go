@@ -436,10 +436,10 @@ func Up(ctx context.Context, opts UpOptions) error {
 			return fail(err)
 		}
 
-		p.step("apply-config", "skipped (already applied), authenticated api answered after %s", took(started))
-		p.detail("that answer IS the proof, and it is the gate a fresh bring-up passes here too:")
-		p.detail("a node in maintenance mode cannot satisfy the cluster PKI, so an authenticated")
-		p.detail("call completing means the config is on disk and apid is serving it")
+		p.step("apply-config", "skipped (already applied), installed system up after %s", took(started))
+		p.detail("the gate is the node's own machine stage, and it is the one a fresh bring-up")
+		p.detail("passes here too: after a config is applied the MAINTENANCE boot serves the")
+		p.detail("cluster PKI as well, so an authenticated answer alone would prove nothing")
 	} else {
 		// ── 5/10 maintenance ────────────────────────────────────────────
 		// A REAL Talos API call, never a dial: a qemu hostfwd is accepted by
@@ -667,15 +667,16 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 		return nil, err
 	}
 
-	// The gate is the AUTHENTICATED API answering, and it is named
-	// WaitBootstrapReady because that is what it is for: maintenance mode
-	// cannot satisfy the cluster PKI, so success here proves the config landed,
-	// the installed system booted, and apid is serving.
+	// The gate is the node's own STAGE, not merely an authenticated call
+	// completing — see WaitBootstrapReady's Trap 4. The config has just been
+	// handed to a node that is still in its maintenance boot, and that node
+	// starts serving the cluster PKI long before it reboots into what it is
+	// installing.
 	if err := hooks.waitBootstrapReady(ctx, generated.Talosconfig, installed, installTimeout); err != nil {
 		return nil, err
 	}
 
-	p.step("apply-config", "installing... rebooting... api back after %s", took(started))
+	p.step("apply-config", "installing... rebooting... installed system up after %s", took(started))
 
 	return generated.Talosconfig, nil
 }
@@ -1006,7 +1007,17 @@ func bootstrapWithRetry(ctx context.Context, timeout time.Duration, call func(co
 			return nil
 
 		// NOT YET: keep asking until the budget runs out.
-		case client.StatusCode(err) == codes.FailedPrecondition:
+		//
+		// Unavailable is here as DEFENSE IN DEPTH rather than because this
+		// layer should need it. It is what apid going down for the install
+		// reboot looks like — `connection refused` — and with the stage gate in
+		// WaitBootstrapReady doing its job the reboot is already over by now.
+		// It was NOT already over when that gate merely checked whether an
+		// authenticated call succeeded, and a bring-up died here for it. One
+		// bounded retry loop is a cheaper insurance policy than trusting that
+		// the gate above can never regress.
+		case client.StatusCode(err) == codes.FailedPrecondition,
+			client.StatusCode(err) == codes.Unavailable:
 			return fmt.Errorf("bootstrapping etcd: %w", err)
 
 		// NOT EVER: hand it straight back, wrapped exactly as this function
