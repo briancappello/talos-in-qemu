@@ -60,6 +60,14 @@ const (
 	// installTimeout covers install, reboot and the installed system's apid
 	// coming back with the cluster PKI. It is the longest wait in a bring-up.
 	installTimeout = 10 * time.Minute
+	// NodeVersionTimeout bounds asking an installed node what version it is.
+	//
+	// SHORT, because it is not a wait for a node to become ready — it is a
+	// question to one that is supposed to be ready already, and the caller has
+	// its own budget for readiness. Long enough to ride out a dropped packet on
+	// a wireless uplink, short enough that a node which is genuinely gone is
+	// reported as gone rather than sat on.
+	NodeVersionTimeout = 30 * time.Second
 	// bootstrapTimeout covers the gap between apid serving the cluster PKI and
 	// the node being able to accept a bootstrap — containerd starting, and the
 	// clock coming into sync. Both are usually seconds; this is generous

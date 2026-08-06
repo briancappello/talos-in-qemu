@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
@@ -139,6 +140,35 @@ func TestToDisksOnANodeWithNoDisks(t *testing.T) {
 				t.Errorf("toDisks(%s) = %+v, want nothing", tc.name, got)
 			}
 		})
+	}
+}
+
+// EVERY OTHER CALL INTO A NODE IN THIS PACKAGE POLLS. This one did not, and it
+// is the FIRST call a resumed adopt makes — nothing has waited for the node
+// before it, so a single dropped packet ended the run. Measured: an adopt of the
+// baremetal node died on `no route to host` from this function while the node
+// was perfectly healthy, on a workstation whose uplink is Wi-Fi.
+//
+// The bound is what asserts the retry: nothing listens on this port, so a
+// single-shot call returns in microseconds and only a polling one is still
+// going when the budget runs out.
+func TestInstalledNodeVersionOutlastsABlip(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 3 * time.Second
+
+	started := time.Now()
+
+	_, err := InstalledNodeVersion(t.Context(), mustGenerateDefault(t).Talosconfig,
+		"127.0.0.1:1", timeout)
+	if err == nil {
+		t.Fatal("InstalledNodeVersion reported a version from an address nothing listens on")
+	}
+
+	if elapsed := time.Since(started); elapsed < timeout/2 {
+		t.Errorf("InstalledNodeVersion gave up after %s of a %s budget\n"+
+			"  reason: it does not retry, so one dropped packet ends a bring-up against a "+
+			"node that is fine", elapsed, timeout)
 	}
 }
 
@@ -351,7 +381,7 @@ func TestNodeVersionRefusesAnEmptyEndpoint(t *testing.T) {
 // without a dial: an empty endpoint and a credential that does not parse are
 // both provable from the arguments alone.
 func TestInstalledNodeVersionRefusesBeforeDialling(t *testing.T) {
-	_, err := InstalledNodeVersion(t.Context(), []byte("not a talosconfig"), "")
+	_, err := InstalledNodeVersion(t.Context(), []byte("not a talosconfig"), "", NodeVersionTimeout)
 	if err == nil {
 		t.Fatal("InstalledNodeVersion accepted an empty endpoint\n" +
 			"  reason: an empty address spends the caller's whole timeout proving " +
@@ -378,7 +408,7 @@ func TestInstalledNodeVersionRefusesBeforeDialling(t *testing.T) {
 	// not assumed.
 	broken := []byte("context: default\ncontexts: " + marker + strings.Repeat("A", 200) + "\n")
 
-	_, err = InstalledNodeVersion(t.Context(), broken, "192.0.2.1:50000")
+	_, err = InstalledNodeVersion(t.Context(), broken, "192.0.2.1:50000", NodeVersionTimeout)
 
 	assertNoSecretParserOutput(t, "talosconfig", err)
 }

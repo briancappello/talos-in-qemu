@@ -88,7 +88,7 @@ func Reconfigure(ctx context.Context, opts ReconfigureOptions) ([]byte, error) {
 			"for a different one", err)
 	}
 
-	version, err := InstalledNodeVersion(ctx, talosconfig, opts.TalosEndpoint)
+	version, err := InstalledNodeVersion(ctx, talosconfig, opts.TalosEndpoint, NodeVersionTimeout)
 	if err != nil {
 		return nil, err
 	}

@@ -479,7 +479,7 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		log.Printf("this machine already has a talosconfig, so the maintenance pre-flight is skipped")
 
 		if version == "" {
-			if version, err = cluster.InstalledNodeVersion(ctx, talosconfig, installed); err != nil {
+			if version, err = cluster.InstalledNodeVersion(ctx, talosconfig, installed, cluster.NodeVersionTimeout); err != nil {
 				return err
 			}
 

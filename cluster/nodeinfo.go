@@ -7,6 +7,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/cosi-project/runtime/pkg/safe"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
@@ -59,8 +60,19 @@ func NodeVersion(ctx context.Context, endpoint string) (string, error) {
 // bring-up still needs a version, and the maintenance API that NodeVersion uses
 // is gone for good once a node has installed.
 //
+// IT POLLS, and it is the only question in this file that does. NodeVersion
+// above is asked immediately after WaitMaintenance has just proved the node
+// answers; this one is the FIRST call a resumed bring-up makes, with nothing
+// ahead of it that waited for anything. A single dropped packet therefore ended
+// the whole run — measured against a healthy node, from a workstation on Wi-Fi.
+//
+// The retry is bounded rather than generous on purpose: this is not a wait for
+// a node to become ready, it is a question to a node that is supposed to be
+// ready already. A node that cannot answer within the budget is a real failure
+// and the caller should hear about it.
+//
 // talosconfig is secret and is neither logged nor placed in an error.
-func InstalledNodeVersion(ctx context.Context, talosconfig []byte, endpoint string) (string, error) {
+func InstalledNodeVersion(ctx context.Context, talosconfig []byte, endpoint string, timeout time.Duration) (string, error) {
 	c, err := AuthenticatedClient(ctx, talosconfig, endpoint)
 	if err != nil {
 		return "", err
@@ -68,12 +80,23 @@ func InstalledNodeVersion(ctx context.Context, talosconfig []byte, endpoint stri
 
 	defer c.Close() //nolint:errcheck
 
-	resp, err := c.Version(ctx)
-	if err != nil {
-		return "", fmt.Errorf("asking the installed node its Talos version: %w", err)
+	var version string
+
+	if err := waitFor(ctx, timeout, "the installed node at "+endpoint+" to report its Talos version",
+		func(ctx context.Context) error {
+			resp, err := c.Version(ctx)
+			if err != nil {
+				return fmt.Errorf("asking the installed node its Talos version: %w", err)
+			}
+
+			version = versionTag(resp)
+
+			return nil
+		}); err != nil {
+		return "", err
 	}
 
-	return versionTag(resp), nil
+	return version, nil
 }
 
 // versionTag picks a version tag out of a Version reply, or "" when the reply
