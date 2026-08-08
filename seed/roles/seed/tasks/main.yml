@@ -24,3 +24,6 @@
 
 - name: Bring up step-ca (internal CA)
   ansible.builtin.include_tasks: step_ca.yml
+
+- name: Bring up Caddy (TLS front door)
+  ansible.builtin.include_tasks: caddy.yml

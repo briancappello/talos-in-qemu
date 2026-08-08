@@ -6,3 +6,11 @@ seed_state_root: /var/lib/seed
 # Container images — pinned, never :latest (Global Constraints)
 seed_stepca_image: docker.io/smallstep/step-ca:0.28.1
 seed_caddy_image: docker.io/library/caddy:2.10.2
+
+# Vhost short-names Caddy serves. Each becomes a Caddy NETWORK ALIAS
+# (<name>.<seed_domain>) so step-ca can reach Caddy at that name to validate the
+# ACME challenge for its certificate. Every phase that adds a Caddy vhost MUST
+# add its short-name here, or issuance for that host fails (step-ca cannot
+# resolve it in-network). Phase 1 appends: registry, git, auth.
+seed_caddy_vhosts:
+  - hello

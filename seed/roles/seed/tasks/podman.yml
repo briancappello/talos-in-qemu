@@ -19,6 +19,32 @@
     group: root
     mode: "0755"
 
+# Podman's default base_hosts_file ("") copies the HOST's /etc/hosts into every
+# container. The Phase-0 name bridge (127.0.0.1 ca.lab ... in /etc/hosts, added
+# for host-side resolution) would then leak in and SHADOW the seed network's own
+# DNS aliases (aardvark), so a container resolving ca.lab gets 127.0.0.1 instead
+# of the peer container's IP — and every in-network call (Caddy -> step-ca ACME)
+# dials loopback and is refused. "image" bases each container's /etc/hosts on the
+# image's minimal file; podman still adds the network aliases via aardvark and
+# the container's own name. Must land before any container is created.
+- name: Ensure the containers.conf drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/containers/containers.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Isolate container /etc/hosts from the host (let the seed network DNS govern)
+  ansible.builtin.copy:
+    dest: /etc/containers/containers.conf.d/seed.conf
+    content: |
+      [containers]
+      base_hosts_file = "image"
+    owner: root
+    group: root
+    mode: "0644"
+
 - name: Render the shared podman network quadlet
   ansible.builtin.template:
     src: seed.network.j2
