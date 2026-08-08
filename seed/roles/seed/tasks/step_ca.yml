@@ -31,3 +31,45 @@
   ansible.builtin.wait_for:
     path: "{{ seed_state_root }}/step-ca/certs/root_ca.crt"
     timeout: 90
+
+- name: Ensure the seed cert export dir exists
+  ansible.builtin.file:
+    path: /etc/ssl/seed
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Export the step-ca root to a stable path
+  ansible.builtin.copy:
+    src: "{{ seed_state_root }}/step-ca/certs/root_ca.crt"
+    dest: /etc/ssl/seed/root_ca.crt
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the step-ca root into the host trust store (Debian family)
+  ansible.builtin.copy:
+    src: /etc/ssl/seed/root_ca.crt
+    dest: /usr/local/share/ca-certificates/seed-root.crt
+    remote_src: true
+    mode: "0644"
+  when: ansible_os_family == "Debian"
+  notify: update ca trust (debian)
+
+- name: Install the step-ca root into the host trust store (RedHat family)
+  ansible.builtin.copy:
+    src: /etc/ssl/seed/root_ca.crt
+    dest: /etc/pki/ca-trust/source/anchors/seed-root.crt
+    remote_src: true
+    mode: "0644"
+  when: ansible_os_family == "RedHat"
+  notify: update ca trust (redhat)
+
+- name: Resolve seed service names locally (Phase-0 bridge; dnsmasq replaces this in Phase 2)
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} SEED PHASE-0 NAMES"
+    block: |
+      127.0.0.1 ca.{{ seed_domain }} hello.{{ seed_domain }}
