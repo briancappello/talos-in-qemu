@@ -371,6 +371,12 @@ spec:
                       overridePath:
                         type: boolean
                         default: false
+                      ca:
+                        type: string
+                        description: PEM CA bundle to verify an https endpoint against.
+                      caFile:
+                        type: string
+                        description: Path (on the host running tinq) to a PEM CA bundle.
             status:
               type: object
               properties:

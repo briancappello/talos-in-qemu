@@ -458,9 +458,15 @@ func registryMirrors(m *unstructured.Unstructured) ([]cluster.RegistryMirror, er
 				i, m.GetName())
 		}
 
+		ca, err := registryCA(e)
+		if err != nil {
+			return nil, fmt.Errorf("spec.registries[%d]: %w (%s)", i, err, m.GetName())
+		}
+
 		mirror := cluster.RegistryMirror{
 			Host:     str(e["host"], ""),
 			Endpoint: str(e["endpoint"], ""),
+			CA:       ca,
 			// A non-bool reads as false, which is the safe answer for both:
 			// one weakens TLS and the other suppresses /v2/, and neither is a
 			// thing to switch on because a value could not be parsed.
@@ -1296,6 +1302,21 @@ func ensureEFIVars(path, template string) error {
 }
 
 // ── tiny helpers ────────────────────────────────────────────────────────────
+
+// registryCA resolves the optional CA for a mirror. caFile is a path read at
+// generate time — the seed exports /etc/ssl/seed/root_ca.crt — and ca is inline
+// PEM. caFile wins if both are set; neither is the common case. Read here, in
+// cmd/tinq, so cluster/ stays pure: it receives already-resolved bytes.
+func registryCA(e map[string]interface{}) (string, error) {
+	if p := str(e["caFile"], ""); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return "", fmt.Errorf("caFile %q could not be read: %w", p, err)
+		}
+		return string(b), nil
+	}
+	return str(e["ca"], ""), nil
+}
 
 func str(v interface{}, def string) string {
 	if s, ok := v.(string); ok && s != "" {

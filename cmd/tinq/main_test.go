@@ -1941,6 +1941,46 @@ func TestRegistryMirrorsReadsTheList(t *testing.T) {
 	}
 }
 
+func TestRegistryMirrorsReadsInlineCA(t *testing.T) {
+	m := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"registries": []interface{}{
+			map[string]interface{}{
+				"host": "registry.lab", "endpoint": "https://registry.lab",
+				"ca": "-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n",
+			},
+		}},
+	}}
+	got, err := registryMirrors(m)
+	if err != nil {
+		t.Fatalf("registryMirrors: %v", err)
+	}
+	if len(got) != 1 || !strings.Contains(got[0].CA, "BEGIN CERTIFICATE") {
+		t.Fatalf("inline ca not read: %+v", got)
+	}
+}
+
+func TestRegistryMirrorsReadsCAFile(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/root.crt"
+	if err := os.WriteFile(p, []byte("PEMBYTES"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{"registries": []interface{}{
+			map[string]interface{}{
+				"host": "registry.lab", "endpoint": "https://registry.lab", "caFile": p,
+			},
+		}},
+	}}
+	got, err := registryMirrors(m)
+	if err != nil {
+		t.Fatalf("registryMirrors: %v", err)
+	}
+	if got[0].CA != "PEMBYTES" {
+		t.Fatalf("caFile not read: %q", got[0].CA)
+	}
+}
+
 // nil, not an empty slice, and it must not be an error: a machine with no
 // mirrors is the normal case and cluster/config.go reads len() == 0 as "emit no
 // registries section at all".

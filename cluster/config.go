@@ -44,6 +44,12 @@ type RegistryMirror struct {
 	// Endpoint is the mirror URL. The SCHEME is the plain-HTTP switch: http://
 	// makes containerd speak cleartext, and no boolean anywhere does that job.
 	Endpoint string
+	// CA is a PEM certificate bundle to verify an https:// endpoint against,
+	// emitted as machine.registries.config.<host>.tls.ca. It is how a node
+	// trusts a registry with a PRIVATE CA (the seed's step-ca) without the
+	// blunt instrument of InsecureSkipVerify. Empty for http:// or a
+	// publicly-trusted endpoint.
+	CA string
 	// InsecureSkipVerify stops certificate verification for an https://
 	// endpoint. Meaningless for http://, where there is no certificate.
 	InsecureSkipVerify bool
@@ -537,13 +543,15 @@ func registriesConfig(mirrors []RegistryMirror) v1alpha1.RegistriesConfig {
 			entry.MirrorOverridePath = new(true)
 		}
 
-		if !m.InsecureSkipVerify {
+		// TLS config is a SECOND map. Either a CA to trust or a request to skip
+		// verification lands here; a plain http:// mirror needs neither.
+		needsTLS := m.InsecureSkipVerify || m.CA != ""
+		if !needsTLS {
 			continue
 		}
 
-		// TLS CONFIG IS A SECOND MAP, not a field on the mirror, and Talos
-		// refuses "*" as a key there. Emitting it would make the whole config
-		// fail validation on apply, which costs a boot to discover.
+		// Talos refuses "*" as a TLS config key; emitting it fails validation
+		// on apply, i.e. after a VM has already booted.
 		if m.Host == "*" {
 			continue
 		}
@@ -552,11 +560,15 @@ func registriesConfig(mirrors []RegistryMirror) v1alpha1.RegistriesConfig {
 			out.RegistryConfig = map[string]*v1alpha1.RegistryConfig{}
 		}
 
-		out.RegistryConfig[m.Host] = &v1alpha1.RegistryConfig{
-			RegistryTLS: &v1alpha1.RegistryTLSConfig{
-				TLSInsecureSkipVerify: new(true),
-			},
+		tls := &v1alpha1.RegistryTLSConfig{}
+		if m.InsecureSkipVerify {
+			tls.TLSInsecureSkipVerify = new(true)
 		}
+		if m.CA != "" {
+			// Raw PEM bytes; machinery base64-encodes TLSCA when it renders.
+			tls.TLSCA = []byte(m.CA)
+		}
+		out.RegistryConfig[m.Host] = &v1alpha1.RegistryConfig{RegistryTLS: tls}
 	}
 
 	return out

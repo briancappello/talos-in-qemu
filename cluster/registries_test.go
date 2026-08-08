@@ -54,6 +54,25 @@ func TestRegistriesConfigInsecureTLS(t *testing.T) {
 	}
 }
 
+func TestRegistriesConfigCA(t *testing.T) {
+	pem := "-----BEGIN CERTIFICATE-----\nMIIseed\n-----END CERTIFICATE-----\n"
+	got := registriesConfig([]RegistryMirror{{
+		Host: "registry.lab", Endpoint: "https://registry.lab", CA: pem,
+	}})
+
+	cfg := got.RegistryConfig["registry.lab"]
+	if cfg == nil || cfg.RegistryTLS == nil || cfg.RegistryTLS.TLSCA == nil {
+		t.Fatalf("CA did not reach the TLS config: %+v", got.RegistryConfig)
+	}
+	if string(cfg.RegistryTLS.TLSCA) != pem {
+		t.Fatal("CA bytes not carried verbatim")
+	}
+	// A CA to TRUST is not a request to SKIP verification.
+	if cfg.RegistryTLS.TLSInsecureSkipVerify != nil {
+		t.Fatal("CA must not imply insecureSkipVerify")
+	}
+}
+
 func TestRegistriesConfigWildcardHasNoTLSConfig(t *testing.T) {
 	// Talos rejects "*" as a TLS config key. Emitting one fails validation at
 	// apply time, i.e. after a VM has already booted.
