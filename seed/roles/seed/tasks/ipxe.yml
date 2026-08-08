@@ -1,0 +1,20 @@
+---
+# seed_tftp_root (/srv/tftp), NOT the brief's hardcoded /var/lib/seed/tftp:
+# Task 1 relocated the TFTP root out of the 0700 state root so the unprivileged
+# host dnsmasq user can reach it. The iPXE binaries are public boot artifacts.
+- name: Fetch iPXE binaries into the TFTP root
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "{{ seed_tftp_root }}/{{ item.name }}"
+    mode: "0644"
+  loop:
+    - { url: "{{ seed_ipxe_efi_url }}", name: ipxe.efi }
+    - { url: "{{ seed_ipxe_bios_url }}", name: undionly.kpxe }
+
+- name: Render the iPXE boot script
+  ansible.builtin.template:
+    src: boot.ipxe.j2
+    dest: "{{ seed_state_root }}/assets/boot.ipxe"
+    owner: root
+    group: root
+    mode: "0644"

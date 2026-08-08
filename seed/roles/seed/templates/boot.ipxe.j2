@@ -1,0 +1,7 @@
+#!ipxe
+# Boot Talos into MAINTENANCE mode: talos.platform=metal and NO talos.config,
+# so the node comes up on its DHCP lease and waits for `tinq adopt`.
+set base http://boot.{{ seed_domain }}
+kernel ${base}/vmlinuz-{{ seed_talos_arch }} talos.platform=metal console=tty0 console=ttyS0
+initrd ${base}/initramfs-{{ seed_talos_arch }}.xz
+boot

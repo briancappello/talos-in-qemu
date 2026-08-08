@@ -52,3 +52,6 @@
 
 - name: Fetch Talos assets and the boot server
   ansible.builtin.include_tasks: assets.yml
+
+- name: Install iPXE binaries and the boot script
+  ansible.builtin.include_tasks: ipxe.yml

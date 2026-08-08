@@ -45,6 +45,11 @@ seed_registry_user: seed
 seed_talos_version: v1.13.7
 seed_talos_arch: amd64
 
+# iPXE binaries fetched into the TFTP root (public boot artifacts, so they live
+# in seed_tftp_root, not the 0700 state root).
+seed_ipxe_efi_url: https://boot.ipxe.org/x86_64-efi/ipxe.efi
+seed_ipxe_bios_url: https://boot.ipxe.org/x86_64-pcbios/undionly.kpxe
+
 # Vhost short-names Caddy serves. Each becomes a Caddy NETWORK ALIAS
 # (<name>.<seed_domain>) so step-ca can reach Caddy at that name to validate the
 # ACME challenge for its certificate. Every phase that adds a Caddy vhost MUST
