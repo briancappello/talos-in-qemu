@@ -55,3 +55,6 @@
 
 - name: Install iPXE binaries and the boot script
   ansible.builtin.include_tasks: ipxe.yml
+
+- name: Bring up chrony (NTP)
+  ansible.builtin.include_tasks: chrony.yml
