@@ -10,21 +10,25 @@
     - "{{ seed_state_root }}/postgres"
     - "{{ seed_state_root }}/redis"
 
-# The postgres:alpine entrypoint runs as root, then re-execs as the in-image
-# `postgres` user (uid 70) for initdb and the init scripts. That unprivileged
-# pass must traverse the data mount (PGDATA is a subdir), read the initdb dir,
-# and cat the db-password secrets. Root:root 0700/0600 mounts block it, so
-# postgres crash-loops on "Permission denied". Own those paths to uid 70.
-- name: Own the Postgres data and initdb dirs to the in-image postgres uid
+# Postgres runs its initdb/data pass as the in-image `postgres` user
+# (seed_postgres_uid). PGDATA is a subdir it must WRITE, so own it to that uid.
+- name: Own the Postgres data dir to the in-image postgres uid
   ansible.builtin.file:
-    path: "{{ item }}"
+    path: "{{ seed_state_root }}/postgres/data"
     state: directory
-    owner: "70"
-    group: "70"
+    owner: "{{ seed_postgres_uid }}"
+    group: "{{ seed_postgres_uid }}"
     mode: "0700"
-  loop:
-    - "{{ seed_state_root }}/postgres/data"
-    - "{{ seed_state_root }}/postgres/initdb"
+
+# initdb is only READ/traversed by uid 70; world r-x under the 0700 secrets/state
+# parent is safe (non-root host users can't traverse in) and needs no chown.
+- name: Ensure the Postgres initdb dir is root-owned and world-traversable
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/postgres/initdb"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
 
 - name: Ensure datastore secrets exist
   ansible.builtin.include_tasks: secrets.yml
@@ -35,16 +39,18 @@
     - gitea_db_password
     - authentik_db_password
 
-# The init script cats these two secrets while running as the postgres user
-# (uid 70); the secrets primitive creates them root:root 0600, unreadable by
-# uid 70. Own them to 70 (mode stays 0600). postgres_password is read only in
-# the root pass, so it stays root-owned.
-- name: Own the DB-role secrets to the in-image postgres uid
+# These two secrets have MULTIPLE consumers: postgres-init reads them as uid 70,
+# and Gitea (Task 3) / Authentik (Task 4) read them at runtime as their own uids.
+# Convention for multi-consumer secrets: 0644 root:root. Safe because
+# secrets/ is 0700 root:root (non-root host users can't traverse in) and each
+# bind mount exposes only the one file to the one intended container.
+# postgres_password stays 0600 root:root (read only by the root entrypoint pass).
+- name: Make the multi-consumer DB-role secrets world-readable
   ansible.builtin.file:
     path: "{{ seed_state_root }}/secrets/{{ item }}"
-    owner: "70"
-    group: "70"
-    mode: "0600"
+    owner: root
+    group: root
+    mode: "0644"
   loop:
     - gitea_db_password
     - authentik_db_password
