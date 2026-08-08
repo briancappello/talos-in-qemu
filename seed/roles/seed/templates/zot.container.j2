@@ -1,0 +1,20 @@
+[Unit]
+Description=zot OCI registry and pull-through cache
+After=network-online.target seed-network.service
+Wants=network-online.target
+
+[Container]
+Image={{ seed_zot_image }}
+ContainerName=zot
+Network=seed
+NetworkAlias=registry.{{ seed_domain }}
+Volume={{ seed_state_root }}/zot/registry:/var/lib/registry
+Volume={{ seed_state_root }}/zot/config.json:/etc/zot/config.json:ro
+Volume={{ seed_state_root }}/zot/htpasswd:/etc/zot/htpasswd:ro
+Exec=serve /etc/zot/config.json
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

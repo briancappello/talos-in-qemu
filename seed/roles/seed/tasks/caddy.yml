@@ -9,6 +9,7 @@
   loop:
     - "{{ seed_state_root }}/caddy"
     - "{{ seed_state_root }}/caddy/data"
+    - "{{ seed_state_root }}/caddy/conf.d"
 
 - name: Render the Caddyfile
   ansible.builtin.template:

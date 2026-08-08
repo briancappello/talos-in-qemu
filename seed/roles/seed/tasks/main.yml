@@ -27,3 +27,6 @@
 
 - name: Bring up Caddy (TLS front door)
   ansible.builtin.include_tasks: caddy.yml
+
+- name: Bring up zot (registry + cache)
+  ansible.builtin.include_tasks: zot.yml
