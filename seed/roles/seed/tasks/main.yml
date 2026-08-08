@@ -49,3 +49,6 @@
 
 - name: Bring up dnsmasq (DNS + proxy-DHCP + TFTP)
   ansible.builtin.include_tasks: dnsmasq.yml
+
+- name: Fetch Talos assets and the boot server
+  ansible.builtin.include_tasks: assets.yml

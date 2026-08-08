@@ -1,0 +1,79 @@
+---
+- name: Install skopeo
+  ansible.builtin.package:
+    name: skopeo
+    state: present
+
+- name: Ensure the asset dir exists
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/assets"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Fetch the Talos maintenance kernel and initramfs
+  ansible.builtin.get_url:
+    url: "https://github.com/siderolabs/talos/releases/download/{{ seed_talos_version }}/{{ item }}"
+    dest: "{{ seed_state_root }}/assets/{{ item }}"
+    mode: "0644"
+  loop:
+    - "vmlinuz-{{ seed_talos_arch }}"
+    - "initramfs-{{ seed_talos_arch }}.xz"
+
+- name: Read the zot push password
+  ansible.builtin.slurp:
+    src: "{{ seed_state_root }}/secrets/zot_password"
+  register: _zot_pw_b64
+  no_log: true
+
+- name: Is the installer already in zot?
+  ansible.builtin.command: >
+    skopeo inspect docker://registry.{{ seed_domain }}/siderolabs/installer:{{ seed_talos_version }}
+  register: _installer_present
+  failed_when: false
+  changed_when: false
+
+- name: Own the Talos installer image in zot
+  ansible.builtin.command: >
+    skopeo copy --retry-times 3
+    --dest-creds "{{ seed_registry_user }}:{{ _zot_pw_b64.content | b64decode }}"
+    docker://ghcr.io/siderolabs/installer:{{ seed_talos_version }}
+    docker://registry.{{ seed_domain }}/siderolabs/installer:{{ seed_talos_version }}
+  when: _installer_present.rc != 0
+  no_log: true
+
+- name: Add the boot asset vhost
+  ansible.builtin.template:
+    src: boot.caddy.j2
+    dest: "{{ seed_state_root }}/caddy/conf.d/boot.caddy"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart caddy
+
+# boot.lab is HTTP-only and NOT a Caddy NetworkAlias (no ACME), so it is absent
+# from the Phase-0/Phase-1 /etc/hosts bridges. The host's libc resolver only
+# reads /etc/hosts for the seed names (systemd-resolved forwards *.lab upstream,
+# not to dnsmasq), so bridge boot.lab too or host-local access (the gate curl)
+# cannot resolve it. Caddy publishes :80 on all interfaces, so 127.0.0.1 works.
+- name: Resolve boot.{{ seed_domain }} on the host (HTTP boot vhost, no ACME alias)
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} SEED BOOT NAME"
+    block: |
+      127.0.0.1 boot.{{ seed_domain }}
+
+- name: Re-render the Caddy quadlet with the asset mount
+  ansible.builtin.template:
+    src: caddy.container.j2
+    dest: /etc/containers/systemd/caddy.container
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart caddy
+
+- name: Apply pending changes
+  ansible.builtin.meta: flush_handlers

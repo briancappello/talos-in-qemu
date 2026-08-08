@@ -10,6 +10,10 @@
     - "{{ seed_state_root }}/caddy"
     - "{{ seed_state_root }}/caddy/data"
     - "{{ seed_state_root }}/caddy/conf.d"
+    # Caddy bind-mounts this as /srv/boot (the HTTP boot server); the mount
+    # source must exist before Caddy (re)starts, and this task runs before
+    # assets.yml, which populates it.
+    - "{{ seed_state_root }}/assets"
 
 - name: Render the Caddyfile
   ansible.builtin.template:

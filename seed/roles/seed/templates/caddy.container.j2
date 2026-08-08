@@ -15,6 +15,7 @@ Volume={{ seed_state_root }}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
 Volume={{ seed_state_root }}/caddy/conf.d:/etc/caddy/conf.d:ro
 Volume={{ seed_state_root }}/caddy/data:/data
 Volume=/etc/ssl/seed/root_ca.crt:/etc/ssl/seed/root_ca.crt:ro
+Volume={{ seed_state_root }}/assets:/srv/boot:ro
 PublishPort=80:80
 PublishPort=443:443
 

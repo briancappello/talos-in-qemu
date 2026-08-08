@@ -41,6 +41,10 @@ seed_authentik_uid: 1000
 # Registry (zot) push user; password lives in secrets/zot_password
 seed_registry_user: seed
 
+# Talos release pin for the maintenance boot assets and the installer image.
+seed_talos_version: v1.13.7
+seed_talos_arch: amd64
+
 # Vhost short-names Caddy serves. Each becomes a Caddy NETWORK ALIAS
 # (<name>.<seed_domain>) so step-ca can reach Caddy at that name to validate the
 # ACME challenge for its certificate. Every phase that adds a Caddy vhost MUST
