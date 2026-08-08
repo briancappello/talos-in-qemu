@@ -14,13 +14,17 @@ podman logout "registry.${D}"
 podman pull "registry.${D}/seed/busybox:test"          # anonymous read
 podman pull "registry.${D}/library/alpine:3.20"        # docker.io via cache
 
-# Gitea: git push (repo created earlier) and the three package registries live
-curl -fsS -o /dev/null -w 'pypi-simple:%{http_code}\n' \
-  -u "seedadmin:$pw" "https://git.${D}/api/packages/seedadmin/pypi/simple/"
+# Gitea: the three package registries are live. Use the content-independent
+# packages API (returns 200 even with an empty registry) — Gitea's native
+# pypi `/simple/` root and `/go` endpoints 404 until a package exists, which
+# `curl -f` under `set -e` would treat as failure. Cargo's config.json is a
+# genuine functional 200 (the registry's own config document), kept as-is.
+curl -fsS -o /dev/null -w 'pypi-registry:%{http_code}\n' \
+  -u "seedadmin:$pw" "https://git.${D}/api/v1/packages/seedadmin?type=pypi"
+curl -fsS -o /dev/null -w 'go-registry:%{http_code}\n' \
+  -u "seedadmin:$pw" "https://git.${D}/api/v1/packages/seedadmin?type=go"
 curl -fsS -o /dev/null -w 'cargo-config:%{http_code}\n' \
   -u "seedadmin:$pw" "https://git.${D}/api/packages/seedadmin/cargo/config.json"
-curl -fsS -o /dev/null -w 'go-registry:%{http_code}\n' \
-  "https://git.${D}/api/packages/seedadmin/go"
 
 # Authentik: live, and the Gitea OIDC discovery resolves
 curl -fsS -o /dev/null -w 'authentik:%{http_code}\n' "https://auth.${D}/-/health/live/"
