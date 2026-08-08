@@ -7,7 +7,6 @@ Wants=network-online.target
 Image={{ seed_zot_image }}
 ContainerName=zot
 Network=seed
-NetworkAlias=registry.{{ seed_domain }}
 Volume={{ seed_state_root }}/zot/registry:/var/lib/registry
 Volume={{ seed_state_root }}/zot/config.json:/etc/zot/config.json:ro
 Volume={{ seed_state_root }}/zot/htpasswd:/etc/zot/htpasswd:ro

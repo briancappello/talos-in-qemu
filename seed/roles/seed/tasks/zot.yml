@@ -23,9 +23,9 @@
 
 - name: Generate the zot htpasswd (bcrypt) on first run
   ansible.builtin.shell: >
-    set -o pipefail;
     htpasswd -nbB {{ seed_registry_user }} "$(cat {{ seed_state_root }}/secrets/zot_password)"
-    > {{ seed_state_root }}/zot/htpasswd
+    > {{ seed_state_root }}/zot/htpasswd.tmp
+    && mv {{ seed_state_root }}/zot/htpasswd.tmp {{ seed_state_root }}/zot/htpasswd
   args:
     executable: /bin/bash
     creates: "{{ seed_state_root }}/zot/htpasswd"
@@ -70,24 +70,6 @@
     group: root
     mode: "0644"
   notify: restart caddy
-
-- name: Re-render the Caddyfile with conf.d import
-  ansible.builtin.template:
-    src: Caddyfile.j2
-    dest: "{{ seed_state_root }}/caddy/Caddyfile"
-    owner: root
-    group: root
-    mode: "0644"
-  notify: restart caddy
-
-- name: Re-render the Caddy quadlet with the conf.d mount
-  ansible.builtin.template:
-    src: caddy.container.j2
-    dest: /etc/containers/systemd/caddy.container
-    owner: root
-    group: root
-    mode: "0644"
-  notify: reload systemd
 
 - name: Apply pending changes
   ansible.builtin.meta: flush_handlers
