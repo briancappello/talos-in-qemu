@@ -12,7 +12,12 @@
     state: directory
     owner: root
     group: root
-    mode: "0700"
+    # 0711: traversable (not listable). dnsmasq drops privileges to the
+    # unprivileged 'dnsmasq' user and must traverse here to reach its TFTP
+    # root; every secret-bearing subdir keeps its own 0700, so o+x exposes
+    # no secrets. Keeping the network daemon unprivileged beats running it
+    # as root, and beats leaving the state root fully closed.
+    mode: "0711"
 
 - name: Provision podman and the shared network
   ansible.builtin.include_tasks: podman.yml
@@ -42,3 +47,6 @@
 
 - name: Wire Gitea <-> Authentik OIDC
   ansible.builtin.include_tasks: oidc.yml
+
+- name: Bring up dnsmasq (DNS + proxy-DHCP + TFTP)
+  ansible.builtin.include_tasks: dnsmasq.yml

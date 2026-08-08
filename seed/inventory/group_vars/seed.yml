@@ -1,3 +1,11 @@
 ---
 # Override role defaults per environment here, e.g.:
 # seed_domain: lab
+
+# The seed's LAN facts (per-environment). These are seed-dev's real values:
+# a cloud-init VM on the libvirt NAT default network (192.168.122.0/24).
+seed_lan_iface: enp1s0            # the seed's LAN interface
+seed_lan_address: 192.168.122.10  # the seed's LAN IP (what *.lab resolves to)
+seed_lan_subnet: 192.168.122.0    # the LAN network address (/24 assumed)
+seed_dhcp_mode: proxy             # proxy (coexist w/ router) | authoritative (seed owns a segment)
+seed_dhcp_range: 192.168.50.50,192.168.50.150,12h   # only used when mode=authoritative
