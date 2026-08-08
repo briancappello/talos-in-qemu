@@ -64,16 +64,5 @@
     block: |
       127.0.0.1 boot.{{ seed_domain }}
 
-- name: Re-render the Caddy quadlet with the asset mount
-  ansible.builtin.template:
-    src: caddy.container.j2
-    dest: /etc/containers/systemd/caddy.container
-    owner: root
-    group: root
-    mode: "0644"
-  notify:
-    - reload systemd
-    - restart caddy
-
 - name: Apply pending changes
   ansible.builtin.meta: flush_handlers

@@ -23,8 +23,8 @@
 
 - name: Generate the zot htpasswd (bcrypt) on first run
   ansible.builtin.shell: >
-    htpasswd -nbB {{ seed_registry_user }} "$(cat {{ seed_state_root }}/secrets/zot_password)"
-    > {{ seed_state_root }}/zot/htpasswd.tmp
+    cat {{ seed_state_root }}/secrets/zot_password
+    | htpasswd -inB {{ seed_registry_user }} > {{ seed_state_root }}/zot/htpasswd.tmp
     && mv {{ seed_state_root }}/zot/htpasswd.tmp {{ seed_state_root }}/zot/htpasswd
   args:
     executable: /bin/bash
