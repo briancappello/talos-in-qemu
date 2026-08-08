@@ -1,0 +1,103 @@
+---
+- name: Ensure the Authentik state dir exists
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/authentik"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# The goauthentik/server image runs as uid 1000 and must write /media and
+# /templates; root:root 0750 makes it crash-loop on "PermissionError:
+# /media/public". Own these two mounts to the in-image uid. Non-recursive
+# (media grows at runtime), matching the seed_gitea_uid pattern (no :U).
+- name: Ensure Authentik data dirs exist, owned by the authentik uid
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ seed_authentik_uid }}"
+    group: "{{ seed_authentik_uid }}"
+    mode: "0750"
+  loop:
+    - "{{ seed_state_root }}/authentik/media"
+    - "{{ seed_state_root }}/authentik/templates"
+
+- name: Ensure Authentik secrets exist
+  ansible.builtin.include_tasks: secrets.yml
+  vars:
+    secret_name: "{{ item }}"
+    secret_length: 60
+  loop:
+    - authentik_secret_key
+    - authentik_bootstrap_password
+    - authentik_bootstrap_token
+
+- name: Read Authentik secrets
+  ansible.builtin.slurp:
+    src: "{{ seed_state_root }}/secrets/{{ item }}"
+  register: _ak_secrets
+  loop:
+    - authentik_db_password
+    - authentik_secret_key
+    - authentik_bootstrap_password
+    - authentik_bootstrap_token
+  no_log: true
+
+- name: Bind Authentik secret facts
+  ansible.builtin.set_fact:
+    _ak_db_password: "{{ _ak_secrets.results[0].content | b64decode }}"
+    _ak_secret_key: "{{ _ak_secrets.results[1].content | b64decode }}"
+    _ak_bootstrap_password: "{{ _ak_secrets.results[2].content | b64decode }}"
+    _ak_bootstrap_token: "{{ _ak_secrets.results[3].content | b64decode }}"
+  no_log: true
+
+- name: Render the Authentik env file
+  ansible.builtin.template:
+    src: authentik.env.j2
+    dest: "{{ seed_state_root }}/authentik/authentik.env"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: restart authentik
+
+- name: Render the Authentik quadlets
+  ansible.builtin.template:
+    src: "{{ item }}.container.j2"
+    dest: "/etc/containers/systemd/{{ item }}.container"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - authentik-server
+    - authentik-worker
+  notify: reload systemd
+
+- name: Add the Authentik Caddy vhost
+  ansible.builtin.template:
+    src: auth.caddy.j2
+    dest: "{{ seed_state_root }}/caddy/conf.d/auth.caddy"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart caddy
+
+- name: Apply pending changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Start Authentik
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: started
+  loop:
+    - authentik-server.service
+    - authentik-worker.service
+
+- name: Wait for Authentik readiness
+  ansible.builtin.uri:
+    url: "https://auth.{{ seed_domain }}/-/health/ready/"
+    ca_path: /etc/ssl/seed/root_ca.crt
+    status_code: [200, 204]
+  register: _ak_ready
+  until: _ak_ready.status in [200, 204]
+  retries: 60
+  delay: 3

@@ -20,3 +20,11 @@
   ansible.builtin.systemd_service:
     name: caddy.service
     state: restarted
+
+- name: restart authentik
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: restarted
+  loop:
+    - authentik-server.service
+    - authentik-worker.service

@@ -10,6 +10,7 @@ seed_zot_image: ghcr.io/project-zot/zot:v2.1.2
 seed_postgres_image: docker.io/library/postgres:16.4-alpine
 seed_redis_image: docker.io/library/redis:7.4-alpine
 seed_gitea_image: docker.io/gitea/gitea:1.22.6
+seed_authentik_image: ghcr.io/goauthentik/server:2024.8.3
 
 # Runtime uid of the in-image postgres user for the pinned postgres:16.4-alpine
 # (a debian-based tag would be 999); used to own the data dir postgres must write.
@@ -27,6 +28,13 @@ seed_redis_uid: 999
 # seed_postgres_uid pattern; non-recursive chown (repos grow, so no :U / recurse).
 seed_gitea_uid: 1000
 
+# Authentik's server/worker image (goauthentik/server) runs its process as the
+# in-image `authentik` user (uid 1000). The /media and /templates bind mounts
+# must be owned by it or the server crash-loops with
+# "PermissionError: /media/public" before migrations run. Non-recursive chown,
+# matching the seed_postgres_uid / seed_gitea_uid pattern (no :U).
+seed_authentik_uid: 1000
+
 # Registry (zot) push user; password lives in secrets/zot_password
 seed_registry_user: seed
 
@@ -39,3 +47,4 @@ seed_caddy_vhosts:
   - hello
   - registry
   - git
+  - auth

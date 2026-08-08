@@ -36,3 +36,6 @@
 
 - name: Bring up Gitea (git + packages)
   ansible.builtin.include_tasks: gitea.yml
+
+- name: Bring up Authentik (SSO)
+  ansible.builtin.include_tasks: authentik.yml

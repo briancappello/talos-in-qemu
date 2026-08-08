@@ -1,0 +1,21 @@
+[Unit]
+Description=Authentik worker
+After=network-online.target seed-network.service postgres.service redis.service
+Wants=network-online.target
+Requires=postgres.service redis.service
+
+[Container]
+Image={{ seed_authentik_image }}
+ContainerName=authentik-worker
+Network=seed
+EnvironmentFile={{ seed_state_root }}/authentik/authentik.env
+Volume={{ seed_state_root }}/authentik/media:/media
+Volume={{ seed_state_root }}/authentik/templates:/templates
+Exec=worker
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target
