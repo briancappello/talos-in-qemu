@@ -2,6 +2,9 @@
 # Domain and paths
 seed_domain: lab
 seed_state_root: /var/lib/seed
+# Public boot artifacts (iPXE binaries): deliberately OUTSIDE the 0700
+# /var/lib/seed so the host dnsmasq user needs no traverse into the state root.
+seed_tftp_root: /srv/tftp
 
 # Container images — pinned, never :latest (Global Constraints)
 seed_stepca_image: docker.io/smallstep/step-ca:0.28.1

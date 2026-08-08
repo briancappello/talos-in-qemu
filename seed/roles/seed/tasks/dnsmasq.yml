@@ -6,7 +6,7 @@
 
 - name: Ensure the TFTP root exists
   ansible.builtin.file:
-    path: /var/lib/seed/tftp
+    path: "{{ seed_tftp_root }}"
     state: directory
     owner: root
     group: root
