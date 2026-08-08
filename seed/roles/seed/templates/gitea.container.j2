@@ -11,6 +11,8 @@ Network=seed
 NetworkAlias=git.{{ seed_domain }}
 Volume={{ seed_state_root }}/gitea/data:/data
 Volume={{ seed_state_root }}/secrets/gitea_db_password:/run/secrets/gitea_db_password:ro
+Volume=/etc/ssl/certs/ca-certificates.crt:/etc/ssl/seed/ca-bundle.crt:ro
+Environment=SSL_CERT_FILE=/etc/ssl/seed/ca-bundle.crt
 Environment=USER_UID={{ seed_gitea_uid }}
 Environment=USER_GID={{ seed_gitea_uid }}
 Environment=GITEA__database__DB_TYPE=postgres

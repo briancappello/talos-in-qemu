@@ -23,7 +23,9 @@
     owner: root
     group: root
     mode: "0644"
-  notify: reload systemd
+  notify:
+    - reload systemd
+    - restart gitea
 
 - name: Add the Gitea Caddy vhost
   ansible.builtin.template:

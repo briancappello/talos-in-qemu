@@ -39,3 +39,6 @@
 
 - name: Bring up Authentik (SSO)
   ansible.builtin.include_tasks: authentik.yml
+
+- name: Wire Gitea <-> Authentik OIDC
+  ansible.builtin.include_tasks: oidc.yml

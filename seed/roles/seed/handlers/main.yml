@@ -21,6 +21,11 @@
     name: caddy.service
     state: restarted
 
+- name: restart gitea
+  ansible.builtin.systemd_service:
+    name: gitea.service
+    state: restarted
+
 - name: restart authentik
   ansible.builtin.systemd_service:
     name: "{{ item }}"
