@@ -14,6 +14,8 @@ seed_postgres_image: docker.io/library/postgres:16.4-alpine
 seed_redis_image: docker.io/library/redis:7.4-alpine
 seed_gitea_image: docker.io/gitea/gitea:1.22.6
 seed_authentik_image: ghcr.io/goauthentik/server:2024.8.3
+seed_minio_image: quay.io/minio/minio:RELEASE.2024-08-17T01-24-54Z
+seed_mc_image: quay.io/minio/mc:RELEASE.2024-08-17T11-33-50Z
 
 # Runtime uid of the in-image postgres user for the pinned postgres:16.4-alpine
 # (a debian-based tag would be 999); used to own the data dir postgres must write.
@@ -60,3 +62,4 @@ seed_caddy_vhosts:
   - registry
   - git
   - auth
+  - s3

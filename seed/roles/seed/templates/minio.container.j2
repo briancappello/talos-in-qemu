@@ -1,0 +1,21 @@
+[Unit]
+Description=MinIO (S3 store + restic target)
+After=network-online.target seed-network.service
+Wants=network-online.target
+
+[Container]
+Image={{ seed_minio_image }}
+ContainerName=minio
+Network=seed
+NetworkAlias=s3.{{ seed_domain }}
+Volume={{ seed_state_root }}/minio/data:/data
+Volume={{ seed_state_root }}/secrets/minio_root_password:/run/secrets/minio_root_password:ro
+Environment=MINIO_ROOT_USER={{ seed_registry_user }}
+Environment=MINIO_ROOT_PASSWORD_FILE=/run/secrets/minio_root_password
+Exec=server /data --console-address :9001
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

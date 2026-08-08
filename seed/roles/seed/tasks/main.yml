@@ -58,3 +58,6 @@
 
 - name: Bring up chrony (NTP)
   ansible.builtin.include_tasks: chrony.yml
+
+- name: Bring up MinIO (S3 store + backup target)
+  ansible.builtin.include_tasks: minio.yml

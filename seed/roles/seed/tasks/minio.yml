@@ -1,0 +1,87 @@
+---
+- name: Ensure MinIO data dir exists
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/minio/data"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Ensure the MinIO root password exists
+  ansible.builtin.include_tasks: secrets.yml
+  vars:
+    secret_name: minio_root_password
+
+- name: Render the MinIO quadlet
+  ansible.builtin.template:
+    src: minio.container.j2
+    dest: /etc/containers/systemd/minio.container
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd
+
+- name: Add the MinIO Caddy vhost
+  ansible.builtin.template:
+    src: s3.caddy.j2
+    dest: "{{ seed_state_root }}/caddy/conf.d/s3.caddy"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart caddy
+
+# The uri wait and the gate curl hit https://s3.lab FROM the target host. The
+# host libc resolver only reads /etc/hosts for seed names (systemd-resolved
+# forwards *.lab upstream -> NXDOMAIN; dnsmasq serves the network, not the host
+# resolver), so bridge s3.lab like the other vhosts. Caddy publishes :443 on all
+# interfaces, so 127.0.0.1 works.
+- name: Resolve s3.{{ seed_domain }} on the host (S3 vhost)
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} SEED S3 NAME"
+    block: |
+      127.0.0.1 s3.{{ seed_domain }}
+
+- name: Apply pending changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Start MinIO
+  ansible.builtin.systemd_service:
+    name: minio.service
+    state: started
+
+- name: Wait for MinIO
+  ansible.builtin.uri:
+    url: "https://s3.{{ seed_domain }}/minio/health/live"
+    ca_path: /etc/ssl/seed/root_ca.crt
+  register: _minio_up
+  until: _minio_up.status == 200
+  retries: 30
+  delay: 2
+
+- name: Read the MinIO root password
+  ansible.builtin.slurp:
+    src: "{{ seed_state_root }}/secrets/minio_root_password"
+  register: _minio_pw
+  no_log: true
+
+# One bucket per iteration so each is independent: bare `mc mb` (no -p) is the
+# idempotence signal — it creates on first run (stdout "created" -> changed) and
+# errors "already own it" on re-run (guarded by failed_when -> ok, changed=false).
+# `mc mb -p` cannot do this: it prints "created" even when the bucket exists, so
+# the task would report changed every run. mc's ENTRYPOINT is mc itself, hence
+# --entrypoint /bin/sh to run the alias+mb shell pipeline.
+- name: Create the buckets (idempotent)
+  ansible.builtin.command: >
+    podman run --rm --network seed --entrypoint /bin/sh {{ seed_mc_image }}
+    -c "mc alias set s ${MC_HOST} {{ seed_registry_user }} '{{ _minio_pw.content | b64decode }}' &&
+        mc mb s/{{ item }}"
+  environment:
+    MC_HOST: "http://minio:9000"
+  loop:
+    - seed-backups
+    - tofu-state
+  register: _mc
+  changed_when: "'created' in _mc.stdout"
+  failed_when: _mc.rc != 0 and 'already own it' not in _mc.stderr
+  no_log: true
