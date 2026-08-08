@@ -30,3 +30,6 @@
 
 - name: Bring up zot (registry + cache)
   ansible.builtin.include_tasks: zot.yml
+
+- name: Bring up the datastores (Postgres + Redis)
+  ansible.builtin.include_tasks: datastores.yml
