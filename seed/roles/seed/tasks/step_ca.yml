@@ -55,7 +55,7 @@
     dest: /usr/local/share/ca-certificates/seed-root.crt
     remote_src: true
     mode: "0644"
-  when: ansible_os_family == "Debian"
+  when: ansible_facts['os_family'] == "Debian"
   notify: update ca trust (debian)
 
 - name: Install the step-ca root into the host trust store (RedHat family)
@@ -64,7 +64,7 @@
     dest: /etc/pki/ca-trust/source/anchors/seed-root.crt
     remote_src: true
     mode: "0644"
-  when: ansible_os_family == "RedHat"
+  when: ansible_facts['os_family'] == "RedHat"
   notify: update ca trust (redhat)
 
 - name: Resolve seed service names locally (Phase-0 bridge; dnsmasq replaces this in Phase 2)
