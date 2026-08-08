@@ -3,6 +3,7 @@
   ansible.builtin.apt:
     update_cache: true
     cache_valid_time: 3600
+  changed_when: false
   when: ansible_facts["pkg_mgr"] == "apt"
 
 - name: Install podman
