@@ -1,0 +1,36 @@
+---
+- name: Refresh apt cache before installing packages
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts["pkg_mgr"] == "apt"
+
+- name: Install podman
+  ansible.builtin.package:
+    name: podman
+    state: present
+
+- name: Ensure the Quadlet unit directory exists
+  ansible.builtin.file:
+    path: /etc/containers/systemd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render the shared podman network quadlet
+  ansible.builtin.template:
+    src: seed.network.j2
+    dest: /etc/containers/systemd/seed.network
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd
+
+- name: Apply pending quadlet changes before starting units
+  ansible.builtin.meta: flush_handlers
+
+- name: Start the generated network unit
+  ansible.builtin.systemd_service:
+    name: seed-network.service
+    state: started

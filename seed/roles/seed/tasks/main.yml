@@ -13,3 +13,6 @@
     owner: root
     group: root
     mode: "0700"
+
+- name: Provision podman and the shared network
+  ansible.builtin.include_tasks: podman.yml
