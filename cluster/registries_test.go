@@ -73,6 +73,24 @@ func TestRegistriesConfigCA(t *testing.T) {
 	}
 }
 
+// A CA on host "*" must be dropped, exactly like the insecureSkipVerify case:
+// Talos refuses "*" as a RegistryConfig (TLS) key, and emitting one fails
+// config validation at apply time — after a VM has already booted. The mirror
+// endpoint itself is still emitted; only the TLS stanza is suppressed.
+func TestRegistriesConfigCAWildcardDropped(t *testing.T) {
+	got := registriesConfig([]RegistryMirror{{
+		Host: "*", Endpoint: "https://registry.lab",
+		CA: "-----BEGIN CERTIFICATE-----\nMIIseed\n-----END CERTIFICATE-----\n",
+	}})
+
+	if got.RegistryConfig != nil {
+		t.Fatalf("wildcard host must not produce a TLS config entry: %+v", got.RegistryConfig)
+	}
+	if got.RegistryMirrors["*"] == nil {
+		t.Fatal("wildcard mirror itself must still be emitted")
+	}
+}
+
 func TestRegistriesConfigWildcardHasNoTLSConfig(t *testing.T) {
 	// Talos rejects "*" as a TLS config key. Emitting one fails validation at
 	// apply time, i.e. after a VM has already booted.
