@@ -15,6 +15,13 @@ seed_gitea_image: docker.io/gitea/gitea:1.22.6
 # (a debian-based tag would be 999); used to own the data dir postgres must write.
 seed_postgres_uid: 70
 
+# Runtime uid of the in-image redis user for redis:7.4-alpine. Redis is started
+# with `--save 60 1`, so it forks a BGSAVE child that must WRITE the RDB temp
+# file into /data; a root:root mount makes every write fail (MISCONF
+# stop-writes-on-bgsave-error), which in turn breaks any Redis-write consumer
+# (Authentik). Own the /data mount to this uid, like seed_postgres_uid.
+seed_redis_uid: 999
+
 # Gitea runs its app as the in-image `git` user (USER_UID/USER_GID below); the
 # /data mount root must be owned by it so it can traverse and write. Matches the
 # seed_postgres_uid pattern; non-recursive chown (repos grow, so no :U / recurse).

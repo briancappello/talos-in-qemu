@@ -1,14 +1,24 @@
 ---
-- name: Ensure datastore dirs exist
+- name: Ensure the Postgres state dir exists
   ansible.builtin.file:
-    path: "{{ item }}"
+    path: "{{ seed_state_root }}/postgres"
     state: directory
     owner: root
     group: root
     mode: "0700"
-  loop:
-    - "{{ seed_state_root }}/postgres"
-    - "{{ seed_state_root }}/redis"
+
+# Redis mounts this dir directly as /data and forks a BGSAVE child (--save 60 1)
+# that must WRITE the RDB temp file here as uid 999; a root:root mount makes
+# every snapshot fail (MISCONF stop-writes-on-bgsave-error), rejecting all Redis
+# writes and breaking Authentik. Own the mount root to the in-image redis uid,
+# like the Postgres data dir. Non-recursive (no :U), matching the uid pattern.
+- name: Own the Redis data dir to the in-image redis uid
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/redis"
+    state: directory
+    owner: "{{ seed_redis_uid }}"
+    group: "{{ seed_redis_uid }}"
+    mode: "0700"
 
 # Postgres runs its initdb/data pass as the in-image `postgres` user
 # (seed_postgres_uid). PGDATA is a subdir it must WRITE, so own it to that uid.
