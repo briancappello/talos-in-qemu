@@ -1,0 +1,67 @@
+---
+- name: Install restic
+  ansible.builtin.package:
+    name: restic
+    state: present
+
+- name: Ensure the restic password exists
+  ansible.builtin.include_tasks: secrets.yml
+  vars:
+    secret_name: restic_password
+
+- name: Ensure the backup dir exists
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/backup"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Read the MinIO root password
+  ansible.builtin.slurp:
+    src: "{{ seed_state_root }}/secrets/minio_root_password"
+  register: _minio_pw_b64
+  no_log: true
+
+- name: Bind the MinIO password
+  ansible.builtin.set_fact:
+    _minio_pw: "{{ _minio_pw_b64.content | b64decode }}"
+  no_log: true
+
+- name: Render the backup env file
+  ansible.builtin.template:
+    src: seed-backup.env.j2
+    dest: "{{ seed_state_root }}/backup/seed-backup.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Install the backup script
+  ansible.builtin.template:
+    src: seed-backup.sh.j2
+    dest: /usr/local/bin/seed-backup
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the backup units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - seed-backup.service
+    - seed-backup.timer
+  notify: reload systemd
+
+- name: Apply pending changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable the daily backup timer
+  ansible.builtin.systemd_service:
+    name: seed-backup.timer
+    enabled: true
+    state: started

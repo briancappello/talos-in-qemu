@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+mkdir -p {{ seed_state_root }}/backup
+podman exec postgres pg_dumpall -U postgres > {{ seed_state_root }}/backup/postgres.sql
+restic snapshots >/dev/null 2>&1 || restic init
+restic backup \
+  {{ seed_state_root }}/zot {{ seed_state_root }}/gitea {{ seed_state_root }}/authentik \
+  {{ seed_state_root }}/step-ca {{ seed_state_root }}/caddy {{ seed_state_root }}/secrets \
+  {{ seed_state_root }}/assets \
+  {{ seed_state_root }}/backup/postgres.sql
+restic forget --keep-daily 7 --keep-weekly 4 --prune

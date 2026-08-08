@@ -61,3 +61,6 @@
 
 - name: Bring up MinIO (S3 store + backup target)
   ansible.builtin.include_tasks: minio.yml
+
+- name: Install the restic backup timer
+  ansible.builtin.include_tasks: backup.yml
