@@ -1,22 +1,14 @@
 ---
 # The smallstep/step-ca image runs as its own non-root 'step' user (uid 1000),
-# and rootful podman does not remap uids, so uid 1000 in the container is uid
-# 1000 on the host. The bind-mount sources must therefore be owned by 1000, or
-# the entrypoint (running as step) cannot write /home/step or read the password.
+# and rootful podman does not remap uids. The quadlet mounts both bind sources
+# with podman's :U option, which chowns each source to the container user at
+# start, so Ansible only creates the state dir (as root) and leaves the
+# container-user ownership to :U.
 - name: Ensure the step-ca state dir exists
   ansible.builtin.file:
     path: "{{ seed_state_root }}/step-ca"
     state: directory
-    owner: "1000"
-    group: "1000"
     mode: "0700"
-
-- name: Make the CA password readable by the step-ca container user
-  ansible.builtin.file:
-    path: "{{ seed_state_root }}/secrets/step_ca_password"
-    owner: "1000"
-    group: "1000"
-    mode: "0600"
 
 - name: Render the step-ca quadlet
   ansible.builtin.template:
