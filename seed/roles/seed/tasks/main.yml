@@ -21,3 +21,6 @@
   ansible.builtin.include_tasks: secrets.yml
   vars:
     secret_name: step_ca_password
+
+- name: Bring up step-ca (internal CA)
+  ansible.builtin.include_tasks: step_ca.yml
