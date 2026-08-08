@@ -16,3 +16,8 @@
 
 - name: Provision podman and the shared network
   ansible.builtin.include_tasks: podman.yml
+
+- name: Ensure the step-ca CA password exists
+  ansible.builtin.include_tasks: secrets.yml
+  vars:
+    secret_name: step_ca_password
