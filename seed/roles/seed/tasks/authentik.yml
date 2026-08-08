@@ -59,6 +59,7 @@
     group: root
     mode: "0600"
   notify: restart authentik
+  no_log: true
 
 - name: Render the Authentik quadlets
   ansible.builtin.template:
