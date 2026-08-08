@@ -33,3 +33,6 @@
 
 - name: Bring up the datastores (Postgres + Redis)
   ansible.builtin.include_tasks: datastores.yml
+
+- name: Bring up Gitea (git + packages)
+  ansible.builtin.include_tasks: gitea.yml

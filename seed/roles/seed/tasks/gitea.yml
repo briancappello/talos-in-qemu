@@ -1,0 +1,72 @@
+---
+# Own the /data mount root to the in-image git uid so uid 1000 can traverse and
+# write it (root:root 0750 blocks it — Gitea crash-loops on "permission denied"
+# reading /data/gitea/conf/app.ini). Non-recursive: repos under here can grow, so
+# no :U / recurse per the seed_postgres_uid pattern.
+- name: Ensure Gitea data dir exists, owned by the git uid
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/gitea/data"
+    state: directory
+    owner: "{{ seed_gitea_uid }}"
+    group: "{{ seed_gitea_uid }}"
+    mode: "0750"
+
+- name: Ensure the Gitea admin password exists
+  ansible.builtin.include_tasks: secrets.yml
+  vars:
+    secret_name: gitea_admin_password
+
+- name: Render the Gitea quadlet
+  ansible.builtin.template:
+    src: gitea.container.j2
+    dest: /etc/containers/systemd/gitea.container
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd
+
+- name: Add the Gitea Caddy vhost
+  ansible.builtin.template:
+    src: git.caddy.j2
+    dest: "{{ seed_state_root }}/caddy/conf.d/git.caddy"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart caddy
+
+- name: Apply pending changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Start Gitea
+  ansible.builtin.systemd_service:
+    name: gitea.service
+    state: started
+
+- name: Wait for Gitea HTTP
+  ansible.builtin.uri:
+    url: "https://git.{{ seed_domain }}/api/v1/version"
+    ca_path: /etc/ssl/seed/root_ca.crt
+  register: _gitea_up
+  until: _gitea_up.status == 200
+  retries: 30
+  delay: 2
+
+- name: Read the Gitea admin password
+  ansible.builtin.slurp:
+    src: "{{ seed_state_root }}/secrets/gitea_admin_password"
+  register: _gitea_admin_pw_b64
+  no_log: true
+
+- name: List existing Gitea users
+  ansible.builtin.command: podman exec -u git gitea gitea admin user list
+  register: _gitea_users
+  changed_when: false
+
+- name: Create the Gitea admin on first run
+  ansible.builtin.command: >
+    podman exec -u git gitea gitea admin user create
+    --admin --username seedadmin
+    --password "{{ _gitea_admin_pw_b64.content | b64decode }}"
+    --email admin@git.{{ seed_domain }} --must-change-password=false
+  when: "'seedadmin' not in _gitea_users.stdout"
+  no_log: true

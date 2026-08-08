@@ -9,10 +9,16 @@ seed_caddy_image: docker.io/library/caddy:2.10.2
 seed_zot_image: ghcr.io/project-zot/zot:v2.1.2
 seed_postgres_image: docker.io/library/postgres:16.4-alpine
 seed_redis_image: docker.io/library/redis:7.4-alpine
+seed_gitea_image: docker.io/gitea/gitea:1.22.6
 
 # Runtime uid of the in-image postgres user for the pinned postgres:16.4-alpine
 # (a debian-based tag would be 999); used to own the data dir postgres must write.
 seed_postgres_uid: 70
+
+# Gitea runs its app as the in-image `git` user (USER_UID/USER_GID below); the
+# /data mount root must be owned by it so it can traverse and write. Matches the
+# seed_postgres_uid pattern; non-recursive chown (repos grow, so no :U / recurse).
+seed_gitea_uid: 1000
 
 # Registry (zot) push user; password lives in secrets/zot_password
 seed_registry_user: seed
@@ -25,3 +31,4 @@ seed_registry_user: seed
 seed_caddy_vhosts:
   - hello
   - registry
+  - git

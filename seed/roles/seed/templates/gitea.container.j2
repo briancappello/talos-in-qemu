@@ -1,0 +1,32 @@
+[Unit]
+Description=Gitea (git + package registries)
+After=network-online.target seed-network.service postgres.service
+Wants=network-online.target
+Requires=postgres.service
+
+[Container]
+Image={{ seed_gitea_image }}
+ContainerName=gitea
+Network=seed
+NetworkAlias=git.{{ seed_domain }}
+Volume={{ seed_state_root }}/gitea/data:/data
+Volume={{ seed_state_root }}/secrets/gitea_db_password:/run/secrets/gitea_db_password:ro
+Environment=USER_UID={{ seed_gitea_uid }}
+Environment=USER_GID={{ seed_gitea_uid }}
+Environment=GITEA__database__DB_TYPE=postgres
+Environment=GITEA__database__HOST=postgres:5432
+Environment=GITEA__database__NAME=gitea
+Environment=GITEA__database__USER=gitea
+Environment=GITEA__database__PASSWD__FILE=/run/secrets/gitea_db_password
+Environment=GITEA__server__DOMAIN=git.{{ seed_domain }}
+Environment=GITEA__server__ROOT_URL=https://git.{{ seed_domain }}/
+Environment=GITEA__security__INSTALL_LOCK=true
+Environment=GITEA__service__DISABLE_REGISTRATION=true
+Environment=GITEA__packages__ENABLED=true
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
