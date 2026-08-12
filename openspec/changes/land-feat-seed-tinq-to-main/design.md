@@ -38,7 +38,7 @@
 
 **Rollback:** if `main` destabilizes, revert the merge commit; `feat/seed` remains intact.
 
-## Open Questions
+## Open Questions (resolved)
 
-- Merge commit vs rebase `feat/seed` onto `main`? (Lean: merge — preserves branch history, no rewrite.)
-- Any seed-side test/helper the tinq packages depend on that must stay when `seed/` is removed? (Verify with `go build/test` after the drop.)
+- Merge commit vs rebase `feat/seed` onto `main`? **RESOLVED — merge commit** (operator decision, matches the lean): `git merge --no-ff feat/seed` preserves all 124 commits + branch history, no SHA rewrite, rollback = `git revert` the merge commit.
+- Any seed-side test/helper the tinq packages depend on that must stay when `seed/` is removed? Verify with `go build/test` after the drop (§3.3) — deferred with the destructive `git rm -r seed/`.
