@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<SQL
+  CREATE ROLE gitea LOGIN PASSWORD '$(cat /run/secrets/gitea_db_password)';
+  CREATE DATABASE gitea OWNER gitea;
+  CREATE ROLE authentik LOGIN PASSWORD '$(cat /run/secrets/authentik_db_password)';
+  CREATE DATABASE authentik OWNER authentik;
+SQL

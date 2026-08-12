@@ -1,0 +1,105 @@
+---
+- name: Ensure the Postgres state dir exists
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/postgres"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# Redis mounts this dir directly as /data and forks a BGSAVE child (--save 60 1)
+# that must WRITE the RDB temp file here as uid 999; a root:root mount makes
+# every snapshot fail (MISCONF stop-writes-on-bgsave-error), rejecting all Redis
+# writes and breaking Authentik. Own the mount root to the in-image redis uid,
+# like the Postgres data dir. Non-recursive (no :U), matching the uid pattern.
+- name: Own the Redis data dir to the in-image redis uid
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/redis"
+    state: directory
+    owner: "{{ seed_redis_uid }}"
+    group: "{{ seed_redis_uid }}"
+    mode: "0700"
+
+# Postgres runs its initdb/data pass as the in-image `postgres` user
+# (seed_postgres_uid). PGDATA is a subdir it must WRITE, so own it to that uid.
+- name: Own the Postgres data dir to the in-image postgres uid
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/postgres/data"
+    state: directory
+    owner: "{{ seed_postgres_uid }}"
+    group: "{{ seed_postgres_uid }}"
+    mode: "0700"
+
+# initdb is only READ/traversed by uid 70; world r-x under the 0700 secrets/state
+# parent is safe (non-root host users can't traverse in) and needs no chown.
+- name: Ensure the Postgres initdb dir is root-owned and world-traversable
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/postgres/initdb"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure datastore secrets exist
+  ansible.builtin.include_tasks: secrets.yml
+  vars:
+    secret_name: "{{ item }}"
+  loop:
+    - postgres_password
+    - gitea_db_password
+    - authentik_db_password
+
+# These two secrets have MULTIPLE consumers: postgres-init reads them as uid 70,
+# and Gitea (Task 3) / Authentik (Task 4) read them at runtime as their own uids.
+# Convention for multi-consumer secrets: 0644 root:root. Safe because
+# secrets/ is 0700 root:root (non-root host users can't traverse in) and each
+# bind mount exposes only the one file to the one intended container.
+# postgres_password stays 0600 root:root (read only by the root entrypoint pass).
+- name: Make the multi-consumer DB-role secrets world-readable
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/secrets/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - gitea_db_password
+    - authentik_db_password
+
+- name: Render the Postgres init script
+  ansible.builtin.template:
+    src: postgres-initdb.sh.j2
+    dest: "{{ seed_state_root }}/postgres/initdb/10-seed-databases.sh"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render the datastore quadlets
+  ansible.builtin.template:
+    src: "{{ item }}.container.j2"
+    dest: "/etc/containers/systemd/{{ item }}.container"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - postgres
+    - redis
+  notify: reload systemd
+
+- name: Apply pending changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Start Postgres and Redis
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: started
+  loop:
+    - postgres.service
+    - redis.service
+
+- name: Wait for Postgres to accept connections
+  ansible.builtin.command: podman exec postgres pg_isready -U postgres
+  register: _pg_ready
+  until: _pg_ready.rc == 0
+  retries: 30
+  delay: 2
+  changed_when: false

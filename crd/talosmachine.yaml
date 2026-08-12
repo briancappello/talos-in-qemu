@@ -45,9 +45,21 @@ spec:
       additionalPrinterColumns:
         - { name: Site,  type: string, jsonPath: .spec.site }
         - { name: Role,  type: string, jsonPath: .spec.role }
+        - { name: Power, type: string, jsonPath: .status.powerState }
         - name: Ready
           type: string
           jsonPath: ".status.conditions[?(@.type=='Ready')].status"
+        # SYNCED EARNS A COLUMN, because without one the condition split buys
+        # nothing at the only place anyone looks. A machine stopped on purpose
+        # and a machine whose Create just failed BOTH print Power=Stopped and
+        # Ready=False — byte-identical rows, and one of them is an incident.
+        # Synced is the single character that tells them apart, and a condition
+        # nobody sees might as well not be published. Ordered after Ready to
+        # match Crossplane's READY/SYNCED convention, since these resources sit
+        # beside provider-managed ones in the same kubectl output.
+        - name: Synced
+          type: string
+          jsonPath: ".status.conditions[?(@.type=='Synced')].status"
         - { name: PID,   type: integer, jsonPath: .status.pid }
         - { name: API,   type: string, jsonPath: .status.apiEndpoint }
         - { name: Age,   type: date,   jsonPath: .metadata.creationTimestamp }
@@ -57,7 +69,26 @@ spec:
           properties:
             spec:
               type: object
-              required: [site, role, image, cpu, memory, disk]
+              required: [site, role]
+              x-kubernetes-validations:
+                - rule: "has(self.baremetal) || (has(self.image) && has(self.cpu) && has(self.memory) && has(self.disk))"
+                  message: >-
+                    a TalosMachine is either hardware (spec.baremetal) or a VM to build
+                    (image, cpu, memory, disk). Relaxing `required` is what allows the
+                    first; this rule is what stops it also allowing a VM with no disk.
+                - rule: "!(has(self.baremetal) && (has(self.hostForwards) || has(self.image) || has(self.cpu) || has(self.memory) || has(self.disk) || has(self.dataDisk)))"
+                  message: >-
+                    image, cpu, memory, disk, dataDisk and hostForwards all describe a guest
+                    to BUILD, and a machine that already exists is not built: nothing here
+                    creates its disks, sizes its RAM, or forwards a host port into it —
+                    hardware serves apid on its own address. ACCEPTING THEM AND IGNORING
+                    THEM IS THE WORSE FAILURE, because a manifest carrying both shapes reads
+                    as configuration that is in effect when none of it is; the machine is
+                    hardware the moment spec.baremetal is present, and every one of these
+                    fields is then dead text. The price is paid on migration: turning a VM
+                    manifest into a hardware one means DELETING these fields, not merely
+                    adding spec.baremetal. That is the trade — one explicit edit, over a
+                    silent discard that never announces itself.
               properties:
                 site:
                   type: string
@@ -91,6 +122,152 @@ spec:
                     (talos-data), never by size — with two large disks a size
                     matcher becomes a coin flip between the OS target and this.
                     Omit for a single-disk machine with no StorageClass.
+                baremetal:
+                  type: object
+                  required: [maintenanceEndpoint]
+                  description: >-
+                    Present when this machine is HARDWARE that already exists. Its
+                    presence is the discriminator: apply/up/stop/destroy refuse a
+                    machine that has it, and `tinq adopt` requires it. Nothing here
+                    powers a node on — it must already be in maintenance mode.
+                  properties:
+                    maintenanceEndpoint:
+                      type: string
+                      # minLength CARRIES THE WEIGHT `required` LOOKS LIKE IT DOES.
+                      # `required: [maintenanceEndpoint]` is key presence only, so
+                      # `maintenanceEndpoint: ""` satisfies it and travels all the way to
+                      # adopt.go, which then rejects it. The schema should refuse what it
+                      # appears to refuse.
+                      minLength: 1
+                      description: >-
+                        Where the node answers RIGHT NOW, in maintenance mode. No port:
+                        Talos's own defaults are used (50000 for apid, 6443 for
+                        kube-apiserver) because there is no forward to describe.
+                        With no network block this is also where the node answers
+                        FOREVER, and it goes into apid's certificate. With one, it is
+                        transient — spec.baremetal.network.address takes over the moment
+                        the node reboots into what it installed.
+                    systemDiskSerial:
+                      type: string
+                      description: >-
+                        Serial of the install target. Omit on the first run and `adopt`
+                        prints the node's disks and refuses — a size matcher is a coin
+                        flip, and losing it overwrites a disk that may hold data. Use
+                        systemDiskWWID instead for a disk whose SERIAL column reads
+                        (none); setting both is refused.
+                    systemDiskWWID:
+                      type: string
+                      description: >-
+                        WWID of the install target, for a disk that reports NO SERIAL —
+                        USB bridges commonly do not. It is the value `adopt` prints in
+                        that disk's NOTES column, quoted because a real one contains runs
+                        of spaces that are part of the value. Alternative to
+                        systemDiskSerial, never a companion: Talos ANDs the two, so both
+                        together select no disk at all.
+                    dataDiskSerial:
+                      type: string
+                      description: >-
+                        Serial of a SEPARATE disk for PVCs. Absent means no user volume
+                        AND no StorageClass unless ephemeralMaxSize is set; the two are
+                        alternatives and setting both is refused.
+                    ephemeralMaxSize:
+                      type: string
+                      description: >-
+                        Cap Talos's EPHEMERAL volume so the user volume can take the rest
+                        of the SYSTEM disk — the single-disk alternative to dataDiskSerial.
+                        Needs a unit: 120GB, 100GiB or 60%; a bare number means BYTES.
+                        EPHEMERAL is /var, so this is the partition etcd, container images
+                        and kubelet state share. It buys ONE property a second disk buys —
+                        a runaway PVC cannot ENOSPC etcd — and not the other two, because
+                        it is the same device. FIXED AT INSTALL: changing it later means a
+                        wipe and a reinstall.
+                    consoleArg:
+                      type: string
+                      description: >-
+                        Console kernel argument for the installed system. DEFAULT NONE —
+                        hardware has a firmware-configured console, and a guessed one is
+                        silent at exactly the boot you would need it for.
+                    talosVersion:
+                      type: string
+                      description: >-
+                        Override for the version `adopt` reads from the node. Only needed
+                        if a maintenance-mode node reports no version tag.
+                    network:
+                      type: object
+                      required: [address, gateway, nameservers, hardwareAddr]
+                      description: >-
+                        Static addressing for a segment that serves no DHCP. ABSENT
+                        MEANS DHCP, which is what every node had before this block
+                        existed and what every QEMU machine still uses. All four fields
+                        are required together: there is no useful half-configured
+                        state, and a static block with no nameservers is a node that
+                        cannot resolve a registry and so cannot pull the image it was
+                        just told to install.
+                      properties:
+                        address:
+                          type: string
+                          # A LOOSE PATTERN ON PURPOSE. All it asserts is the SHAPE —
+                          # four dot-separated numeric groups with a slash-suffix — so
+                          # 999.999.999.999/99 satisfies it. Whether the value parses at
+                          # all, and whether its prefix actually CONTAINS
+                          # maintenanceEndpoint, is the check that matters, it needs
+                          # arithmetic, and it lives in cluster.CheckNetwork — which is
+                          # also the only one that runs on the standalone path, where
+                          # no apiserver ever sees this schema. That shape is also what
+                          # refuses an empty string here, which is why this field carries
+                          # no minLength: maintenanceEndpoint above has no pattern, so
+                          # there minLength is the only thing standing in that gap.
+                          pattern: '^[0-9]+(\.[0-9]+){3}/[0-9]{1,2}$'
+                          description: >-
+                            Where the node answers AFTER the install, in CIDR —
+                            192.168.2.10/24. Its prefix MUST contain
+                            maintenanceEndpoint: inside it the node re-pins itself on
+                            the same wire and comes back reachable, outside it the node
+                            boots onto an address that does not exist on the wire it is
+                            plugged into, and adopt cannot resume because an installed
+                            node never serves the maintenance API again. This address
+                            becomes apid's certificate SAN, the talosconfig endpoint
+                            and the kubeconfig server.
+                        gateway:
+                          type: string
+                          pattern: '^[0-9]+(\.[0-9]+){3}$'
+                          description: >-
+                            The default route's next hop. Must be inside address's
+                            prefix — a node has no route to a gateway off its own
+                            segment.
+                        nameservers:
+                          type: array
+                          minItems: 1
+                          items: { type: string }
+                          description: >-
+                            At least one resolver. A segment with no DHCP offers no
+                            resolver either, and there is no other source of one.
+                        hardwareAddr:
+                          type: string
+                          pattern: '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'
+                          description: >-
+                            MAC of the NIC to configure. A MAC and not an interface
+                            name, for the reason the install disk is selected by serial
+                            and not by size: a stable identity rather than an
+                            enumeration artifact. OMITTING IT IS REFUSED FROM THE FILE,
+                            before any node is dialled, so there is no links table to
+                            print at that point — the node's own console lists its
+                            interfaces and their MACs, and you are already standing at
+                            it to type the ip= kernel argument. A MAC that is
+                            well-formed but WRONG passes that check and is refused
+                            later, once the node has answered, with this node's real
+                            links printed to copy from.
+                powerState:
+                  type: string
+                  enum: [Running, Stopped]
+                  default: Running
+                  description: >-
+                    Desired power. Stopped halts the VM and KEEPS its disks —
+                    the installed OS and any PVCs survive. Deleting the resource
+                    is what destroys them. Defaults to Running so existing
+                    manifests keep their meaning. Read by the CONTROLLER only:
+                    the standalone verbs always drive toward Running, and
+                    `tinq stop` is what halts a machine on that path.
                 machineConfigSecretRef:
                   type: object
                   description: >-
@@ -130,10 +307,81 @@ spec:
                         type: string
                         enum: [tcp, udp, both]
                         default: tcp
+                registries:
+                  type: array
+                  description: >-
+                    Image registry mirrors for this machine's containerd. Each
+                    entry redirects one registry HOST to one ENDPOINT, which is
+                    how a cluster pulls images that exist nowhere on the
+                    internet.
+
+                    NOT in the baremetal exclusion rule above, unlike
+                    hostForwards: a mirror is a property of the NODE, not of the
+                    hypervisor, and hardware needs one for the same reason a
+                    guest does. Only the address differs.
+                  items:
+                    type: object
+                    required: [host, endpoint]
+                    properties:
+                      # The FIRST SEGMENT of an image reference, and it must
+                      # match byte for byte including the port: an image tagged
+                      # 10.0.2.2:5000/app:v1 is looked up under the key
+                      # "10.0.2.2:5000", and a host entry of "10.0.2.2" alone
+                      # never matches it. `*` is a fallback for MIRRORS ONLY --
+                      # Talos rejects it as a TLS config key, so an entry with
+                      # host `*` must not set insecureSkipVerify.
+                      host:
+                        type: string
+                        minLength: 1
+                      # The SCHEME HERE IS THE PLAIN-HTTP SWITCH, not a flag.
+                      # http:// makes containerd speak cleartext; there is no
+                      # separate "insecure" boolean that does this, and setting
+                      # insecureSkipVerify on an https:// endpoint is a
+                      # different decision about a different failure. A
+                      # go-install'd registry on a dev host has no certificate
+                      # at all, so it is http://; a bare-metal registry has a
+                      # real or self-signed one, so it is https://.
+                      #
+                      # If the path is omitted it defaults to /v2 -- see
+                      # overridePath below.
+                      endpoint:
+                        type: string
+                        # A scheme-less endpoint is not a slow path: containerd
+                        # fails to parse it at PULL time, long after this file
+                        # was accepted and a node booted from it.
+                        pattern: '^https?://'
+                      # For an https:// endpoint whose certificate is
+                      # self-signed or names a different host. Leaves the
+                      # connection encrypted and stops verifying who is on the
+                      # other end, so it is a real weakening and not a
+                      # formality: only set it for a registry you physically
+                      # control on a network you control. It does NOTHING for
+                      # an http:// endpoint, where there is no certificate to
+                      # skip verifying -- if a plain-HTTP mirror is failing,
+                      # this is not the knob, the scheme is.
+                      insecureSkipVerify:
+                        type: boolean
+                        default: false
+                      # Use the endpoint's path EXACTLY, instead of appending
+                      # /v2/. Needed when several mirrors are served from
+                      # different paths on ONE registry instance; wrong
+                      # everywhere else, because a stock registry serves the
+                      # API at /v2/ and suppressing that turns every pull into
+                      # a 404 that reads like a missing image.
+                      overridePath:
+                        type: boolean
+                        default: false
+                      ca:
+                        type: string
+                        description: PEM CA bundle to verify an https endpoint against.
+                      caFile:
+                        type: string
+                        description: Path (on the host running tinq) to a PEM CA bundle.
             status:
               type: object
               properties:
                 pid: { type: integer }
+                powerState: { type: string, description: Observed power state; may lag spec. }
                 stateDir: { type: string, description: Per-machine state root — removed on delete. }
                 apiEndpoint: { type: string }
                 observedGeneration: { type: integer }

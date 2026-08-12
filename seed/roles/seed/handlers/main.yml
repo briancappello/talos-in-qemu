@@ -1,0 +1,45 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: restart zot
+  ansible.builtin.systemd_service:
+    name: zot.service
+    state: restarted
+
+- name: update ca trust (debian)
+  ansible.builtin.command: update-ca-certificates
+  changed_when: true
+
+- name: update ca trust (redhat)
+  ansible.builtin.command: update-ca-trust extract
+  changed_when: true
+
+- name: restart caddy
+  ansible.builtin.systemd_service:
+    name: caddy.service
+    state: restarted
+
+- name: restart gitea
+  ansible.builtin.systemd_service:
+    name: gitea.service
+    state: restarted
+
+- name: restart authentik
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: restarted
+  loop:
+    - authentik-server.service
+    - authentik-worker.service
+
+- name: restart dnsmasq
+  ansible.builtin.systemd_service:
+    name: dnsmasq
+    state: restarted
+
+- name: restart chrony
+  ansible.builtin.systemd_service:
+    name: "{{ 'chrony' if ansible_facts['os_family'] == 'Debian' else 'chronyd' }}"
+    state: restarted

@@ -123,9 +123,10 @@ func newRootCmd() *cobra.Command {
 			detect: sync.OnceValues(platform.Detect)}, nil
 	}
 
-	// The three standalone verbs are the SAME code path with a different word:
-	// standalone() decides, and it runs the identical Observe/Create/Destroy the
-	// controller loop uses. Two ways to build a machine would drift.
+	// The standalone verbs are the SAME code path with a different word:
+	// standalone() decides, and it runs the identical
+	// Observe/Create/Stop/Destroy the controller loop uses. Two ways to build a
+	// machine would drift.
 	runVerb := func(verb string) func(*cobra.Command, []string) error {
 		return func(cmd *cobra.Command, args []string) error {
 			d, err := newDriver()
@@ -148,11 +149,35 @@ func newRootCmd() *cobra.Command {
 		RunE: runVerb("apply"),
 	}
 
+	stop := &cobra.Command{
+		Use:   "stop <machine.yaml>",
+		Short: "Halt the VM but KEEP its disks, then exit",
+		Long: "A shutdown, not a teardown. The installed OS and any PVCs survive, and\n" +
+			"`tinq up` starts the machine again from the same disks — that distinction\n" +
+			"is the only reason this exists beside `destroy`. Idempotent: already\n" +
+			"stopped, or never created, is success.\n\n" +
+			"`up` is the verb that brings a stopped machine back to a Ready cluster: it\n" +
+			"is idempotent, and it skips the steps this machine has already passed\n" +
+			"rather than sending it back through maintenance mode, which the installed\n" +
+			"system never re-enters. (`tinq apply` starts the VM too, and stops there.)\n\n" +
+			"A bootstrapped machine is asked to power itself off over the Talos API,\n" +
+			"so its filesystem is quiesced. A machine still in maintenance mode has no\n" +
+			"talosconfig to ask with, and QEMU is signalled instead (SIGTERM, then\n" +
+			"SIGKILL) — a power cut the guest never learns about, which is safe there\n" +
+			"because it holds no applied config and nothing persistent. Either way the\n" +
+			"escalation is announced in the log rather than performed silently.",
+		Args: cobra.ExactArgs(1),
+		RunE: runVerb("stop"),
+	}
+
 	destroy := &cobra.Command{
 		Use:   "destroy <machine.yaml>",
 		Short: "Destroy the VM and its whole state directory, then exit",
 		Long: "Takes the entire SCC: the qemu process and everything in the state\n" +
-			"directory. Idempotent — already-gone is success. Works with no usable\n" +
+			"directory. NOT RECOVERABLE — the installed OS and any PVCs go with it;\n" +
+			"`tinq stop` is the verb that keeps them.\n\n" +
+			"Idempotent — already-gone is success, and a merely stopped machine is\n" +
+			"destroyed too, since it still has disks to sweep. Works with no usable\n" +
 			"accelerator and no reachable node: teardown must not require a live\n" +
 			"hypervisor.",
 		Args: cobra.ExactArgs(1),
@@ -165,9 +190,54 @@ func newRootCmd() *cobra.Command {
 		Long: "apply, plus the Talos side: machine config, install, bootstrap,\n" +
 			"kubeconfig, and storage — one command from a TalosMachine to a Ready\n" +
 			"node.\n\nThe VM half is byte-for-byte what `apply` builds; this adds the\n" +
-			"cluster on top.",
+			"cluster on top.\n\nIdempotent, and safe to re-run: a machine that has\n" +
+			"already been configured skips config generation and apply-config, and a\n" +
+			"bootstrap the node refuses because etcd exists is a success. That is also\n" +
+			"how you restart a machine halted with `tinq stop`.",
 		Args: cobra.ExactArgs(1),
 		RunE: runVerb("up"),
+	}
+
+	adopt := &cobra.Command{
+		Use:   "adopt <machine.yaml>",
+		Short: "Bring up a Talos node this tool did NOT create",
+		Long: "Takes a machine that is already booted into maintenance mode — from a USB\n" +
+			"stick, virtual media, or netboot — and drives it to a Ready single-node\n" +
+			"cluster using the same ten steps `up` uses.\n\n" +
+			"Requires spec.baremetal. Run it once with no systemDiskSerial and it prints\n" +
+			"the node's disks and refuses; write one down and run it again.\n\n" +
+			"It never powers anything on and never installs without an explicit serial.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			d, err := newDriver()
+			if err != nil {
+				return err
+			}
+			return adoptMachine(cmd.Context(), d, args[0])
+		},
+	}
+
+	reconfigure := &cobra.Command{
+		Use:   "reconfigure <machine.yaml>",
+		Short: "Apply an edited manifest to a machine that is already running",
+		Long: "Regenerates this machine's config from its manifest, against the SECRETS\n" +
+			"BUNDLE it already has, and applies it over the authenticated API.\n\n" +
+			"`up` and `adopt` skip config generation once a machine has a talosconfig,\n" +
+			"because regenerating there would mint new certificate authorities and take\n" +
+			"away the only credential that reaches the node. This is where a manifest\n" +
+			"edit goes instead — adding a registry mirror no longer means wiping a disk.\n\n" +
+			"Refuses anything decided when the disk was PARTITIONED: the install target,\n" +
+			"the EPHEMERAL cap and the user volume's disk. Talos accepts a config saying\n" +
+			"otherwise and does nothing about it, so those still need a wipe.\n\n" +
+			"Talos decides per change whether a reboot is required.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			d, err := newDriver()
+			if err != nil {
+				return err
+			}
+			return reconfigureMachine(cmd.Context(), d, args[0])
+		},
 	}
 
 	controller := &cobra.Command{
@@ -192,52 +262,78 @@ func newRootCmd() *cobra.Command {
 	}
 	controller.Flags().DurationVar(&interval, "interval", 5*time.Second, "reconcile interval")
 
-	root.AddCommand(apply, destroy, up, controller)
+	root.AddCommand(apply, stop, destroy, up, adopt, reconfigure, controller)
 	return root
 }
 
 // standalone runs one CR through the Driver with no control plane. It is
-// deliberately thin: decode, Observe, then Create or Destroy. Every decision
-// about WHAT a machine is stays in the driver, so bootstrap and steady state
-// cannot disagree.
+// deliberately thin: decode, refuse the wrong substrate, Observe, then Create,
+// Stop or Destroy — the refusal comes second because a machine this tool did
+// not create has no honest answer to any of the three. Every
+// decision about WHAT a machine is stays in the driver, so bootstrap and steady
+// state cannot disagree.
 //
-// Create is skipped when Observe reports present, which is the same
-// already-exists rule the controller applies — so re-running is safe and does
-// not start a second qemu against the same state dir.
+// Create is skipped only when Observe reports Running, so re-running is safe
+// and does not start a second qemu against the same state dir. Stopped falls
+// through to Create, because there is no live process to collide with and
+// Create reuses the disks.
+//
+// That is NOT the controller's rule, and the difference is user-visible:
+// standalone always drives toward Running and NEVER READS spec.powerState. A
+// manifest carrying powerState: Stopped boots here — a valid value, silently
+// ignored — whereas the controller feeds it to plan and converges on it.
+// Deliberate: this is the bootstrap path, run before any control plane exists
+// to hold the desired state, and its one job is to get a node up. Once the
+// controller owns the resource it reconciles powerState normally. `tinq stop`
+// is the verb that halts a machine on this path.
 func standalone(ctx context.Context, d *hvf, path, verb string) error {
-	b, err := os.ReadFile(path)
+	m, err := readMachine(path)
 	if err != nil {
 		return err
 	}
-	var obj map[string]interface{}
-	if err := yaml.Unmarshal(b, &obj); err != nil {
-		return fmt.Errorf("parse: %w", err)
-	}
-	m := &unstructured.Unstructured{Object: obj}
-	if m.GetUID() == "" {
-		// The controller gets a UID from the API server; here there is none, so
-		// derive a STABLE one from namespace/name. It keys the state dir, so it
-		// must be identical across runs or a re-apply would orphan the first VM
-		// and boot a second beside it.
-		m.SetUID(types.UID(fmt.Sprintf("bootstrap-%s-%s", m.GetNamespace(), m.GetName())))
+
+	// BEFORE Observe, not after. Observe stats system.qcow2 and would report a
+	// machine that is a machine as Absent — a meaningless answer for hardware,
+	// and one that reads as "not created yet" to everything downstream.
+	if err := refuseWrongSubstrate(m, verb); err != nil {
+		return err
 	}
 
-	exists, status, err := d.Observe(ctx, m)
+	state, status, err := d.Observe(ctx, m)
 	if err != nil {
 		return fmt.Errorf("observe: %w", err)
 	}
 
 	switch verb {
 	case "destroy":
-		if !exists {
+		// Stopped is destroyed along with Running: a machine that is merely
+		// stopped still has disks and a state dir to sweep, and skipping it is
+		// exactly the residue the SCC rule forbids.
+		if state == driverkit.Absent {
 			log.Printf("already gone: %s", d.dir(m))
 			return nil
 		}
 		return d.Destroy(ctx, m)
+	case "stop":
+		// Both early returns exist so a re-run is quiet and cheap rather than
+		// merely harmless: Stop already re-Observes and returns nil for
+		// anything that is not Running, so without these the operator gets no
+		// word on WHY nothing happened — and "nothing to stop" and "already
+		// stopped" are different facts. The first means no disks exist; the
+		// second means they do and survive.
+		if state == driverkit.Absent {
+			log.Printf("nothing to stop: %s", d.dir(m))
+			return nil
+		}
+		if state == driverkit.Stopped {
+			log.Printf("already stopped: %s", d.dir(m))
+			return nil
+		}
+		return d.Stop(ctx, m)
 	case "up":
-		return bringUp(ctx, d, m, exists, status)
+		return bringUp(ctx, d, m, state, status)
 	default:
-		if exists {
+		if state == driverkit.Running {
 			log.Printf("already running: %v", status)
 			return nil
 		}
@@ -253,6 +349,31 @@ func standalone(ctx context.Context, d *hvf, path, verb string) error {
 	}
 }
 
+// readMachine loads one TalosMachine from a file and gives it a STABLE identity.
+//
+// The UID is derived rather than random because it keys the state dir: a
+// re-run that minted a new one would orphan the first machine's artifacts and
+// build a second beside it. Shared by every file-driven verb so the derivation
+// cannot drift between them.
+func readMachine(path string) (*unstructured.Unstructured, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var obj map[string]interface{}
+	if err := yaml.Unmarshal(b, &obj); err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+
+	m := &unstructured.Unstructured{Object: obj}
+	if m.GetUID() == "" {
+		m.SetUID(types.UID(fmt.Sprintf("bootstrap-%s-%s", m.GetNamespace(), m.GetName())))
+	}
+
+	return m, nil
+}
+
 // The two guest ports a bring-up talks to. They are Talos's, not ours: apid
 // serves on 50000 and kube-apiserver on 6443, so these are the guest sides that
 // spec.hostForwards has to map onto the host.
@@ -261,27 +382,41 @@ const (
 	kubeAPIGuestPort  = 6443
 )
 
-// hostForward reports the HOST port forwarded to guestPort, or 0 when the
-// machine forwards nothing there.
+// defaultHostAddr is the bind address a forward gets when it names none.
+//
+// It is read in exactly TWO places — the qemu argument builder that BINDS the
+// forward, and hostForward below that DIALS it — and it is a constant so those
+// two can never drift apart. A dialled address that disagrees with the bound
+// one is not a wrong string, it is a five-minute timeout.
+const defaultHostAddr = "127.0.0.1"
+
+// hostForward reports the HOST address and port forwarded to guestPort, or
+// ("", 0) when the machine forwards nothing there.
 //
 // Everything reachable from the host goes through a qemu user-mode forward, so
 // a missing entry is not a slow path — it is an address that will never answer.
 // cluster.Up refuses an empty endpoint up front rather than spending a wait's
 // whole budget discovering that.
-func hostForward(m *unstructured.Unstructured, guestPort int) int {
+//
+// THE ADDRESS IS RETURNED, not assumed. qemu binds each forward to its own
+// hostAddr and binds it EXCLUSIVELY: with hostAddr set to a LAN address,
+// nothing is listening on loopback at all. Returning a hardcoded 127.0.0.1
+// here sent every wait to an address that could never answer, and the symptom
+// was a full maintenance timeout rather than a connection refusal.
+func hostForward(m *unstructured.Unstructured, guestPort int) (string, int) {
 	for _, hf := range nestedSlice(m, "spec", "hostForwards") {
 		h, _ := hf.(map[string]interface{})
 		if toInt(h["guestPort"]) == guestPort {
-			return toInt(h["hostPort"])
+			return str(h["hostAddr"], defaultHostAddr), toInt(h["hostPort"])
 		}
 	}
-	return 0
+	return "", 0
 }
 
 // talosEndpoint is the host side of the Talos API forward, host:port, or "".
 func talosEndpoint(m *unstructured.Unstructured) string {
-	if p := hostForward(m, talosAPIGuestPort); p > 0 {
-		return fmt.Sprintf("127.0.0.1:%d", p)
+	if a, p := hostForward(m, talosAPIGuestPort); p > 0 {
+		return fmt.Sprintf("%s:%d", a, p)
 	}
 	return ""
 }
@@ -292,17 +427,83 @@ func talosEndpoint(m *unstructured.Unstructured) string {
 // into the kubeconfig, so it has to be the address the HOST can reach — the
 // guest's own is unroutable from here without a bridge.
 func kubeEndpoint(m *unstructured.Unstructured) string {
-	if p := hostForward(m, kubeAPIGuestPort); p > 0 {
-		return fmt.Sprintf("https://127.0.0.1:%d", p)
+	if a, p := hostForward(m, kubeAPIGuestPort); p > 0 {
+		return fmt.Sprintf("https://%s:%d", a, p)
 	}
 	return ""
 }
 
+// registryMirrors reads spec.registries, the node's image registry mirrors.
+//
+// IT REFUSES RATHER THAN SKIPS. The CRD already constrains this list, but the
+// apiserver is not in the path a bootstrap run takes: `up` and `adopt` read a
+// file straight off disk, so every schema guarantee is absent exactly where
+// this is read. A malformed entry silently dropped here is a node that pulls
+// from the internet instead — which SUCCEEDS for every public image and fails
+// only on the one image that exists nowhere else, long after this file was
+// accepted.
+//
+// The scheme check is the same one the CRD's pattern makes, for the same
+// reason and in the other half of the world: containerd rejects a scheme-less
+// endpoint at PULL time, on a node that has already installed and rebooted.
+func registryMirrors(m *unstructured.Unstructured) ([]cluster.RegistryMirror, error) {
+	var out []cluster.RegistryMirror
+
+	for i, raw := range nestedSlice(m, "spec", "registries") {
+		e, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("spec.registries[%d] is not a block of fields\n\n"+
+				"  each entry must be a mapping:\n\n    registries:\n"+
+				"      - host: 10.0.2.2:5000\n        endpoint: http://10.0.2.2:5000\n\n  (%s)",
+				i, m.GetName())
+		}
+
+		ca, err := registryCA(e)
+		if err != nil {
+			return nil, fmt.Errorf("spec.registries[%d]: %w (%s)", i, err, m.GetName())
+		}
+
+		mirror := cluster.RegistryMirror{
+			Host:     str(e["host"], ""),
+			Endpoint: str(e["endpoint"], ""),
+			CA:       ca,
+			// A non-bool reads as false, which is the safe answer for both:
+			// one weakens TLS and the other suppresses /v2/, and neither is a
+			// thing to switch on because a value could not be parsed.
+			InsecureSkipVerify: e["insecureSkipVerify"] == true,
+			OverridePath:       e["overridePath"] == true,
+		}
+
+		// THE PORT IS PART OF THE HOST. An image tagged 10.0.2.2:5000/app:v1
+		// is looked up under "10.0.2.2:5000"; an entry of "10.0.2.2" alone
+		// never matches it, and that is a mirror configured, accepted, and
+		// never consulted. Not checkable here — a registry on :443 is written
+		// without a port, correctly — so it is said rather than enforced.
+		if mirror.Host == "" {
+			return nil, fmt.Errorf("spec.registries[%d] has no host: it is the FIRST SEGMENT of an "+
+				"image reference, port included, e.g. 10.0.2.2:5000 (%s)", i, m.GetName())
+		}
+
+		if !strings.HasPrefix(mirror.Endpoint, "http://") && !strings.HasPrefix(mirror.Endpoint, "https://") {
+			return nil, fmt.Errorf("spec.registries[%d].endpoint is %q, which has no http:// or "+
+				"https:// scheme\n\n"+
+				"  the scheme is the plain-HTTP switch, not decoration: http:// is what makes\n"+
+				"  containerd speak cleartext to a registry that has no certificate, and there\n"+
+				"  is no boolean anywhere that does it instead\n\n  (%s)",
+				i, mirror.Endpoint, m.GetName())
+		}
+
+		out = append(out, mirror)
+	}
+
+	return out, nil
+}
+
 // bringUp is the -up verb: create (or adopt) the VM, then hand everything after
 // that to cluster.Up, which owns all ten steps and every line of output.
-func bringUp(ctx context.Context, d *hvf, m *unstructured.Unstructured, exists bool,
+func bringUp(ctx context.Context, d *hvf, m *unstructured.Unstructured, state driverkit.State,
 	status map[string]interface{}) error {
-	opts, err := upOptions(d, m, exists, status)
+	opts, err := upOptions(d, m, state, status)
 	if err != nil {
 		return err
 	}
@@ -321,11 +522,29 @@ func bringUp(ctx context.Context, d *hvf, m *unstructured.Unstructured, exists b
 // second way to build a machine. What is HERE is only the translation, and
 // package main is the only place that can do it — the serials, the qemu
 // forwards and the profile resolution are all its.
-func upOptions(d *hvf, m *unstructured.Unstructured, exists bool,
+func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 	status map[string]interface{}) (cluster.UpOptions, error) {
 	spec, _, _ := unstructured.NestedMap(m.Object, "spec")
 
 	image, err := d.resolveImage(spec)
+	if err != nil {
+		return cluster.UpOptions{}, err
+	}
+
+	// Host facts resolved HERE, because this is the layer that owns QEMU. The
+	// three values below are the node facts they imply, and the implication is
+	// only valid for a guest: the README requires the image architecture to
+	// match the host, which is what makes the host's console argument the
+	// guest's console argument. Nothing outside this function may assume it.
+	host, err := d.detect()
+	if err != nil {
+		return cluster.UpOptions{}, err
+	}
+
+	// Refused BEFORE the VM is created. A malformed mirror is provable from the
+	// file, and discovering it after the boot costs a state dir and a
+	// maintenance wait for a verdict this line gives for free.
+	mirrors, err := registryMirrors(m)
 	if err != nil {
 		return cluster.UpOptions{}, err
 	}
@@ -337,20 +556,46 @@ func upOptions(d *hvf, m *unstructured.Unstructured, exists bool,
 	dir := d.dir(m)
 
 	return cluster.UpOptions{
-		ClusterName:      m.GetName(),
-		ImagePath:        image,
-		StateDir:         dir,
-		TalosEndpoint:    talosEndpoint(m),
-		KubeEndpoint:     kubeEndpoint(m),
-		SystemDiskSerial: DiskSerialSystem,
-		DataDiskSerial:   dataDiskSerial(spec),
-		Detect:           d.detect,
+		ClusterName:   m.GetName(),
+		StateDir:      dir,
+		TalosEndpoint: talosEndpoint(m),
+		KubeEndpoint:  kubeEndpoint(m),
+		// A SERIAL, ALWAYS, on this path: main.go sets `serial=` on the QEMU
+		// devices itself, so a guest's disks are named by construction and the
+		// WWID alternative a DiskRef also carries has nothing to describe here.
+		SystemDisk:     cluster.DiskRef{Serial: DiskSerialSystem},
+		DataDiskSerial: dataDiskSerial(spec),
+
+		TalosVersion:  platform.InspectImageVersion(image),
+		VersionSource: fmt.Sprintf("%s (ISO volume id)", filepath.Base(image)),
+		Substrate:     fmt.Sprintf("%s/%s, %s, %s", host.OS, host.ImageArch, host.Accel, host.QEMUBinary),
+		ConsoleArg:    host.ConsoleArg,
+		// KEXEC IS DISABLED ON macOS/arm64 ONLY. Talos kexecs straight into the
+		// kernel it just installed; under QEMU on macOS that path dies in the
+		// guest on arm64 and the node never boots what it installed. Elsewhere
+		// it works and it is FASTER, so disabling it more widely is a tax paid
+		// for another platform's bug. Upstream gates its own workaround on the
+		// target ARCHITECTURE, so an Intel Mac has nothing to work around.
+		DisableKexec: host.OS == "darwin" && host.ImageArch == "arm64",
+		// spec.registries is NOT in the baremetal exclusion rule, so this same
+		// list is read the same way by adopt: a mirror is a property of the
+		// node, and only its address differs between a guest and a machine.
+		Registries: mirrors,
+
 		Boot: func() (int, error) {
-			// The same already-exists rule -apply applies, and it is what
-			// makes `-apply` then `-up` work: a VM already sitting in
+			// The same already-running rule `apply` applies, and it is what
+			// makes `apply` then `up` work: a VM already sitting in
 			// maintenance mode is ADOPTED, not duplicated. Starting a second
 			// qemu against one state dir would corrupt the disk it shares.
-			if exists {
+			//
+			// RUNNING, not "not Absent". Stopped MUST fall through to create:
+			// it has disks and no process, so there is no pid to adopt —
+			// status is the {stateDir} map Observe returns for a stopped
+			// machine, toInt(nil) is 0, and cluster.Up would report a VM whose
+			// process does not exist and then wait out the whole maintenance
+			// budget against an address nothing is listening on. Widening this
+			// test is a hang, not a misprint.
+			if state == driverkit.Running {
 				return toInt(status["pid"]), nil
 			}
 			return d.create(m, dir)
@@ -367,27 +612,60 @@ func (h *hvf) dir(m *unstructured.Unstructured) string {
 	return filepath.Join(h.stateRoot, driverkit.Str(m, "spec", "site"), string(m.GetUID()))
 }
 
-// Observe reads the pidfile the hypervisor itself wrote and checks LIVENESS.
-// Never trust a state file alone: talosctl's `cluster show` deserialises
-// state.yaml and reports a long-dead cluster as present.
-func (h *hvf) Observe(ctx context.Context, m *unstructured.Unstructured) (bool, map[string]interface{}, error) {
+// Observe reports what the HOST says, in three states.
+//
+// Absent is keyed on system.qcow2 rather than on the state dir, because that
+// file is exactly what create() would reuse. Both partial-failure paths then
+// land correctly with no special case: a create that died before ensureQcow2
+// leaves a dir with no disk and reads Absent, so Create retries; disks made but
+// qemu never launched reads Stopped, so Create re-execs.
+//
+// Running demands a VERIFIED process, not a live pid. Never trust a state file
+// alone — talosctl's `cluster show` deserialises state.yaml and reports a
+// long-dead cluster as present — and a pidfile is a state file too: after a
+// host reboot it can name a live stranger. Reading disk here only ever tells
+// Absent from Stopped, and neither claims the machine is usable.
+//
+// This function is READ-ONLY. Unlinking a stale pidfile here would be tidy and
+// is refused: an observer with side effects is how a status call quietly
+// becomes a mutation. qemu's -pidfile truncates on next start anyway.
+func (h *hvf) Observe(ctx context.Context, m *unstructured.Unstructured) (driverkit.State, map[string]interface{}, error) {
 	dir := h.dir(m)
-	pid := readPid(dir)
-	if pid <= 0 || !processAlive(pid) {
-		return false, nil, nil
+
+	// Hardware answers first. Everything below this line reasons about
+	// system.qcow2, a file a machine on a desk does not have and never will.
+	if isBaremetal(m) {
+		return observeBaremetal(m, dir)
 	}
+
+	if _, err := os.Stat(filepath.Join(dir, "system.qcow2")); err != nil {
+		if os.IsNotExist(err) {
+			return driverkit.Absent, nil, nil
+		}
+		return driverkit.Absent, nil, err
+	}
+
+	pid := readPid(dir)
+	if pid <= 0 || !platform.ProcessMatches(pid, dir) {
+		return driverkit.Stopped, map[string]interface{}{"stateDir": dir}, nil
+	}
+
 	// talosEndpoint, not a second hand-rolled scan of hostForwards: status's
 	// apiEndpoint and the endpoint -up hands cluster.Up are two answers to one
 	// question, and nothing but this shared call keeps them equal. The
 	// hand-rolled loop also reported "127.0.0.1:0" for an entry with a
 	// guestPort and no hostPort — an address, printed as status, that cannot
 	// answer.
-	return true, map[string]interface{}{
+	return driverkit.Running, map[string]interface{}{
 		"pid": int64(pid), "stateDir": dir, "apiEndpoint": talosEndpoint(m),
 	}, nil
 }
 
 func (h *hvf) Create(ctx context.Context, m *unstructured.Unstructured) error {
+	if isBaremetal(m) {
+		return ignoreBaremetalOp(m, "create")
+	}
+
 	if _, err := h.create(m, h.dir(m)); err != nil {
 		return err
 	}
@@ -414,11 +692,264 @@ func (h *hvf) Create(ctx context.Context, m *unstructured.Unstructured) error {
 	return nil
 }
 
+// Stop halts the VM and leaves every artifact in place.
+//
+// The ladder is deliberate and it escalates LOUDLY. A stop that silently
+// SIGKILLs after announcing a graceful shutdown is how you find out months
+// later that none of your stops were ever clean.
+func (h *hvf) Stop(ctx context.Context, m *unstructured.Unstructured) error {
+	if isBaremetal(m) {
+		return ignoreBaremetalOp(m, "stop")
+	}
+
+	state, _, err := h.Observe(ctx, m)
+	if err != nil {
+		return err
+	}
+	if state != driverkit.Running {
+		return nil // already stopped, or never existed
+	}
+
+	dir := h.dir(m)
+	pid := readPid(dir)
+
+	if err := h.shutdownGuest(ctx, m); err != nil {
+		log.Printf("graceful shutdown unavailable (%v); falling back to signals", err)
+	} else {
+		gone, err := waitGone(ctx, pid, dir, gracefulStopTimeout)
+		if err != nil {
+			// Named, not generic. The guest was ASKED to power off and may well
+			// be part-way through doing it; what we no longer know is whether it
+			// finished. Saying so is the difference between an operator who
+			// re-runs the stop and one who believes the machine is down.
+			return fmt.Errorf("stop of %s abandoned while waiting for the guest to power "+
+				"off; it may still be running: %w", m.GetName(), err)
+		}
+		if gone {
+			return nil
+		}
+		log.Printf("guest did not power off within %s; escalating to SIGTERM", gracefulStopTimeout)
+	}
+	return halt(ctx, pid, dir)
+}
+
+const (
+	gracefulStopTimeout = 60 * time.Second
+	sigtermTimeout      = 5 * time.Second
+	// How often waitGone re-asks, and therefore the WORST-CASE latency of a
+	// Ctrl-C landing mid-wait. Shortening it makes cancellation crisper and
+	// costs darwin a `ps` fork every tick; see waitGone.
+	pollInterval = 100 * time.Millisecond
+	// The budget for the Shutdown REQUEST, not for the power-off it triggers —
+	// that is gracefulStopTimeout, waited out by Stop against the process.
+	// Talos answers this RPC and runs its shutdown sequence afterwards, so a
+	// reachable guest replies in milliseconds over a loopback forward.
+	//
+	// It exists because ctx here reaches Stop unbounded (cobra's, or the
+	// controller loop's), and a gRPC call is only fail-fast once the channel
+	// reports TRANSIENT_FAILURE. A guest whose apid accepts the TCP connection
+	// and then never completes the TLS handshake leaves the channel CONNECTING
+	// forever, and the call blocks with it — so `tinq stop` on a half-wedged
+	// node would hang instead of falling through to the signal ladder. A
+	// wedged guest must still be stoppable; that is the failure this bounds.
+	shutdownRequestTimeout = 15 * time.Second
+)
+
+// shutdownGuest asks the GUEST to power itself off, over the authenticated
+// Talos API, so the filesystem is quiesced before the VM goes.
+//
+// The alternative is what Stop falls back to: signalling the QEMU PROCESS,
+// which is a power cut the guest never learns about. etcd survives that (its
+// WAL is fsynced), but a workload's in-flight writes are the exposure.
+//
+// The talosconfig is the one cluster.Up wrote into this machine's state dir at
+// step 4. Reading it from there rather than $TALOSCONFIG is deliberate: the
+// credentials that stop a machine must be THAT machine's, and the operator's
+// environment may be pointed anywhere.
+//
+// A machine in MAINTENANCE MODE — created by `apply`, never bootstrapped —
+// never gets this rung: it has no talosconfig, so it cannot satisfy the mutual
+// TLS that Shutdown requires, and this returns immediately rather than
+// dialling. That is safe rather than a compromise — a maintenance node is a
+// booted ISO with no applied config and nothing persistent to corrupt.
+//
+// talosconfig is SECRET. It is never logged and never interpolated into an
+// error; see cluster.errSecretParse for why even a parser's own message is
+// withheld.
+func (h *hvf) shutdownGuest(ctx context.Context, m *unstructured.Unstructured) error {
+	// os.ReadFile's error quotes the PATH and never the contents, so it is
+	// safe to wrap. Nothing below may relax that.
+	talosconfig, err := os.ReadFile(filepath.Join(h.dir(m), "talosconfig"))
+	if err != nil {
+		return fmt.Errorf("no credentials to ask the guest with (a machine still in "+
+			"maintenance mode has none): %w", err)
+	}
+
+	endpoint := talosEndpoint(m)
+
+	ctx, cancel := context.WithTimeout(ctx, shutdownRequestTimeout)
+	defer cancel()
+
+	c, err := cluster.AuthenticatedClient(ctx, talosconfig, endpoint)
+	if err != nil {
+		return fmt.Errorf("authenticated Talos client: %w", err)
+	}
+
+	defer c.Close() //nolint:errcheck
+
+	// MachineService.Shutdown, exposed on the client — NOT LifecycleService,
+	// which carries only Install and Upgrade.
+	//
+	// It returns once the node has ACCEPTED the request; Talos runs the
+	// shutdown sequence after replying. So nil here means "asked", not "gone",
+	// and Stop is right to wait on the process afterwards rather than trust it.
+	if err := c.Shutdown(ctx); err != nil {
+		return fmt.Errorf("asking the Talos API at %s to power the guest off: %w", endpoint, err)
+	}
+
+	return nil
+}
+
+// halt escalates signals at pid until it is no longer this machine's qemu.
+//
+// EVERY signal is gated on ProcessMatches, THE FIRST ONE INCLUDED. A pidfile
+// that outlived its qemu names a pid the kernel is free to hand to someone
+// else — after a reboot, to a low-numbered stranger, plausibly another
+// machine's qemu — and an ungated opening SIGTERM would take that process down.
+// Gating only the later rungs is not a weaker version of this rule, it is the
+// absence of it: the first signal is the one that lands.
+//
+// The window is not hypothetical even though Observe already verified the pid.
+// Stop RE-READS the pidfile rather than reusing what Observe proved, so these
+// are two different reads with a graceful-shutdown attempt in between; and the
+// most likely outcome of that attempt is an error CAUSED by the guest going
+// away (the RPC drops mid-power-off), which logs "graceful shutdown
+// unavailable" and arrives here with a pid that has just exited. That is the
+// recycled-pid case exactly, reached by the ordinary success path.
+//
+// Measured against the ungated version: halt(strangerPid, dir) returned nil in
+// ~10µs having SIGTERMed a live unrelated process — and reported success,
+// because waitGone read the non-match as "gone".
+//
+// The pid gate is not redundant with it. kill(0, sig) is NOT a no-op: POSIX
+// sends the signal to every process in OUR OWN process group. readPid reports 0
+// for a pidfile that has gone — which a concurrent destroy causes, since it
+// removes the whole state dir — so the pid can become 0 between reads and an
+// ungated ladder would SIGTERM and then SIGKILL tinq itself.
+//
+// The gate is <= 0, not == 0, and the negative half earns its place: readPid
+// runs the pidfile through strconv.Atoi, so a corrupt or partially written one
+// reading "-1" yields a NEGATIVE pid rather than a parse failure. kill(-1, sig)
+// is strictly worse than kill(0, sig) — it signals every process the caller has
+// permission to signal, not merely its own process group. ProcessMatches covers
+// both cases, but it does not EXPLAIN them, and a future reader deleting the
+// comparison as dead code is the failure this paragraph prevents.
+//
+// A CANCELLED ctx stops the ladder where it stands and returns the error: it
+// never escalates, and it never reports success. Both halves are deliberate.
+// Escalating would read Ctrl-C as "kill it harder" when it means "stop what you
+// are doing" — the operator interrupting a stop did not ask for a power cut, and
+// the SIGTERM already sent may yet be honoured. Reporting nil would be worse
+// still: the process is very likely alive, and Stop's caller would record a
+// machine as stopped that is still running.
+//
+// The first SIGTERM is NOT gated on ctx. Cancellation cuts the waiting short,
+// which is what took ~85s; the signal itself is instant, already gated on
+// ProcessMatches, and skipping it would mean an interrupted destroy left a qemu
+// running that it had not even asked to exit.
+func halt(ctx context.Context, pid int, dir string) error {
+	if pid <= 0 || !platform.ProcessMatches(pid, dir) {
+		return nil
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	gone, err := waitGone(ctx, pid, dir, sigtermTimeout)
+	if err != nil {
+		return err
+	}
+	if gone {
+		return nil
+	}
+	log.Printf("process %d survived SIGTERM after %s; escalating to SIGKILL", pid, sigtermTimeout)
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+
+	gone, err = waitGone(ctx, pid, dir, sigtermTimeout)
+	if err != nil {
+		return err
+	}
+	if !gone {
+		return fmt.Errorf("process %d survived SIGKILL", pid)
+	}
+	return nil
+}
+
+// waitGone polls until the process is no longer OUR qemu, the deadline passes,
+// or ctx is cancelled. It re-checks identity rather than mere liveness, so a pid
+// recycled mid-wait cannot read as "still running".
+//
+// The three outcomes are distinct and callers must keep them distinct:
+// (true, nil) gone, (false, nil) deadline passed and it is STILL ours — the only
+// outcome that may escalate — and (false, err) the wait was ABANDONED, having
+// learned nothing. Collapsing the third into either of the others is the bug
+// this signature exists to prevent: read as "gone" it reports a success that did
+// not happen, read as "still running" it escalates to SIGKILL on a Ctrl-C, and
+// Ctrl-C means "stop what you are doing", not "kill it harder".
+//
+// The poll is a select on ctx.Done(), not time.Sleep, because a sleeping wait is
+// an UNINTERRUPTIBLE one. With a bare sleep the whole ladder was deaf to
+// cancellation for as long as it ran — up to ~85s per machine (15s shutdown RPC
+// + 60s graceful + 5s SIGTERM + 5s SIGKILL) — and driverkit.Run only looks at
+// ctx BETWEEN reconcile ticks, never during one, so a Ctrl-C mid-stop was
+// ignored for over a minute with no output to say why. Cancellation is now
+// observed within one poll interval.
+//
+// A Ticker rather than a per-iteration Timer: one allocation for a loop that can
+// run 600 times across the graceful budget, and nothing to leak on the way out.
+//
+// Identity is also what gets this right for a ZOMBIE, which kill(pid, 0) calls
+// alive: a zombie's command line is empty, so it matches nothing and the wait
+// ends at once instead of burning the full deadline and then SIGKILLing a
+// corpse. That trade is paid knowingly, and destroy pays it too now that it
+// shares this loop: on darwin ProcessMatches forks `ps`, ten times a second
+// for as long as the wait runs — up to 51 forks across a full 5s deadline,
+// where a plain liveness check was a single syscall.
+func waitGone(ctx context.Context, pid int, dir string, d time.Duration) (bool, error) {
+	deadline := time.Now().Add(d)
+	tick := time.NewTicker(pollInterval)
+	defer tick.Stop()
+	for {
+		// Identity first, deadline second, so a zero or already-expired budget
+		// still gets exactly one check — the same shape the sleeping loop had,
+		// where the post-deadline re-check was that final look.
+		if !platform.ProcessMatches(pid, dir) {
+			return true, nil
+		}
+		if !time.Now().Before(deadline) {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			// Named, not generic: the caller has to be able to tell "we gave up
+			// waiting" from "it is gone", because the process is very likely
+			// still running and a caller that believes it stopped acts on a
+			// false premise.
+			return false, fmt.Errorf("gave up waiting for process %d to exit: %w", pid, ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
 // Destroy takes the WHOLE SCC: the process (which sweeps everything inside the
 // VM) and the state dir (everything outside it). Idempotent — it is called on
 // every delete tick until it succeeds.
+//
+// Except on hardware, where the SCC holds no machine to take and the state dir
+// holds the only credential to one that survives its own registration — see
+// forgetBaremetal.
 func (h *hvf) Destroy(ctx context.Context, m *unstructured.Unstructured) error {
-	return destroy(h.dir(m))
+	if isBaremetal(m) {
+		return forgetBaremetal(m, h.dir(m))
+	}
+	return destroy(ctx, h.dir(m))
 }
 
 func readPid(dir string) int {
@@ -542,7 +1073,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		// difference between "runs on my machine" and "runs in a demo". Set
 		// hostAddr to 0.0.0.0 (or a specific interface address) to publish it.
 		// That is a deliberate, per-port exposure decision, not a global switch.
-		addr := str(h["hostAddr"], "127.0.0.1")
+		addr := str(h["hostAddr"], defaultHostAddr)
 		switch strings.ToLower(str(h["protocol"], "tcp")) {
 		case "udp":
 			netdev += fmt.Sprintf(",hostfwd=udp:%s:%d-:%d", addr, hp, gp)
@@ -673,17 +1204,48 @@ func ensureQcow2(path, size string) error {
 }
 
 // destroy is idempotent — it is called on every delete tick until it succeeds.
-func destroy(dir string) error {
-	if b, err := os.ReadFile(filepath.Join(dir, "qemu.pid")); err == nil {
-		if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
-			_ = syscall.Kill(pid, syscall.SIGTERM)
-			for i := 0; i < 50 && processAlive(pid); i++ {
-				time.Sleep(100 * time.Millisecond)
-			}
-			if processAlive(pid) {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
+func destroy(ctx context.Context, dir string) error {
+	// Destroy does NOT ask the guest to shut down, and that is deliberate: the
+	// disks are deleted immediately below, so a clean shutdown buys nothing and
+	// costs up to a minute. The asymmetry with Stop is the entire point of
+	// having both — an unexplained asymmetry reads as an oversight, so this
+	// says it out loud.
+	//
+	// The ladder is halt's, not a second copy of it.
+	//
+	// This used to be an inline 50 x 100ms loop over a bare kill(pid, 0) — the
+	// same 5s semantics halt spells out, written a second time — and the two
+	// copies DIVERGED exactly where it hurts: this one signalled whatever the
+	// pidfile named, gating nothing. The rule that every signal is gated on
+	// ProcessMatches, THE FIRST ONE INCLUDED, is stated on halt now and kept
+	// where the signals are, so no caller can route around it and no second
+	// copy can drift away from it again.
+	if err := halt(ctx, readPid(dir), dir); err != nil {
+		// A CANCELLED teardown is the one failure that must NOT sweep. The
+		// ladder stopped early, so the qemu is probably still live and still
+		// has system.qcow2 open — deleting the state dir out from under it is
+		// not a teardown, it is corruption with a running writer. Blocking is
+		// safe precisely because this is idempotent: the next delete tick
+		// retries, and until then the finalizer holds, which driverkit's
+		// reconcile already calls the correct outcome.
+		//
+		// A cancel arriving between halt's return and this check reads as
+		// cancellation for an error that was really "survived SIGKILL". That
+		// costs one retry of an idempotent sweep; the reverse mistake costs a
+		// disk.
+		//
+		// An already-gone machine never reaches here: halt's pid/ProcessMatches
+		// gate returns nil without waiting, so teardown still needs neither a
+		// live hypervisor nor a reachable node.
+		if ctx.Err() != nil {
+			return fmt.Errorf("teardown of %s abandoned before the process was confirmed "+
+				"gone; state left in place rather than swept from under a live qemu: %w", dir, err)
 		}
+		// Not fatal, and the asymmetry is the point: destroy is called on every
+		// delete tick until it succeeds, so a process we could not kill must
+		// not stop the sweep. Leaving the disks behind forever is the worse
+		// outcome, and the escalation already logged why it got here.
+		log.Printf("destroy: %v; removing state anyway", err)
 	}
 	if err := os.RemoveAll(dir); err != nil {
 		return err
@@ -695,8 +1257,6 @@ func destroy(dir string) error {
 	os.Remove(filepath.Dir(dir))
 	return nil
 }
-
-func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
 // ensureEFIVars makes path a per-machine, writable copy of the firmware's own
 // nvram template, VERBATIM. UEFI vars must be per-machine: a shared copy is how
@@ -742,6 +1302,21 @@ func ensureEFIVars(path, template string) error {
 }
 
 // ── tiny helpers ────────────────────────────────────────────────────────────
+
+// registryCA resolves the optional CA for a mirror. caFile is a path read at
+// generate time — the seed exports /etc/ssl/seed/root_ca.crt — and ca is inline
+// PEM. caFile wins if both are set; neither is the common case. Read here, in
+// cmd/tinq, so cluster/ stays pure: it receives already-resolved bytes.
+func registryCA(e map[string]interface{}) (string, error) {
+	if p := str(e["caFile"], ""); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return "", fmt.Errorf("caFile %q could not be read: %w", p, err)
+		}
+		return string(b), nil
+	}
+	return str(e["ca"], ""), nil
+}
 
 func str(v interface{}, def string) string {
 	if s, ok := v.(string); ok && s != "" {

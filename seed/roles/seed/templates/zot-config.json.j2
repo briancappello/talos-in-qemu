@@ -1,0 +1,29 @@
+{
+  "distSpecVersion": "1.1.0",
+  "storage": { "rootDirectory": "/var/lib/registry", "gc": true, "dedupe": true },
+  "http": {
+    "address": "0.0.0.0",
+    "port": "5000",
+    "auth": { "htpasswd": { "path": "/etc/zot/htpasswd" } },
+    "accessControl": {
+      "repositories": {
+        "**": {
+          "anonymousPolicy": ["read"],
+          "policies": [
+            { "users": ["{{ seed_registry_user }}"], "actions": ["read", "create", "update", "delete"] }
+          ]
+        }
+      }
+    }
+  },
+  "log": { "level": "info" },
+  "extensions": {
+    "sync": {
+      "enable": true,
+      "registries": [
+        { "urls": ["https://registry-1.docker.io"], "onDemand": true, "tlsVerify": true, "content": [{ "prefix": "**" }] },
+        { "urls": ["https://ghcr.io"], "onDemand": true, "tlsVerify": true, "content": [{ "prefix": "**" }] }
+      ]
+    }
+  }
+}

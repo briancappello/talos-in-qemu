@@ -1,0 +1,22 @@
+[Unit]
+Description=Authentik server
+After=network-online.target seed-network.service postgres.service redis.service
+Wants=network-online.target
+Requires=postgres.service redis.service
+
+[Container]
+Image={{ seed_authentik_image }}
+ContainerName=authentik-server
+Network=seed
+NetworkAlias=auth.{{ seed_domain }}
+EnvironmentFile={{ seed_state_root }}/authentik/authentik.env
+Volume={{ seed_state_root }}/authentik/media:/media
+Volume={{ seed_state_root }}/authentik/templates:/templates
+Exec=server
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

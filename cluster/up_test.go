@@ -13,7 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coglative/talos-in-qemu/platform"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // THE OUTPUT IS THE FEATURE, so the output is what this file tests.
@@ -48,15 +49,20 @@ const (
 	fakeTalosconfig  = "talosconfig-secret-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 	fakeSecrets      = "secretsbundle-secret-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 	fakeKubeconfig   = "kubeconfig-secret-DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+	// The talosconfig a PREVIOUS `up` left in the state dir. It is deliberately
+	// a different string from fakeTalosconfig, which is what THIS run's config
+	// generation would produce: a resumed bring-up that quietly generated fresh
+	// material and used that instead would be invisible if the two agreed, and
+	// what it produces is a new CA the installed node does not trust.
+	existingTalosconfig = "existing-talosconfig-secret-EEEEEEEEEEEEEEEEEEEEEEEEEEEE"
 )
 
 // recorder captures what Up asked its hooks to do, so a test can assert on
 // "storage was never installed" as well as on what got printed.
 type recorder struct {
-	imageVersion string
-	generateErr  error
-	failAt       string
-	err          error
+	generateErr error
+	failAt      string
+	err         error
 
 	called []string
 	input  ConfigInput
@@ -65,6 +71,11 @@ type recorder struct {
 	// talosconfig to a node in maintenance mode, or installing storage with
 	// the machine config, fails on the node rather than here.
 	payload map[string][]byte
+	// endpoint is the address each operation was pointed at. A node with a
+	// static block ANSWERS AT TWO ADDRESSES over its life, and every hook below
+	// takes a string — so pointing bootstrap at the maintenance address still
+	// COMPILES, and fails minutes later against a node that stopped holding it.
+	endpoint map[string]string
 }
 
 func (r *recorder) call(name string, payload ...[]byte) error {
@@ -89,6 +100,16 @@ func (r *recorder) call(name string, payload ...[]byte) error {
 	return nil
 }
 
+func (r *recorder) at(name, endpoint string, payload ...[]byte) error {
+	if r.endpoint == nil {
+		r.endpoint = map[string]string{}
+	}
+
+	r.endpoint[name] = endpoint
+
+	return r.call(name, payload...)
+}
+
 func (r *recorder) did(name string) bool {
 	for _, c := range r.called {
 		if c == name {
@@ -101,7 +122,6 @@ func (r *recorder) did(name string) bool {
 
 func (r *recorder) hooks() *upHooks {
 	return &upHooks{
-		detectVersion: func(string) string { return r.imageVersion },
 		generateConfig: func(in ConfigInput) (*Generated, error) {
 			r.input = in
 
@@ -130,20 +150,20 @@ func (r *recorder) hooks() *upHooks {
 				Secrets:      []byte(fakeSecrets),
 			}, nil
 		},
-		waitMaintenance: func(context.Context, string, time.Duration) error {
-			return r.call("waitMaintenance")
+		waitMaintenance: func(_ context.Context, endpoint string, _ time.Duration) error {
+			return r.at("waitMaintenance", endpoint)
 		},
-		applyConfig: func(_ context.Context, _ string, config []byte) error {
-			return r.call("applyConfig", config)
+		applyConfig: func(_ context.Context, endpoint string, config []byte) error {
+			return r.at("applyConfig", endpoint, config)
 		},
-		waitBootstrapReady: func(_ context.Context, talosconfig []byte, _ string, _ time.Duration) error {
-			return r.call("waitBootstrapReady", talosconfig)
+		waitBootstrapReady: func(_ context.Context, talosconfig []byte, endpoint string, _ time.Duration) error {
+			return r.at("waitBootstrapReady", endpoint, talosconfig)
 		},
-		bootstrap: func(_ context.Context, talosconfig []byte, _ string) error {
-			return r.call("bootstrap", talosconfig)
+		bootstrap: func(_ context.Context, talosconfig []byte, endpoint string) error {
+			return r.at("bootstrap", endpoint, talosconfig)
 		},
-		kubeconfig: func(_ context.Context, talosconfig []byte, _ string) ([]byte, error) {
-			if err := r.call("kubeconfig", talosconfig); err != nil {
+		kubeconfig: func(_ context.Context, talosconfig []byte, endpoint string) ([]byte, error) {
+			if err := r.at("kubeconfig", endpoint, talosconfig); err != nil {
 				return nil, err
 			}
 
@@ -158,25 +178,18 @@ func (r *recorder) hooks() *upHooks {
 	}
 }
 
-// fakePlatform is the host facts Detect would return. NONE of these values may
-// be the ones the test binary's own host would produce: a console arg of
-// "console=ttyS0" or an OS read from runtime.GOOS would let a hardcoded host
-// fact in up.go pass on the developer's machine and fail nowhere.
+// The three fixture strings the CALLER resolved. NONE of them may be a value
+// this test binary's own host would produce: a console arg of "console=ttyS0",
+// or an emulator binary that really exists, would let a host fact leaking back
+// into up.go pass on the developer's machine and fail nowhere.
 //
-// OS is pinned to "linux" for exactly that reason, and it is the field that
-// caught the leak — up.go printed runtime.GOOS, so the transcript said
-// "darwin/amd64" on a Mac while every other value on the line was injected.
-func fakePlatform() *platform.Platform {
-	return &platform.Platform{
-		OS:         "linux",
-		QEMUBinary: "qemu-system-fake",
-		Machine:    "q35",
-		Accel:      "kvm",
-		CPU:        "host",
-		ConsoleArg: "console=ttyFAKE0",
-		ImageArch:  "amd64",
-	}
-}
+// The substrate reads like a QEMU one because that is the caller this suite
+// stands in for, but "qemu-system-fake" is deliberately a binary no host has.
+const (
+	fakeSubstrate     = "linux/amd64, kvm, qemu-system-fake"
+	fakeConsoleArg    = "console=ttyFAKE0"
+	fakeVersionSource = "talos-" + imageTalosVersion + "-amd64.iso (ISO volume id)"
+)
 
 // upFixture builds an UpOptions wired to a recorder, a temp state dir and a
 // buffer, plus the booted flag so "the guard ran before the VM was created"
@@ -194,20 +207,22 @@ func newFixture(t *testing.T) *upFixture {
 	t.Helper()
 
 	f := &upFixture{
-		rec: &recorder{imageVersion: imageTalosVersion},
+		rec: &recorder{},
 		out: &strings.Builder{},
 		dir: t.TempDir(),
 	}
 
 	f.opts = UpOptions{
-		ClusterName:      "probe",
-		ImagePath:        filepath.Join(t.TempDir(), "talos-"+imageTalosVersion+"-amd64.iso"),
-		StateDir:         f.dir,
-		TalosEndpoint:    "127.0.0.1:50000",
-		KubeEndpoint:     "https://127.0.0.1:6443",
-		SystemDiskSerial: "talos-system",
-		DataDiskSerial:   "talos-data",
-		Detect:           func() (*platform.Platform, error) { return fakePlatform(), nil },
+		ClusterName:    "probe",
+		StateDir:       f.dir,
+		TalosEndpoint:  "127.0.0.1:50000",
+		KubeEndpoint:   "https://127.0.0.1:6443",
+		SystemDisk:     DiskRef{Serial: "talos-system"},
+		DataDiskSerial: "talos-data",
+		TalosVersion:   imageTalosVersion,
+		VersionSource:  fakeVersionSource,
+		Substrate:      fakeSubstrate,
+		ConsoleArg:     fakeConsoleArg,
 		Boot: func() (int, error) {
 			f.booted++
 
@@ -248,29 +263,30 @@ func wants(t *testing.T, transcript string, fragments ...string) {
 	}
 }
 
-// The step line is the contract: the number, the total and the label. Asserting
-// on the label alone lets two steps swap places and the suite stay green — and
-// the ORDER is the thing an operator reads a bring-up transcript for.
-func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
-	f := newFixture(t)
-	transcript := f.mustRun(t)
+// announcedSteps is every step line a bring-up prints, in order. It is shared
+// because a RESUMED bring-up has to print all ten of them too: steps it skips
+// are announced as skipped, never dropped, so the numbering cannot silently
+// close up and describe a sequence that did not run.
+var announcedSteps = []string{
+	"[ 1/10] platform",
+	"[ 2/10] version",
+	"[ 3/10] version guard",
+	"[ 4/10] boot",
+	"[ 5/10] maintenance",
+	"[ 6/10] config",
+	"[ 7/10] apply-config",
+	"[ 8/10] bootstrap",
+	"[ 9/10] kubeconfig",
+	"[10/10] storage",
+}
 
-	steps := []string{
-		"[ 1/10] platform",
-		"[ 2/10] image",
-		"[ 3/10] version guard",
-		"[ 4/10] boot",
-		"[ 5/10] maintenance",
-		"[ 6/10] config",
-		"[ 7/10] apply-config",
-		"[ 8/10] bootstrap",
-		"[ 9/10] kubeconfig",
-		"[10/10] storage",
-	}
+// stepsInOrder asserts every announced step is present, once, in order.
+func stepsInOrder(t *testing.T, transcript string) {
+	t.Helper()
 
 	at := -1
 
-	for _, step := range steps {
+	for _, step := range announcedSteps {
 		i := strings.Index(transcript, step)
 		if i < 0 {
 			t.Fatalf("no %q line in the transcript\n%s", step, redact(transcript))
@@ -284,6 +300,16 @@ func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
 
 		at = i
 	}
+}
+
+// The step line is the contract: the number, the total and the label. Asserting
+// on the label alone lets two steps swap places and the suite stay green — and
+// the ORDER is the thing an operator reads a bring-up transcript for.
+func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
+	f := newFixture(t)
+	transcript := f.mustRun(t)
+
+	stepsInOrder(t, transcript)
 
 	// A reason printed flush left reads as a step of its own, and the
 	// transcript's whole shape is "the operation, then why". Every line inside
@@ -302,13 +328,36 @@ func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
 
 	// The operation each step performed, not just its name.
 	wants(t, transcript,
-		"linux/amd64", "qemu-system-fake", "kvm",
-		"talos-"+imageTalosVersion+"-amd64.iso -> "+imageTalosVersion+" (ISO volume id)",
+		fakeSubstrate,
+		fakeVersionSource+" -> "+imageTalosVersion,
 		"machinery "+GeneratorVersion()+" >= image "+imageTalosVersion,
 		"pid 163166", "api 127.0.0.1:50000",
 		"controlplane.yaml", "talosconfig",
 		"local-path-provisioner "+LocalPathVersion,
 	)
+}
+
+// Step 1 and step 2 are the caller's lines now. This package cannot assemble
+// either one: an accelerator and an emulator binary describe a QEMU guest, and
+// an ISO volume id is not where a running node's version comes from.
+func TestUpRendersSubstrateAndVersionFromOptions(t *testing.T) {
+	f := newFixture(t)
+	f.opts.Substrate = "baremetal, 192.168.1.50"
+	f.opts.TalosVersion = imageTalosVersion
+	f.opts.VersionSource = "the node's maintenance API"
+
+	out := f.mustRun(t)
+
+	if !strings.Contains(out, "baremetal, 192.168.1.50") {
+		t.Errorf("step 1 did not print the caller's substrate line\n"+
+			"  reason: cluster/ no longer knows what a hypervisor is, so an "+
+			"accelerator and an emulator binary cannot come from here\n%s", redact(out))
+	}
+
+	if !strings.Contains(out, "the node's maintenance API -> "+imageTalosVersion) {
+		t.Errorf("step 2 did not print the caller's version source\n"+
+			"  reason: a baremetal node has no ISO to read a volume id from\n%s", redact(out))
+	}
 }
 
 // CARRIED REQUIREMENT 1. CheckVersion returns (checked, err) and `checked` is
@@ -323,7 +372,7 @@ func TestUpPrintsTheTenAnnouncedStepsInOrder(t *testing.T) {
 // failure the ISO's volume id already proved.
 func TestUpRefusesAnImageItCouldNotIdentifyBeforeBooting(t *testing.T) {
 	f := newFixture(t)
-	f.rec.imageVersion = ""
+	f.opts.TalosVersion = ""
 
 	err := f.run(t)
 	if err == nil {
@@ -381,7 +430,7 @@ func TestUpDoesNotAnnounceASkippedGuardForAKnownImage(t *testing.T) {
 // failure that cost nothing to see coming.
 func TestUpRefusesAnImageNewerThanTheGeneratorBeforeBooting(t *testing.T) {
 	f := newFixture(t)
-	f.rec.imageVersion = "v1.99.0"
+	f.opts.TalosVersion = "v1.99.0"
 
 	err := f.run(t)
 	if err == nil {
@@ -411,7 +460,7 @@ func TestUpAnnouncesStorageWasSkippedWithoutADataDisk(t *testing.T) {
 
 	wants(t, transcript,
 		"[10/10] storage",
-		"skipped (spec.dataDisk not set)",
+		"skipped (no dataDisk and no ephemeralMaxSize)",
 	)
 
 	if f.rec.did("installStorage") {
@@ -444,7 +493,7 @@ func TestUpAnnouncesTheReasonForEveryNonObviousDecision(t *testing.T) {
 	}{
 		{
 			"diskSelector by serial",
-			[]string{"diskSelector: serial talos-system", "coin flip"},
+			[]string{`diskSelector: serial "talos-system"`, "coin flip"},
 			"a size matcher picks between the OS target and the data disk once both are large",
 		},
 		{
@@ -472,21 +521,30 @@ func TestUpAnnouncesTheReasonForEveryNonObviousDecision(t *testing.T) {
 	}
 }
 
-// The console arg is the host's, from Detect. A literal in up.go would read
-// correctly on amd64 and put an arm64 node's console on a UART it does not have.
-func TestUpCarriesTheHostsConsoleArgIntoTheConfig(t *testing.T) {
+// Every node fact Up is GIVEN reaches GenerateConfig unaltered, and the two
+// worth a test of their own are the console arg and the API address. The
+// console arg is the caller's — up.go no longer derives one, and a literal
+// here would read correctly on amd64 and put an arm64 node's console on a UART
+// it does not have. The address is DERIVED, from the endpoint, which is the
+// one field in this struct nobody hands over ready-made.
+func TestUpCarriesTheCallersNodeFactsIntoTheConfig(t *testing.T) {
 	f := newFixture(t)
+	// NOT the fixture's loopback endpoint. APIAddress is asserted below, and
+	// against 127.0.0.1:50000 a hardcoded "127.0.0.1" written beside the
+	// endpoint in up.go is indistinguishable from deriving it — which is the
+	// exact defect the derivation exists to remove.
+	f.opts.TalosEndpoint = "192.168.1.50:50000"
 	f.mustRun(t)
 
 	if f.rec.input.ConsoleArg != "console=ttyFAKE0" {
-		t.Errorf("GenerateConfig got ConsoleArg %q, want the host's console=ttyFAKE0\n"+
+		t.Errorf("GenerateConfig got ConsoleArg %q, want the caller's console=ttyFAKE0\n"+
 			"  reason: hardcoding ttyS0 gives an arm64 node a serial console it does not have",
 			f.rec.input.ConsoleArg)
 	}
 
-	if f.rec.input.SystemDiskSerial != "talos-system" || f.rec.input.DataDiskSerial != "talos-data" {
-		t.Errorf("GenerateConfig got serials %q/%q, want the caller's talos-system/talos-data",
-			f.rec.input.SystemDiskSerial, f.rec.input.DataDiskSerial)
+	if f.rec.input.SystemDisk != (DiskRef{Serial: "talos-system"}) || f.rec.input.DataDiskSerial != "talos-data" {
+		t.Errorf("GenerateConfig got disks %v/%q, want the caller's talos-system/talos-data",
+			f.rec.input.SystemDisk, f.rec.input.DataDiskSerial)
 	}
 
 	if f.rec.input.TalosVersion != imageTalosVersion {
@@ -497,6 +555,13 @@ func TestUpCarriesTheHostsConsoleArgIntoTheConfig(t *testing.T) {
 
 	if f.rec.input.Endpoint != "https://127.0.0.1:6443" {
 		t.Errorf("GenerateConfig got Endpoint %q, want the Kubernetes API URL", f.rec.input.Endpoint)
+	}
+
+	if f.rec.input.APIAddress != "192.168.1.50" {
+		t.Errorf("GenerateConfig got APIAddress %q, want the host part of TalosEndpoint 192.168.1.50\n"+
+			"  reason: apid's certificate must name the address the client dials; an address written "+
+			"beside the endpoint instead of derived from it is a TLS failure minutes into a bring-up",
+			f.rec.input.APIAddress)
 	}
 
 	if f.rec.input.ClusterName != "probe" {
@@ -620,6 +685,22 @@ func TestUpNeverPrintsSecrets(t *testing.T) {
 		}
 	})
 
+	// A RESUMED bring-up reads a talosconfig off disk and announces that it
+	// did, which is a new place for the file's contents to end up in a line
+	// that is meant to name it.
+	t.Run("on-a-resumed-run", func(t *testing.T) {
+		f := newFixture(t)
+		writeTalosconfig(t, f.dir)
+
+		transcript := f.mustRun(t)
+
+		if strings.Contains(transcript, existingTalosconfig) {
+			t.Errorf("the talosconfig read from the state dir was printed to the transcript (%d chars)\n"+
+				"  reason: it is a cluster CA and a client key; the step may name the file, never its contents",
+				len(existingTalosconfig))
+		}
+	})
+
 	// Every step after the config exists holds secret material in a local, and
 	// a failure is where an error message goes looking for context to add.
 	for _, step := range []string{"applyConfig", "waitBootstrapReady", "bootstrap", "kubeconfig", "waitNodeReady", "installStorage"} {
@@ -641,9 +722,11 @@ func TestUpNeverPrintsSecrets(t *testing.T) {
 	}
 }
 
-// A bring-up that dies half way leaves a VM and a state dir, and v1 has no
-// resume. Saying so is the difference between a retry that works and a second
-// -up against a node that is no longer in maintenance mode.
+// A bring-up that dies half way leaves a VM and a state dir. Re-running `up` is
+// now the first thing to try — it resumes from whatever the machine reached —
+// so the message has to say that AND name the one case a retry cannot repair:
+// a config written to the state dir but never accepted by the node, where the
+// state dir says "configured" and the node is still in maintenance mode.
 func TestUpSaysHowToRecoverFromAMidFlightFailure(t *testing.T) {
 	f := newFixture(t)
 	f.rec.failAt = "bootstrap"
@@ -653,11 +736,19 @@ func TestUpSaysHowToRecoverFromAMidFlightFailure(t *testing.T) {
 		t.Fatal("a failing bootstrap did not fail the bring-up")
 	}
 
-	for _, want := range []string{"-destroy", "not resumable"} {
+	for _, want := range []string{"tinq up", "tinq destroy", "maintenance mode"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the failure does not mention %q: %s\n"+
-				"  reason: re-running -up against a node past maintenance mode waits out the whole timeout for nothing",
-				want, redactErr(err))
+				"  reason: the retry that works and the retry that waits out a ten-minute timeout are different commands, "+
+				"and this message is the only thing that tells them apart", want, redactErr(err))
+		}
+	}
+
+	// The flag spellings are gone: these are cobra verbs now, and a message
+	// telling an operator to run `tinq -destroy` sends them to a usage error.
+	for _, stale := range []string{"-destroy", "-up "} {
+		if strings.Contains(err.Error(), stale) {
+			t.Errorf("the failure still tells the operator to run %q: %s", stale, redactErr(err))
 		}
 	}
 }
@@ -715,10 +806,11 @@ func TestUpStopsAtTheFirstFailedStep(t *testing.T) {
 	}
 }
 
-// Both endpoints are the HOST side of a qemu forward, and both come from
-// spec.hostForwards. A missing one is not discovered until a wait spends its
-// whole budget on an address that is not there.
-func TestUpRefusesWithoutTheForwardedEndpoints(t *testing.T) {
+// Both endpoints are the address a client dials to reach this node — the host
+// side of a forward for a VM, the node's own address for adopted hardware. A
+// missing one is not discovered until a wait spends its whole budget on an
+// address that is not there.
+func TestUpRefusesWithoutTheAPIEndpoints(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		clear func(*UpOptions)
@@ -737,8 +829,9 @@ func TestUpRefusesWithoutTheForwardedEndpoints(t *testing.T) {
 			}
 
 			if !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("the refusal does not name the guest port %s: %s\n"+
-					"  reason: the fix is a spec.hostForwards entry, and the message is the only thing that says which",
+				t.Errorf("the refusal does not name the API's port %s: %s\n"+
+					"  reason: the port is what tells the two endpoints apart, and the message is the "+
+					"only thing that says which one is missing",
 					tc.want, redactErr(err))
 			}
 
@@ -749,32 +842,90 @@ func TestUpRefusesWithoutTheForwardedEndpoints(t *testing.T) {
 	}
 }
 
+// apiAddress decides the ONE value apid's certificate is issued for, so each of
+// its refusals is the difference between an error here and a TLS handshake
+// failure minutes into a bring-up. The empty-host case is the one worth a test
+// of its own: ":50000" splits WITHOUT an error, host just comes back "", and
+// without the guard that generates a certificate naming nothing.
+func TestAPIAddressIsTheHostPartOfTheEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		endpoint string
+		want     string
+	}{
+		{"127.0.0.1:50000", "127.0.0.1"},
+		{"192.168.1.50:50000", "192.168.1.50"},
+		{"[fd00::1]:50000", "fd00::1"},
+	} {
+		got, err := apiAddress(tc.endpoint)
+		if err != nil {
+			t.Errorf("apiAddress(%q): %s", tc.endpoint, err)
+			continue
+		}
+
+		if got != tc.want {
+			t.Errorf("apiAddress(%q) = %q, want %q\n"+
+				"  reason: this is what apid's certificate is issued for, and it must be what the client dials",
+				tc.endpoint, got, tc.want)
+		}
+	}
+
+	for _, endpoint := range []string{"", "192.168.1.50", ":50000"} {
+		if got, err := apiAddress(endpoint); err == nil {
+			t.Errorf("apiAddress(%q) = %q, want a refusal\n"+
+				"  reason: a certificate issued for %q names nothing a client can dial, and that "+
+				"surfaces as a handshake failure with nothing pointing at the endpoint",
+				endpoint, got, got)
+		}
+	}
+}
+
 // Both defaults in Up are invisible to every test above, because every test
 // above supplies both — and their absence is not a wrong answer, it is a nil
-// dereference in production only. This drives a bring-up with NEITHER supplied
-// and stops it at step 3, which is now the last point before anything needs a
-// node: the image does not exist, the REAL detectVersion reads it as unknown,
-// and the version guard refuses.
+// dereference in production only.
 //
-// Reaching that refusal is what proves both defaults: hooks nil resolved to
-// realHooks (or hooks.detectVersion would have panicked) and Out nil resolved
-// to os.Stdout (or p.step would have).
+// The version is a FIELD now rather than something a hook reads off an ISO, so
+// nothing before step 5 touches a hook at all and the only way to prove the
+// hooks default is to REACH one. The context is cancelled before the call, so
+// the real waitMaintenance gives up on its first probe instead of spending its
+// five-minute budget on an address nothing is listening on.
+//
+// Both proofs are structural rather than textual: Boot running means steps 1 to
+// 4 printed, so Out nil resolved to os.Stdout (a nil writer panics in p.step),
+// and an ERROR back from step 5 means the real wait ran, so hooks nil resolved
+// to realHooks (a nil hooks panics, it does not fail).
 func TestUpDefaultsToStdoutAndTheRealOperations(t *testing.T) {
-	err := Up(context.Background(), UpOptions{
-		ClusterName:      "probe",
-		ImagePath:        filepath.Join(t.TempDir(), "absent.iso"),
-		StateDir:         t.TempDir(),
-		TalosEndpoint:    "127.0.0.1:50000",
-		KubeEndpoint:     "https://127.0.0.1:6443",
-		SystemDiskSerial: "talos-system",
-		Detect:           func() (*platform.Platform, error) { return fakePlatform(), nil },
-		// Must never run: step 3 refuses an unidentifiable image before
-		// anything is created.
-		Boot: func() (int, error) { return 0, errors.New("Boot was reached for an image the guard refused") },
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	booted := false
+
+	err := Up(ctx, UpOptions{
+		ClusterName: "probe",
+		StateDir:    t.TempDir(),
+		// Nothing is listening here and nothing needs to be.
+		TalosEndpoint: "127.0.0.1:1",
+		KubeEndpoint:  "https://127.0.0.1:6443",
+		SystemDisk:    DiskRef{Serial: "talos-system"},
+		TalosVersion:  imageTalosVersion,
+		VersionSource: fakeVersionSource,
+		Substrate:     fakeSubstrate,
+		ConsoleArg:    fakeConsoleArg,
+		Boot: func() (int, error) {
+			booted = true
+
+			return 163166, nil
+		},
 		// Out and hooks are deliberately left nil.
 	})
-	if err == nil || !strings.Contains(err.Error(), "could not determine the Talos version") {
-		t.Fatalf("Up did not refuse the unidentifiable image with its own defaults: %s", redactErr(err))
+
+	if !booted {
+		t.Fatal("Up never reached step 4 with Out left nil\n" +
+			"  reason: a nil io.Writer is a panic in p.step, not a quiet no-op")
+	}
+
+	if err == nil {
+		t.Fatal("step 5 succeeded against an address nothing is listening on\n" +
+			"  reason: only the REAL waitMaintenance can fail here; a nil hooks panics")
 	}
 }
 
@@ -851,22 +1002,10 @@ func TestUpReportsAFailureToWriteAnArtifact(t *testing.T) {
 }
 
 // Boot failing is the one error that is NOT mid-flight residue in the sense the
-// note describes — but Detect failing before it is not either, and both have to
-// come back as errors rather than a transcript that stops silently.
-func TestUpReportsAFailureToDetectTheHost(t *testing.T) {
-	f := newFixture(t)
-	f.opts.Detect = func() (*platform.Platform, error) { return nil, errors.New("no accelerator on this host") }
-
-	err := f.run(t)
-	if err == nil {
-		t.Fatal("Up continued with no host platform")
-	}
-
-	if !strings.Contains(err.Error(), "no accelerator") {
-		t.Errorf("the detect failure was replaced rather than reported: %s", redactErr(err))
-	}
-}
-
+// note describes, and it still has to come back as an error rather than a
+// transcript that stops silently. Host detection is no longer among the things
+// that can fail here at all: the caller resolves its own facts and hands over
+// the results, so a host with no accelerator fails before Up is ever called.
 func TestUpReportsAFailureToBoot(t *testing.T) {
 	f := newFixture(t)
 	f.opts.Boot = func() (int, error) { return 0, errors.New("qemu: exit status 1") }
@@ -968,7 +1107,7 @@ func orderReason(op string) string {
 // message — that message is where the remedy is.
 func TestUpKeepsTheVersionGuardsExplanation(t *testing.T) {
 	f := newFixture(t)
-	f.rec.imageVersion = "v1.99.0"
+	f.opts.TalosVersion = "v1.99.0"
 
 	err := f.run(t)
 	if err == nil {
@@ -978,78 +1117,788 @@ func TestUpKeepsTheVersionGuardsExplanation(t *testing.T) {
 	wants(t, err.Error(), "v1.99.0", GeneratorVersion())
 }
 
-// ── the kexec workaround is macOS/arm64-ONLY ────────────────────────────────
+// ── D8: a bring-up starts from wherever the machine already is ──────────────
 //
-// Two host facts gate it, and each one is asserted on a platform the test binary
-// is not running on. That is the whole reason OS and ImageArch are resolved onto
-// Platform instead of read from runtime: a workaround for someone else's host
-// has to be provable from this one.
+// `tinq stop` keeps a machine's disks, so the most natural next command is
+// `tinq up` — and before this it could not work. The node boots the system it
+// INSTALLED, never re-enters maintenance mode, and step 5 spent its entire
+// five-minute budget proving that before failing.
+//
+// The discriminator is the talosconfig in the state dir, and what it is matters
+// to every test below: it is a CREDENTIAL, not a status. Its presence is what
+// makes an authenticated call possible at all; the claim that the node is
+// configured still comes from whether that call's handshake succeeds, which a
+// node in maintenance mode cannot fake.
 
-// hostPlatform returns the fixture platform with OS and guest arch overridden,
-// so each case below states the host it is about instead of inheriting it.
-func hostPlatform(os, arch string) func() (*platform.Platform, error) {
-	return func() (*platform.Platform, error) {
-		p := fakePlatform()
-		p.OS = os
-		p.ImageArch = arch
+// writeTalosconfig leaves behind what a previous `up` leaves behind. It is the
+// ONLY difference between the two paths.
+func writeTalosconfig(t *testing.T, dir string) {
+	t.Helper()
 
-		return p, nil
+	if err := os.WriteFile(filepath.Join(dir, "talosconfig"), []byte(existingTalosconfig), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// The fixture's platform says linux, so this asserts the Linux behaviour while
-// running on a Mac — which is the only way this assertion means anything.
-func TestUpLeavesKexecAloneOnLinux(t *testing.T) {
+// The read BOTH `up` and `adopt` gate on. It is one function because the two
+// must agree on what "configured" means: a disagreement is adopt waiting out
+// its full maintenance budget for an API an installed node never serves again,
+// with nothing in the output naming the cause.
+//
+// The three outcomes are not two: a missing file is an ANSWER — never
+// configured — and everything else is a failure that must not be read as one.
+func TestReadTalosconfigTellsTheThreeCasesApart(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, configured, err := ReadTalosconfig(dir); err != nil || configured {
+		t.Errorf("an empty state dir read as configured=%v, err=%v; want false and no error\n"+
+			"  reason: never configured is an answer, and an error here would refuse every "+
+			"fresh machine", configured, err)
+	}
+
+	writeTalosconfig(t, dir)
+
+	got, configured, err := ReadTalosconfig(dir)
+	if err != nil || !configured {
+		t.Fatalf("a state dir holding a talosconfig read as configured=%v, err=%v", configured, err)
+	}
+
+	// Compared, never printed: it is a cluster CA and a client key.
+	if string(got) != existingTalosconfig {
+		t.Errorf("ReadTalosconfig returned %d bytes, want the %d-byte credential on disk",
+			len(got), len(existingTalosconfig))
+	}
+
+	// A directory in its place. Read as "not configured" this becomes a
+	// maintenance wait against a node that may well be installed.
+	blocked := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(blocked, "talosconfig", "occupied"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, configured, err := ReadTalosconfig(blocked); err == nil || configured {
+		t.Errorf("an unreadable talosconfig read as configured=%v, err=%v; want a refusal\n"+
+			"  reason: silently reading it as absent sends adopt into a ten-minute wait for "+
+			"maintenance mode", configured, err)
+	}
+}
+
+// A machine that has been configured before must not be sent back through
+// maintenance mode, config generation or apply-config: the first waits for a
+// state the node has left forever, and the other two mint a NEW secrets bundle
+// whose CA the installed node has never heard of.
+func TestUpSkipsConfigurationForAMachineThatAlreadyHasATalosconfig(t *testing.T) {
 	f := newFixture(t)
-	f.opts.Detect = hostPlatform("linux", "arm64")
+	writeTalosconfig(t, f.dir)
+
+	transcript := f.mustRun(t)
+
+	for _, op := range []string{"waitMaintenance", "generateConfig", "applyConfig"} {
+		if f.rec.did(op) {
+			t.Errorf("%s ran for a machine that was already configured\n"+
+				"  reason: %s", op, resumeReason(op))
+		}
+	}
+
+	if !f.rec.did("waitBootstrapReady") {
+		t.Error("nothing waited for the node to be reachable before bootstrap\n" +
+			"  reason: the VM was just started; bootstrapping into a booting node fails on a dial")
+	}
+
+	// The credential in flight is the one from DISK. A resumed run that used
+	// freshly generated material would authenticate against a CA the node does
+	// not trust, and every call after this point would fail on the handshake.
+	if got := string(f.rec.payload["bootstrap"]); got != existingTalosconfig {
+		t.Errorf("bootstrap was handed a %d-byte talosconfig, want the %d-byte one from the state dir\n"+
+			"  reason: a regenerated bundle is a NEW cluster CA, and the installed node trusts the old one",
+			len(got), len(existingTalosconfig))
+	}
+
+	// And nothing overwrote it. secrets.yaml and controlplane.yaml are the
+	// same story: rewriting them buries the material the node actually holds.
+	b, err := os.ReadFile(filepath.Join(f.dir, "talosconfig"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(b) != existingTalosconfig {
+		t.Errorf("the talosconfig in the state dir was rewritten (%d bytes, was %d)\n"+
+			"  reason: it is the only way back into the installed node", len(b), len(existingTalosconfig))
+	}
+
+	// The run still finishes the cluster half: kubeconfig, node Ready, storage.
+	for _, op := range []string{"bootstrap", "kubeconfig", "waitNodeReady", "installStorage"} {
+		if !f.rec.did(op) {
+			t.Errorf("%s never ran on a resumed bring-up\n"+
+				"  reason: the point of `up` is a Ready node with somewhere to put a PVC, from whatever state it starts in", op)
+		}
+	}
+
+	stepsInOrder(t, transcript)
+}
+
+func resumeReason(op string) string {
+	switch op {
+	case "waitMaintenance":
+		return "the node boots the system it installed and never re-enters maintenance mode, so this can only time out"
+	case "generateConfig":
+		return "generation mints a fresh secrets bundle, and its CA is not the one the installed node was given"
+	}
+
+	return "the config is already on the node; applying another would install over a running system"
+}
+
+// The transcript must say WHICH steps did not run and WHY. Silently renumbering
+// or leaving gaps turns the one artifact an operator reads a bring-up by into
+// something they have to reverse-engineer.
+func TestUpAnnouncesTheStepsAResumedBringUpSkips(t *testing.T) {
+	f := newFixture(t)
+	writeTalosconfig(t, f.dir)
+
+	transcript := f.mustRun(t)
+
+	wants(t, transcript,
+		"[ 5/10] maintenance", "[ 6/10] config", "[ 7/10] apply-config",
+		// each skip named as a skip
+		"skipped",
+		// and the discriminator explained, in the operator's terms
+		"talosconfig",
+		// the reason maintenance can never answer again
+		"maintenance mode",
+		// the reason regenerating would be worse than useless
+		"CA",
+	)
+
+	// A skipped step must not claim work it did not do.
+	for _, lie := range []string{
+		"wrote controlplane.yaml, talosconfig, secrets.yaml",
+		"reachable after",
+		"installing... rebooting...",
+	} {
+		if strings.Contains(transcript, lie) {
+			t.Errorf("a resumed bring-up printed %q\n"+
+				"  reason: the step did not run; announcing it makes the transcript something to debug rather than debug from\n%s",
+				lie, redact(transcript))
+		}
+	}
+}
+
+// The other side: a machine with NO talosconfig is a machine nothing has ever
+// configured — an `apply` machine, or a fresh one — and it must take the
+// original path unchanged. TestUpRunsTheOperationsInTheOrderTheNodeRequires
+// asserts the whole sequence; this one names the three steps D8 could have
+// stolen from it, so a discriminator inverted by a missing `!` cannot pass.
+func TestUpConfiguresAMachineWithNoTalosconfig(t *testing.T) {
+	f := newFixture(t)
+
+	if _, err := os.Stat(filepath.Join(f.dir, "talosconfig")); !os.IsNotExist(err) {
+		t.Fatalf("the fixture state dir already holds a talosconfig; this test asserts nothing")
+	}
+
+	transcript := f.mustRun(t)
+
+	for _, op := range []string{"waitMaintenance", "generateConfig", "applyConfig"} {
+		if !f.rec.did(op) {
+			t.Errorf("%s did not run for a machine that was never configured\n"+
+				"  reason: nothing else applies a machine config, and a node in maintenance mode never installs without one", op)
+		}
+	}
+
+	if strings.Contains(transcript, "skipped (already configured)") {
+		t.Errorf("a never-configured machine was treated as resumable\n%s", redact(transcript))
+	}
+}
+
+// ── D9: bootstrap is ATTEMPTED, never probed ────────────────────────────────
+//
+// `up` applies the config, waits out the reboot, and only THEN bootstraps etcd.
+// A machine stopped inside that window comes back with apid serving the cluster
+// PKI — so the authenticated wait succeeds — and with no etcd at all. Skipping
+// bootstrap on the strength of that wait hangs forever in step 9 against a node
+// that can never report Ready.
+
+// alreadyBootstrappedError is exactly what a node returns for a second
+// bootstrap, wrapped the way bootstrapEtcd wraps it. Source, Talos v1.13.7,
+// internal/app/machined/internal/server/v1alpha1/v1alpha1_server.go:457:
+//
+//	if entries, _ := os.ReadDir(constants.EtcdDataPath); len(entries) > 0 {
+//		return nil, status.Error(codes.AlreadyExists, "etcd data directory is not empty")
+//	}
+func alreadyBootstrappedError() error {
+	return fmt.Errorf("bootstrapping etcd: %w",
+		status.Error(codes.AlreadyExists, "etcd data directory is not empty"))
+}
+
+// preconditionError is the node's OTHER refusal, and unlike AlreadyExists it is
+// TRANSIENT. Talos v1.13.7 raises it from two places that both clear on their
+// own — v1alpha1_server.go:443, gated on IsBootstrapAllowed(), which
+// v1alpha1_runtime.go:249 documents as "checks for CRI to be up"; and
+// v1alpha1_server.go:454, "time is not in sync yet".
+//
+// MEASURED ON HARDWARE: a first adopt of the 192.168.1.170 node passed the
+// authenticated-API gate after 2s and then died here, because apid serves the
+// cluster PKI before containerd has finished starting. Re-running adopt
+// bootstrapped fine, which is the definition of transient.
+func preconditionError() error {
+	return status.Error(codes.FailedPrecondition, "bootstrap is not available yet")
+}
+
+func TestBootstrapWithRetryOutlastsATransientPrecondition(t *testing.T) {
+	var calls int
+
+	err := bootstrapWithRetry(context.Background(), 30*time.Second, func(context.Context) error {
+		calls++
+		if calls < 3 {
+			return preconditionError()
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("bootstrapWithRetry gave up on a precondition that cleared: %v\n"+
+			"  reason: apid answers before containerd is up, so the FIRST bootstrap on real "+
+			"hardware routinely lands too early", err)
+	}
+
+	if calls != 3 {
+		t.Errorf("the bootstrap call was made %d times, want 3", calls)
+	}
+}
+
+// AlreadyExists is the caller's SUCCESS signal, so retrying it would spend the
+// whole budget and then return a timeout — turning the idempotent path into a
+// five-minute hang followed by a failure against a healthy cluster.
+func TestBootstrapWithRetryReturnsAlreadyExistsImmediately(t *testing.T) {
+	var calls int
+
+	started := time.Now()
+	err := bootstrapWithRetry(context.Background(), 30*time.Second, func(context.Context) error {
+		calls++
+
+		return status.Error(codes.AlreadyExists, "etcd data directory is not empty")
+	})
+
+	if calls != 1 {
+		t.Errorf("the bootstrap call was made %d times, want 1 — AlreadyExists cannot clear", calls)
+	}
+
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Errorf("bootstrapWithRetry spent %s on AlreadyExists, want an immediate return", elapsed)
+	}
+
+	// The whole point of returning early: Up's idempotent path still recognises it.
+	if !alreadyBootstrapped(err) {
+		t.Errorf("alreadyBootstrapped could not see the code through the retry wrapper: %v\n"+
+			"  reason: step 8 reads this to tell a healthy re-run from a real failure", err)
+	}
+}
+
+// Everything that is not a precondition is a real failure, and spending the
+// budget on it delays the report without changing it.
+func TestBootstrapWithRetryDoesNotRetryOrdinaryFailures(t *testing.T) {
+	var calls int
+
+	started := time.Now()
+	err := bootstrapWithRetry(context.Background(), 30*time.Second, func(context.Context) error {
+		calls++
+
+		return errors.New("connection refused")
+	})
+	if err == nil {
+		t.Fatal("bootstrapWithRetry reported a connection failure as success")
+	}
+
+	if calls != 1 {
+		t.Errorf("the bootstrap call was made %d times, want 1", calls)
+	}
+
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Errorf("bootstrapWithRetry spent %s on an ordinary failure, want an immediate return", elapsed)
+	}
+}
+
+// A precondition that never clears is a real failure too, and the message has
+// to carry the node's own words rather than a bare timeout.
+func TestBootstrapWithRetryGivesUpOnAPreconditionThatNeverClears(t *testing.T) {
+	err := bootstrapWithRetry(context.Background(), 3*time.Second, func(context.Context) error {
+		return preconditionError()
+	})
+	if err == nil {
+		t.Fatal("bootstrapWithRetry reported a permanently blocked bootstrap as success")
+	}
+
+	if !strings.Contains(err.Error(), "bootstrap is not available yet") {
+		t.Errorf("the give-up does not quote the node's refusal: %v", err)
+	}
+}
+
+func TestUpTreatsAnAlreadyBootstrappedNodeAsSuccess(t *testing.T) {
+	f := newFixture(t)
+	writeTalosconfig(t, f.dir)
+	f.rec.failAt = "bootstrap"
+	f.rec.err = alreadyBootstrappedError()
+
+	transcript := f.mustRun(t)
+
+	wants(t, transcript, "[ 8/10] bootstrap", "already bootstrapped")
+
+	for _, op := range []string{"kubeconfig", "waitNodeReady", "installStorage"} {
+		if !f.rec.did(op) {
+			t.Errorf("%s never ran after a node reported it was already bootstrapped\n"+
+				"  reason: that refusal is the node agreeing etcd exists, which is the whole precondition of the steps after it", op)
+		}
+	}
+}
+
+// The near-miss mutants, and the reason the matcher is a gRPC CODE rather than
+// a string: everything else from bootstrap is a real failure, and swallowing it
+// would leave `up` waiting on a node that can never become Ready.
+func TestUpFailsOnABootstrapErrorThatIsNotAlreadyBootstrapped(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{
+			// The node's OTHER refusal: apid is up but the runtime is not ready
+			// to bootstrap yet. RETRYING IS THE ANSWER, and it has already
+			// happened by the time an error reaches this layer —
+			// bootstrapWithRetry sits inside the hook and spends its whole
+			// budget on exactly this code. One arriving HERE is therefore a
+			// precondition that never cleared, which is a real failure: Up must
+			// not treat it as success and leave step 9 waiting on a node that
+			// can never report Ready.
+			"another gRPC code",
+			fmt.Errorf("bootstrapping etcd: %w",
+				status.Error(codes.FailedPrecondition, "bootstrap is not available yet")),
+		},
+		{
+			// The same WORDS with no status attached. A substring matcher would
+			// accept this; nothing in Talos produces it over the wire, and
+			// anything that did is not a node telling us etcd exists.
+			"the same message with no code",
+			errors.New("etcd data directory is not empty"),
+		},
+		{
+			"an ordinary failure",
+			errors.New("connection refused"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			writeTalosconfig(t, f.dir)
+			f.rec.failAt = "bootstrap"
+			f.rec.err = tc.err
+
+			err := f.run(t)
+			if err == nil {
+				t.Fatalf("a failing bootstrap (%v) was reported as a working cluster\n"+
+					"  reason: only AlreadyExists means etcd is there; every other error leaves a node that never reaches Ready", tc.err)
+			}
+
+			if f.rec.did("kubeconfig") {
+				t.Error("the bring-up continued past a bootstrap that failed")
+			}
+		})
+	}
+}
+
+// The matcher itself, at the unit it is written in. The message is upstream's
+// to reword; the code is what Talos's own API contract carries.
+func TestAlreadyBootstrappedMatchesTheGRPCCodeNotTheMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"the node's refusal", status.Error(codes.AlreadyExists, "etcd data directory is not empty"), true},
+		{"wrapped, as bootstrapEtcd wraps it", alreadyBootstrappedError(), true},
+		{"a different code", status.Error(codes.FailedPrecondition, "bootstrap is not available yet"), false},
+		{"the message alone", errors.New("etcd data directory is not empty"), false},
+		{"anything else", errors.New("connection refused"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := alreadyBootstrapped(tc.err); got != tc.want {
+				t.Errorf("alreadyBootstrapped(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// ── the kexec workaround is the CALLER's decision, carried faithfully ───────
+//
+// WHICH hosts need it is a fact about the host, so the gate lives in cmd/tinq
+// (see TestUpOptionsDisablesKexecOnAppleSiliconOnly). What this package owes is
+// that the answer it is handed is the answer it asks for and the answer it
+// announces — a field silently dropped between UpOptions and ConfigInput is a
+// node that kexecs into a kernel it cannot boot, with a transcript that says
+// nothing at all.
+
+func TestUpLeavesKexecAloneUnlessTheCallerAsks(t *testing.T) {
+	f := newFixture(t)
+	f.opts.DisableKexec = false
 
 	transcript := f.mustRun(t)
 
 	if f.rec.input.DisableKexec {
-		t.Error("kexec was disabled on a linux host\n" +
-			"  reason: kexec works under KVM and skips a firmware boot; disabling it there is a\n" +
-			"  tax paid for a macOS bug")
+		t.Error("kexec was disabled although the caller did not ask\n" +
+			"  reason: kexec skips a firmware boot and is FASTER; disabling it where the\n" +
+			"  workaround does not apply is a tax paid for another substrate's bug")
 	}
 
 	if strings.Contains(transcript, "kexec_load_disabled") {
-		t.Errorf("transcript announces the workaround on linux\n%s", redact(transcript))
+		t.Errorf("transcript announces a workaround that was not requested\n%s", redact(transcript))
 	}
 }
 
-// An INTEL Mac has nothing to work around: the guest bug is arm64's, and
-// upstream gates its own workaround on the architecture too. Disabling kexec
-// here would cost a firmware boot for a bug that is not present.
-func TestUpLeavesKexecAloneOnAnIntelMac(t *testing.T) {
+// The sysctl must be requested, and the transcript must say so: a bring-up that
+// silently changed the node's reboot behaviour is one nobody can account for
+// later.
+func TestUpDisablesKexecWhenTheCallerAsks(t *testing.T) {
 	f := newFixture(t)
-	f.opts.Detect = hostPlatform("darwin", "amd64")
-
-	transcript := f.mustRun(t)
-
-	if f.rec.input.DisableKexec {
-		t.Error("kexec was disabled on darwin/amd64\n" +
-			"  reason: the kexec bug is arm64's — upstream gates on TargetArch == arm64. An\n" +
-			"  Intel Mac pays a firmware boot for nothing")
-	}
-
-	if strings.Contains(transcript, "kexec_load_disabled") {
-		t.Errorf("transcript announces the workaround on darwin/amd64\n%s", redact(transcript))
-	}
-}
-
-// On macOS/arm64 the sysctl must be requested, and the transcript must say so: a
-// bring-up that silently changed the node's reboot behaviour is one nobody can
-// account for later.
-func TestUpDisablesKexecOnAppleSilicon(t *testing.T) {
-	f := newFixture(t)
-	f.opts.Detect = hostPlatform("darwin", "arm64")
+	f.opts.DisableKexec = true
 
 	transcript := f.mustRun(t)
 
 	if !f.rec.input.DisableKexec {
-		t.Error("kexec was left enabled on darwin/arm64\n" +
+		t.Error("kexec was left enabled although the caller asked for it to be disabled\n" +
 			"  reason: Talos kexecs into the installed kernel, and under QEMU on macOS that\n" +
 			"  path dies in the guest — the node never boots what it just installed")
 	}
 
-	wants(t, transcript, "kexec_load_disabled=1", "darwin/arm64 host", "MAINTENANCE")
+	wants(t, transcript, "kexec_load_disabled=1", "MAINTENANCE")
+}
+
+// "" IS A REAL ANSWER for ConsoleArg, and adopt is the caller that gives it:
+// hardware has a firmware-configured console, and this host's architecture says
+// nothing about a machine that is not this host. Printed unconditionally the
+// line announced a BLANK value, and credited it to "this host's serial" — a
+// claim about the wrong machine, made on the one substrate where it is wrong.
+func TestStep6SaysNothingAboutAKernelArgItWasNotGiven(t *testing.T) {
+	f := newFixture(t)
+	f.opts.ConsoleArg = ""
+
+	transcript := f.mustRun(t)
+
+	if strings.Contains(transcript, "extraKernelArgs") {
+		t.Errorf("step 6 announced an extraKernelArgs it was never given\n"+
+			"  reason: the value is blank, so the line names a setting that is not in "+
+			"the config\n%s", redact(transcript))
+	}
+
+	if strings.Contains(transcript, "serial goes dead") {
+		t.Errorf("step 6 kept the reason for a line it did not print\n"+
+			"  reason: a justification with nothing above it reads as a step of its "+
+			"own\n%s", redact(transcript))
+	}
+}
+
+// The argument configures THE NODE. On QEMU the node happens to be a guest of
+// this host, which is what made "this host's serial" survive; on hardware the
+// node is somewhere else entirely and the credit is simply false.
+func TestStep6CreditsTheKernelArgToTheNode(t *testing.T) {
+	transcript := newFixture(t).mustRun(t)
+
+	wants(t, transcript, "extraKernelArgs: "+fakeConsoleArg+" (the node's serial console)")
+
+	if strings.Contains(transcript, "this host's serial") {
+		t.Errorf("step 6 credits the console arg to THIS host\n"+
+			"  reason: adopt drives a node that is not this host, and the transcript "+
+			"is what an operator learns Talos from\n%s", redact(transcript))
+	}
+}
+
+// The two fixture addresses are deliberately UNRELATED to each other and to
+// every other value in this file. Both are inside one /24 so CheckNetwork
+// accepts them — a same-wire re-pin, which is the only kind that can finish —
+// and they differ in the last octet so a hook handed the wrong one cannot pass.
+const (
+	fakeMaintenanceEndpoint = "10.99.0.186:50000"
+	fakeInstalledEndpoint   = "10.99.0.7:50000"
+	// The Kubernetes endpoint of the SAME node, at the SAME address. It is not
+	// derived from the block — under QEMU it is a forward's host side and could
+	// not be — so every static fixture has to state it, and a fixture that left
+	// the loopback default in place would be a node whose kubeconfig and
+	// control-plane endpoint both point at 127.0.0.1.
+	fakeInstalledKubeEndpoint = "https://10.99.0.7:6443"
+)
+
+func fakeStaticNetwork() *Network {
+	return &Network{
+		Address:      "10.99.0.7/24",
+		Gateway:      "10.99.0.1",
+		Nameservers:  []string{"10.99.0.53"},
+		HardwareAddr: "84:47:09:47:35:f9",
+	}
+}
+
+// THE SEAM, not the function. Everything about the two addresses is correct in
+// cluster/network.go and worth nothing if Up hands the wrong one to a hook —
+// which compiles, because all five take a string.
+func TestUpDialsMaintenanceBeforeTheInstallAndTheStaticAddressAfter(t *testing.T) {
+	f := newFixture(t)
+	f.opts.TalosEndpoint = fakeMaintenanceEndpoint
+	f.opts.KubeEndpoint = fakeInstalledKubeEndpoint
+	f.opts.Network = fakeStaticNetwork()
+
+	f.mustRun(t)
+
+	before := []string{"waitMaintenance", "applyConfig"}
+	for _, op := range before {
+		if got := f.rec.endpoint[op]; got != fakeMaintenanceEndpoint {
+			t.Errorf("%s dialled %q, want %q\n"+
+				"  reason: before the install the node holds ONLY the maintenance address",
+				op, got, fakeMaintenanceEndpoint)
+		}
+	}
+
+	after := []string{"waitBootstrapReady", "bootstrap", "kubeconfig"}
+	for _, op := range after {
+		if got := f.rec.endpoint[op]; got != fakeInstalledEndpoint {
+			t.Errorf("%s dialled %q, want %q\n"+
+				"  reason: the node rebooted into what it installed and stopped holding %s;\n"+
+				"  a wait pointed there can only spend its whole budget",
+				op, got, fakeInstalledEndpoint, fakeMaintenanceEndpoint)
+		}
+	}
+}
+
+// The certificate names what the client dials, and after the install that is
+// the static address. Named wrong, the node installs, boots, serves apid, and
+// every authenticated call fails on a certificate nobody can point at.
+func TestUpPutsTheStaticAddressInTheCertificate(t *testing.T) {
+	f := newFixture(t)
+	f.opts.TalosEndpoint = fakeMaintenanceEndpoint
+	f.opts.KubeEndpoint = fakeInstalledKubeEndpoint
+	f.opts.Network = fakeStaticNetwork()
+
+	f.mustRun(t)
+
+	if got := f.rec.input.APIAddress; got != "10.99.0.7" {
+		t.Errorf("APIAddress = %q, want 10.99.0.7\n"+
+			"  reason: this becomes apid's subject alt name AND the talosconfig endpoint,\n"+
+			"  both baked at generation time and unrepairable afterwards", got)
+	}
+
+	// The SAME node, on its other port. This one is not derived — it is the
+	// caller's string, carried through — and it lands in the kubeconfig's
+	// server and in cluster.controlPlane.endpoint, which is a control plane
+	// nobody can reach if it names a host the node does not take.
+	if got := f.rec.input.Endpoint; got != fakeInstalledKubeEndpoint {
+		t.Errorf("GenerateConfig got Endpoint %q, want %q\n"+
+			"  reason: the kubeconfig's server and the control-plane endpoint are both baked\n"+
+			"  here, and neither can be repaired after the node has installed",
+			got, fakeInstalledKubeEndpoint)
+	}
+
+	if f.rec.input.Network == nil {
+		t.Error("the network block never reached ConfigInput\n" +
+			"  reason: a correct networkOption that nothing calls emits nothing")
+	} else if got := f.rec.input.Network.Address; got != "10.99.0.7/24" {
+		t.Errorf("ConfigInput.Network.Address = %q, want 10.99.0.7/24", got)
+	}
+}
+
+// EVERY MACHINE THAT EXISTED BEFORE THIS FEATURE takes this path, including
+// every QEMU one. With no block the node does not move, so both halves dial the
+// same address and the config carries no network at all.
+func TestUpDialsOneAddressForAMachineWithNoNetworkBlock(t *testing.T) {
+	f := newFixture(t)
+
+	f.mustRun(t)
+
+	// A FLOOR, because the loop below asserts NOTHING against an empty map —
+	// and this test is the designated regression guard for every machine that
+	// existed before this feature. The five are the hooks that take an
+	// endpoint: waitMaintenance, applyConfig, waitBootstrapReady, bootstrap
+	// and kubeconfig.
+	if len(f.rec.endpoint) != 5 {
+		t.Fatalf("%d operations recorded an endpoint, want 5 (%v)\n"+
+			"  reason: a bring-up that dialled nothing would pass the loop below in silence",
+			len(f.rec.endpoint), f.rec.endpoint)
+	}
+
+	for op, got := range f.rec.endpoint {
+		if got != f.opts.TalosEndpoint {
+			t.Errorf("%s dialled %q, want %q — a DHCP node does not move",
+				op, got, f.opts.TalosEndpoint)
+		}
+	}
+
+	if f.rec.input.Network != nil {
+		t.Error("ConfigInput.Network is set for a machine with no network block")
+	}
+}
+
+// Refused where the two endpoint refusals already are: BEFORE Boot. Failing
+// here costs nothing; failing after costs a VM nobody asked to keep and, on
+// hardware, a node that has already been told to install.
+func TestUpRefusesAnUnreachableStaticAddressBeforeBooting(t *testing.T) {
+	f := newFixture(t)
+	f.opts.TalosEndpoint = "192.168.1.186:50000"
+	f.opts.Network = fakeStaticNetwork() // 10.99.0.7/24 — another segment entirely
+
+	err := f.run(t)
+	if err == nil {
+		t.Fatal("Up accepted a static address on a different segment than the node it is adopting")
+	}
+
+	if f.booted != 0 {
+		t.Error("Up booted the machine before refusing\n" +
+			"  reason: the refusal is provable from the options alone, and reaching it later\n" +
+			"  leaves residue for a verdict that was free")
+	}
+
+	if !strings.Contains(err.Error(), "10.99.0.7/24") {
+		t.Errorf("the refusal does not name the address that caused it: %s", err)
+	}
+}
+
+// THE FOURTH ADDRESS, and the one nothing derives. KubeEndpoint stays a field
+// because under QEMU it is the host side of a forward and cannot be computed
+// from anything here — but a machine with a static block DOES know where the
+// node answers afterwards, and this string is written into the kubeconfig's
+// server AND into cluster.controlPlane.endpoint. Naming a host the node never
+// takes installs a control plane nobody can reach, and neither artifact can be
+// regenerated once the node has left maintenance mode.
+func TestUpRefusesAKubeEndpointTheStaticNodeWillNotAnswerAt(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		wantMsg  []string
+	}{
+		{
+			// The fixture's own loopback, which is right for a QEMU forward and
+			// is a control plane pointed at nothing on a machine that moves.
+			"another host entirely", "https://127.0.0.1:6443",
+			[]string{"127.0.0.1", "10.99.0.7", "https://10.99.0.7:6443"},
+		},
+		{
+			// The scheme omitted. It reaches the kubeconfig's server verbatim,
+			// where it is not a URL at all.
+			"not a URL", "10.99.0.7:6443",
+			[]string{"is not a URL with a host"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.opts.TalosEndpoint = fakeMaintenanceEndpoint
+			f.opts.KubeEndpoint = tc.endpoint
+			f.opts.Network = fakeStaticNetwork()
+
+			err := f.run(t)
+			if err == nil {
+				t.Fatal("Up accepted a Kubernetes endpoint naming an address this node never holds\n" +
+					"  reason: the kubeconfig's server and cluster.controlPlane.endpoint are both\n" +
+					"  baked at generation time, and an installed node cannot be reconfigured")
+			}
+
+			// BEFORE Boot, beside the three refusals that are already there.
+			// On hardware, reaching this later spends a node that has been told
+			// to install.
+			if f.booted != 0 {
+				t.Errorf("the machine was booted %d times before the endpoint was checked\n"+
+					"  reason: the verdict is provable from the options alone, and failing here costs nothing",
+					f.booted)
+			}
+
+			if f.rec.did("generateConfig") {
+				t.Error("a config was generated with an endpoint the node cannot answer at")
+			}
+
+			for _, want := range tc.wantMsg {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal does not contain %q, so it cannot be acted on:\n%s", want, redactErr(err))
+				}
+			}
+		})
+	}
+}
+
+// The other side of the gate: a machine with NO static block keeps today's
+// behaviour exactly. Every QEMU bring-up is here, and its KubeEndpoint is the
+// host side of a forward — an address the node itself never holds, on purpose.
+func TestUpDoesNotCheckTheKubeEndpointOfAMachineWithNoNetworkBlock(t *testing.T) {
+	f := newFixture(t)
+	// A forward on the host, to a node that answers at neither address.
+	f.opts.TalosEndpoint = "127.0.0.1:50000"
+	f.opts.KubeEndpoint = "https://127.0.0.1:6443"
+
+	f.mustRun(t)
+
+	if got := f.rec.input.Endpoint; got != "https://127.0.0.1:6443" {
+		t.Errorf("GenerateConfig got Endpoint %q, want the caller's forward untouched\n"+
+			"  reason: with no static block nothing here knows where the node is reached from,\n"+
+			"  and a forward's host side is SUPPOSED to be an address the node does not hold", got)
+	}
+}
+
+// A CLAIM ABOUT REALITY, printed only when it is one. On a segment with no DHCP
+// the operator typed the node's FINAL address at the GRUB prompt, so it is
+// adopted and answers at the same place — and a transcript announcing a move
+// that is not happening sends the operator looking for a node at an address
+// nothing changed to.
+func TestStep6AnnouncesTheMoveOnlyWhenTheNodeMoves(t *testing.T) {
+	moves := newFixture(t)
+	moves.opts.TalosEndpoint = fakeMaintenanceEndpoint
+	moves.opts.KubeEndpoint = fakeInstalledKubeEndpoint
+	moves.opts.Network = fakeStaticNetwork()
+
+	wants(t, moves.mustRun(t),
+		"network: 10.99.0.7/24 via 10.99.0.1 on 84:47:09:47:35:f9, dhcp off",
+		"this node MOVES: adopted at "+fakeMaintenanceEndpoint+
+			", answers at "+fakeInstalledEndpoint+" from the reboot onward")
+
+	// Adopted at the address the static block already names.
+	stays := newFixture(t)
+	stays.opts.TalosEndpoint = fakeInstalledEndpoint
+	stays.opts.KubeEndpoint = fakeInstalledKubeEndpoint
+	stays.opts.Network = fakeStaticNetwork()
+
+	transcript := stays.mustRun(t)
+
+	wants(t, transcript, "network: 10.99.0.7/24 via 10.99.0.1 on 84:47:09:47:35:f9, dhcp off")
+
+	if strings.Contains(transcript, "this node MOVES") {
+		t.Errorf("step 6 announces a move for a node adopted at its own static address\n%s",
+			redact(transcript))
+	}
+}
+
+// ── the mirror list is carried, not interpreted ─────────────────────────────
+//
+// WHERE a mirror lives is the caller's knowledge (a QEMU host alias, a LAN
+// address), and WHETHER anything answers there is not knowable from here at
+// all. What this package owes is that the list it is handed is the list it
+// asks for — a field dropped between UpOptions and ConfigInput is a node that
+// pulls every public image from the internet perfectly well, and fails only on
+// the one image that exists nowhere but the mirror.
+
+func TestUpCarriesTheRegistryMirrorsToConfig(t *testing.T) {
+	f := newFixture(t)
+	f.opts.Registries = []RegistryMirror{{
+		Host:     "10.0.2.2:5000",
+		Endpoint: "http://10.0.2.2:5000",
+	}}
+
+	f.mustRun(t)
+
+	if !reflect.DeepEqual(f.rec.input.Registries, f.opts.Registries) {
+		t.Errorf("ConfigInput.Registries = %+v, want %+v\n"+
+			"  reason: dropped here the node still pulls every public image, so nothing\n"+
+			"  downstream notices until an image that exists ONLY on the mirror is deployed",
+			f.rec.input.Registries, f.opts.Registries)
+	}
+}
+
+func TestUpAsksForNoMirrorsWhenTheCallerNamedNone(t *testing.T) {
+	f := newFixture(t)
+
+	f.mustRun(t)
+
+	if f.rec.input.Registries != nil {
+		t.Errorf("ConfigInput.Registries = %+v, want nil — a mirror nobody asked for is an\n"+
+			"  endpoint nothing is listening on, and every image pull then waits it out",
+			f.rec.input.Registries)
+	}
 }

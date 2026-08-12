@@ -1,0 +1,80 @@
+---
+- name: Ensure zot and conf.d dirs exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ seed_state_root }}/zot"
+    - "{{ seed_state_root }}/zot/registry"
+    - "{{ seed_state_root }}/caddy/conf.d"
+
+- name: Ensure the registry push password exists
+  ansible.builtin.include_tasks: secrets.yml
+  vars:
+    secret_name: zot_password
+
+- name: Install htpasswd tooling
+  ansible.builtin.package:
+    name: "{{ 'apache2-utils' if ansible_facts['os_family'] == 'Debian' else 'httpd-tools' }}"
+    state: present
+
+- name: Generate the zot htpasswd (bcrypt) on first run
+  ansible.builtin.shell: >
+    cat {{ seed_state_root }}/secrets/zot_password
+    | htpasswd -inB {{ seed_registry_user }} > {{ seed_state_root }}/zot/htpasswd.tmp
+    && mv {{ seed_state_root }}/zot/htpasswd.tmp {{ seed_state_root }}/zot/htpasswd
+  args:
+    executable: /bin/bash
+    creates: "{{ seed_state_root }}/zot/htpasswd"
+
+- name: Secure the htpasswd file
+  ansible.builtin.file:
+    path: "{{ seed_state_root }}/zot/htpasswd"
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: Resolve Phase-1 service names locally (dnsmasq replaces this in Phase 2)
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} SEED PHASE-1 NAMES"
+    block: |
+      127.0.0.1 registry.{{ seed_domain }} git.{{ seed_domain }} auth.{{ seed_domain }}
+
+- name: Render the zot config
+  ansible.builtin.template:
+    src: zot-config.json.j2
+    dest: "{{ seed_state_root }}/zot/config.json"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart zot
+
+- name: Render the zot quadlet
+  ansible.builtin.template:
+    src: zot.container.j2
+    dest: /etc/containers/systemd/zot.container
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd
+
+- name: Add the registry Caddy vhost
+  ansible.builtin.template:
+    src: registry.caddy.j2
+    dest: "{{ seed_state_root }}/caddy/conf.d/registry.caddy"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart caddy
+
+- name: Apply pending changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Start zot
+  ansible.builtin.systemd_service:
+    name: zot.service
+    state: started

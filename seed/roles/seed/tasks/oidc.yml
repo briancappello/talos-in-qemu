@@ -1,0 +1,103 @@
+---
+- name: Ensure the Gitea OIDC client secret exists
+  ansible.builtin.include_tasks: secrets.yml
+  vars:
+    secret_name: gitea_oidc_client_secret
+
+- name: Read the Authentik token and OIDC secret
+  ansible.builtin.slurp:
+    src: "{{ seed_state_root }}/secrets/{{ item }}"
+  register: _oidc_secrets
+  loop:
+    - authentik_bootstrap_token
+    - gitea_oidc_client_secret
+  no_log: true
+
+- name: Bind OIDC facts
+  ansible.builtin.set_fact:
+    _ak_token: "{{ _oidc_secrets.results[0].content | b64decode }}"
+    _oidc_secret: "{{ _oidc_secrets.results[1].content | b64decode }}"
+  no_log: true
+
+- name: Resolve Authentik default flows
+  ansible.builtin.uri:
+    url: "https://auth.{{ seed_domain }}/api/v3/flows/instances/?slug={{ item.slug }}"
+    headers: { Authorization: "Bearer {{ _ak_token }}" }
+    ca_path: /etc/ssl/seed/root_ca.crt
+  register: _ak_flows
+  loop:
+    - { slug: default-provider-authorization-implicit-consent }
+    - { slug: default-invalidation-flow }
+  no_log: true
+
+- name: Bind flow pks
+  ansible.builtin.set_fact:
+    _ak_authz_pk: "{{ _ak_flows.results[0].json.results[0].pk }}"
+    _ak_inval_pk: "{{ _ak_flows.results[1].json.results[0].pk }}"
+
+- name: Look for an existing gitea provider
+  ansible.builtin.uri:
+    url: "https://auth.{{ seed_domain }}/api/v3/providers/oauth2/?name=gitea"
+    headers: { Authorization: "Bearer {{ _ak_token }}" }
+    ca_path: /etc/ssl/seed/root_ca.crt
+  register: _ak_prov
+  no_log: true
+
+- name: Create the gitea OAuth2 provider
+  ansible.builtin.uri:
+    url: "https://auth.{{ seed_domain }}/api/v3/providers/oauth2/"
+    method: POST
+    headers: { Authorization: "Bearer {{ _ak_token }}" }
+    ca_path: /etc/ssl/seed/root_ca.crt
+    body_format: json
+    status_code: [201]
+    body:
+      name: gitea
+      client_type: confidential
+      client_id: gitea
+      client_secret: "{{ _oidc_secret }}"
+      authorization_flow: "{{ _ak_authz_pk }}"
+      invalidation_flow: "{{ _ak_inval_pk }}"
+      sub_mode: hashed_user_id
+      redirect_uris: "https://git.{{ seed_domain }}/user/oauth2/authentik/callback"
+  when: _ak_prov.json.pagination.count == 0
+  register: _ak_prov_created
+  no_log: true
+
+- name: Bind the provider pk
+  ansible.builtin.set_fact:
+    _ak_prov_pk: "{{ _ak_prov.json.results[0].pk if _ak_prov.json.pagination.count > 0 else _ak_prov_created.json.pk }}"
+
+- name: Look for an existing gitea application
+  ansible.builtin.uri:
+    url: "https://auth.{{ seed_domain }}/api/v3/core/applications/?slug=gitea"
+    headers: { Authorization: "Bearer {{ _ak_token }}" }
+    ca_path: /etc/ssl/seed/root_ca.crt
+  register: _ak_app
+  no_log: true
+
+- name: Create the gitea application
+  ansible.builtin.uri:
+    url: "https://auth.{{ seed_domain }}/api/v3/core/applications/"
+    method: POST
+    headers: { Authorization: "Bearer {{ _ak_token }}" }
+    ca_path: /etc/ssl/seed/root_ca.crt
+    body_format: json
+    status_code: [201]
+    body: { name: Gitea, slug: gitea, provider: "{{ _ak_prov_pk }}" }
+  when: _ak_app.json.pagination.count == 0
+  no_log: true
+
+- name: List Gitea auth sources
+  ansible.builtin.command: podman exec -u git gitea gitea admin auth list
+  register: _gitea_auth
+  changed_when: false
+
+- name: Add the Authentik OIDC login source to Gitea
+  ansible.builtin.command: >
+    podman exec -u git gitea gitea admin auth add-oauth
+    --name authentik --provider openidConnect
+    --key gitea --secret "{{ _oidc_secret }}"
+    --auto-discover-url https://auth.{{ seed_domain }}/application/o/gitea/.well-known/openid-configuration
+  when: "'authentik' not in _gitea_auth.stdout"
+  no_log: true

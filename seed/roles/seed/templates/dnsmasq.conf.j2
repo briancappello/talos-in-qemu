@@ -1,0 +1,41 @@
+interface={{ seed_lan_iface }}
+listen-address={{ seed_lan_address }}
+bind-interfaces
+# Ignore /etc/hosts: the Phase-0/Phase-1 bridges map the seed names to
+# 127.0.0.1 there (host-local converge resolution). Reading them would make
+# dnsmasq hand the LAN a loopback address, overriding the address= records
+# below. The host's own libc resolver still reads /etc/hosts directly.
+no-hosts
+domain={{ seed_domain }}
+local=/{{ seed_domain }}/
+{% for n in ['ca', 'registry', 'git', 'auth', 'boot', 'time', 's3'] %}
+address=/{{ n }}.{{ seed_domain }}/{{ seed_lan_address }}
+{% endfor %}
+server=1.1.1.1
+
+enable-tftp
+tftp-root={{ seed_tftp_root }}
+
+{% if seed_dhcp_mode == 'proxy' %}
+dhcp-range={{ seed_lan_subnet }},proxy
+{% else %}
+dhcp-range={{ seed_dhcp_range }}
+{% endif %}
+
+# arch-matched boot file (DHCP option 93): BIOS vs UEFI x86-64
+dhcp-match=set:bios,option:client-arch,0
+dhcp-match=set:efi64,option:client-arch,7
+dhcp-match=set:efi64,option:client-arch,9
+dhcp-boot=tag:bios,undionly.kpxe
+dhcp-boot=tag:efi64,ipxe.efi
+
+# once iPXE itself is running (it sends option 175), chainload the HTTP script.
+# HTTP, not HTTPS: stock iPXE does not trust the seed's private CA (that would
+# need a custom iPXE build), and the maintenance boot is on the trusted
+# provisioning wire — the same trust window adopt already documents. The pull
+# that matters, the installer image, is HTTPS via zot (Phase 1 `ca` field).
+dhcp-match=set:ipxe,175
+dhcp-boot=tag:ipxe,http://boot.{{ seed_domain }}/boot.ipxe
+
+# NTP (option 42) -> the seed
+dhcp-option=option:ntp-server,{{ seed_lan_address }}

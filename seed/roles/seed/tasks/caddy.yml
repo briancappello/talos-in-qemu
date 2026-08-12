@@ -1,0 +1,44 @@
+---
+- name: Ensure Caddy state dirs exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ seed_state_root }}/caddy"
+    - "{{ seed_state_root }}/caddy/data"
+    - "{{ seed_state_root }}/caddy/conf.d"
+    # Caddy bind-mounts this as /srv/boot (the HTTP boot server); the mount
+    # source must exist before Caddy (re)starts, and this task runs before
+    # assets.yml, which populates it.
+    - "{{ seed_state_root }}/assets"
+
+- name: Render the Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ seed_state_root }}/caddy/Caddyfile"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart caddy
+
+- name: Render the Caddy quadlet
+  ansible.builtin.template:
+    src: caddy.container.j2
+    dest: /etc/containers/systemd/caddy.container
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart caddy
+
+- name: Apply pending quadlet and Caddyfile changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Start Caddy
+  ansible.builtin.systemd_service:
+    name: caddy.service
+    state: started

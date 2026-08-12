@@ -1,0 +1,24 @@
+[Unit]
+Description=step-ca internal CA (seed trust root)
+After=network-online.target seed-network.service
+Wants=network-online.target
+
+[Container]
+Image={{ seed_stepca_image }}
+ContainerName=step-ca
+Network=seed
+NetworkAlias=ca.{{ seed_domain }}
+Volume={{ seed_state_root }}/step-ca:/home/step:U
+Volume={{ seed_state_root }}/secrets/step_ca_password:/run/seed_password:ro,U
+Environment=DOCKER_STEPCA_INIT_NAME=Seed
+Environment=DOCKER_STEPCA_INIT_DNS_NAMES=ca.{{ seed_domain }},localhost
+Environment=DOCKER_STEPCA_INIT_ACME=true
+Environment=DOCKER_STEPCA_INIT_PASSWORD_FILE=/run/seed_password
+PublishPort=127.0.0.1:9000:9000
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

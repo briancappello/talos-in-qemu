@@ -1,0 +1,42 @@
+# The REHEARSAL VM: a stand-in for hardware, so `tinq adopt` can be exercised
+# without a second machine.
+#
+# Everything `adopt` does differently from `up` is exercised against this except
+# the two things only real hardware can show: a NIC taking a DHCP lease, and
+# disk serials this tool did not choose. What IS exercised is the part that was
+# silently broken before this branch — a certificate that has to name an address
+# other than 127.0.0.1.
+#
+# hostAddr is the per-forward bind address. It already existed; until this branch
+# `talosEndpoint` ignored it and dialled loopback regardless, which bound the
+# forward to a LAN address where nothing was listening on 127.0.0.1 and then
+# spent the whole five-minute maintenance budget proving it.
+#
+# SUBSTITUTE THIS HOST'S OWN LAN ADDRESS. `ip -4 -br addr` prints it. The ports
+# are Talos's defaults on purpose: `adopt` applies them to the node's address and
+# has no forward to describe, so the VM has to answer where hardware would.
+# Binding them to a LAN address does NOT collide with another machine already on
+# 127.0.0.1:50000 — different bind address, same port, no conflict.
+#
+# `tinq apply` this file (which boots it into maintenance mode and stops), then
+# `tinq adopt examples/adopt-node.yaml`.
+apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata:
+  name: rehearsal-cp0
+  namespace: default
+spec:
+  site: rehearsal
+  role: talos-cp
+  image: talos-v1.13.7-amd64.iso
+  cpu: 4
+  memory: 6Gi
+  disk: 20Gi
+  dataDisk: 20Gi
+  hostForwards:
+    - hostPort: 50000
+      guestPort: 50000
+      hostAddr: 192.168.1.165
+    - hostPort: 6443
+      guestPort: 6443
+      hostAddr: 192.168.1.165

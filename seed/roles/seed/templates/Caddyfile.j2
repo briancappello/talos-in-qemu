@@ -1,0 +1,11 @@
+{
+	acme_ca https://ca.{{ seed_domain }}:9000/acme/acme/directory
+	acme_ca_root /etc/ssl/seed/root_ca.crt
+	email seed@{{ seed_domain }}
+}
+
+import /etc/caddy/conf.d/*.caddy
+
+hello.{{ seed_domain }} {
+	respond "seed ok"
+}

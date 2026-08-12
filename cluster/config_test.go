@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -84,12 +85,13 @@ func redactErr(err error) string {
 // matches no disk at all.
 func testInput() ConfigInput {
 	return ConfigInput{
-		ClusterName:      "probe",
-		Endpoint:         "https://127.0.0.1:6443",
-		TalosVersion:     "v1.13.7",
-		ConsoleArg:       "console=ttyS0",
-		SystemDiskSerial: "talos-system",
-		DataDiskSerial:   "talos-data",
+		ClusterName:    "probe",
+		Endpoint:       "https://127.0.0.1:6443",
+		APIAddress:     "127.0.0.1",
+		TalosVersion:   "v1.13.7",
+		ConsoleArg:     "console=ttyS0",
+		SystemDisk:     DiskRef{Serial: "talos-system"},
+		DataDiskSerial: "talos-data",
 	}
 }
 
@@ -123,9 +125,10 @@ func mustGenerateDefault(t *testing.T) *Generated {
 // A Talos machine config is a MULTI-DOCUMENT YAML: v1alpha1 first, then any
 // number of separate documents. Asserting on the whole blob cannot tell which
 // document a string landed in, which is exactly how a swapped serial survives.
-func splitDocs(cp []byte) []string {
-	return strings.Split(string(cp), "\n---\n")
-}
+//
+// The splitter itself lives in reconfigure.go, because the refusals there
+// compare documents for real and a second copy of "what is a document" would
+// let the tests and the production comparison disagree about it.
 
 // The encoder documents every field it sets AND emits a commented-out example
 // of most fields it did not. Asserting against that text is how a test for
@@ -184,16 +187,15 @@ func v1alpha1Doc(t *testing.T, cp []byte) string {
 	return doc
 }
 
-func docOfKind(t *testing.T, cp []byte, kind string) (string, bool) {
+// docOfKindT is docOfKind with the encoder's commented-out examples stripped,
+// which every assertion in this file needs and the production comparison must
+// NOT have: a comment changing is still the document changing.
+func docOfKindT(t *testing.T, cp []byte, kind string) (string, bool) {
 	t.Helper()
 
-	for _, doc := range splitDocs(cp) {
-		if doc = code(doc); strings.Contains(doc, "kind: "+kind) {
-			return doc, true
-		}
-	}
+	doc, ok := docOfKind(cp, kind)
 
-	return "", false
+	return code(doc), ok
 }
 
 // installSelector matches an install block that selects BY SERIAL. The
@@ -225,7 +227,7 @@ func TestGenerateConfigInstallsToTheSystemDiskBySerial(t *testing.T) {
 // two halves drift the moment main.go renames one — and the failure is silent.
 func TestGenerateConfigUsesTheCallersSerials(t *testing.T) {
 	in := testInput()
-	in.SystemDiskSerial = "sys-9000"
+	in.SystemDisk = DiskRef{Serial: "sys-9000"}
 	in.DataDiskSerial = "data-9000"
 
 	cp := mustGenerate(t, in).ControlPlane
@@ -235,10 +237,227 @@ func TestGenerateConfigUsesTheCallersSerials(t *testing.T) {
 			"  reason: the serials are main.go's constants; a literal copied into this package drifts silently", m)
 	}
 
-	vol, ok := docOfKind(t, cp, "UserVolumeConfig")
+	vol, ok := docOfKindT(t, cp, "UserVolumeConfig")
 	if !ok || !strings.Contains(vol, `disk.serial == "data-9000"`) {
 		t.Errorf("user volume does not select data-9000\n"+
 			"  reason: same drift, other half — the volume would match no disk and never appear\n%s", redact(vol))
+	}
+}
+
+// installSelectorWWID is installSelector's other half. Two regexps rather than
+// one with an alternation, because the pairing is the whole point: a test that
+// accepted `serial:` OR `wwid:` would pass on a config that selects by the
+// field the caller did NOT ask for.
+var installSelectorWWID = regexp.MustCompile(`(?m)^ {8}diskSelector:\n {12}wwid: (.+)$`)
+
+// THE DISK THIS WHOLE PATH EXISTS FOR: a USB bridge that reports no serial, so
+// the only identity it has is a WWID — including the runs of spaces a real one
+// contains.
+func TestGenerateConfigInstallsByWWIDWhenThatIsTheIdentityGiven(t *testing.T) {
+	const wwid = "t10.SSK     PCIe581         DD0000000000000C"
+
+	in := testInput()
+	in.SystemDisk = DiskRef{WWID: wwid}
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	m := installSelectorWWID.FindStringSubmatch(doc)
+	if m == nil {
+		t.Fatalf("install has no diskSelector.wwid\n"+
+			"  reason: a disk with no serial cannot be named any other way, and a selector "+
+			"matching nothing installs nowhere while Talos reports a hang\n%s", redact(doc))
+	}
+
+	// The encoder may quote it — it contains spaces — but the VALUE has to
+	// survive intact either way.
+	if got := strings.Trim(m[1], `"'`); got != wwid {
+		t.Errorf("install selects wwid %q, want %q\n"+
+			"  reason: collapsed or truncated, it names no disk on the node", got, wwid)
+	}
+
+	// The two fields are ALTERNATIVES: machinery ANDs every non-empty field of
+	// an InstallDiskSelector, so an emitted `serial:` beside the wwid would
+	// demand one disk reporting both and match nothing.
+	if installSelector.MatchString(doc) {
+		t.Error("install emits a serial selector beside the wwid\n" +
+			"  reason: machinery ANDs the fields, so both together match no disk at all")
+	}
+}
+
+// SINGLE-DISK LAYOUT. EPHEMERAL is capped so there is free space at all, and
+// the user volume takes the rest of the same disk. Both halves or neither: a
+// cap with no user volume wastes the space, and a user volume with no cap has
+// nowhere to go because EPHEMERAL grew to fill the disk.
+func TestGenerateConfigCarvesTheSystemDiskWhenEphemeralIsCapped(t *testing.T) {
+	in := testInput()
+	in.DataDiskSerial = ""
+	in.EphemeralMaxSize = "120GB"
+
+	cp := mustGenerate(t, in).ControlPlane
+
+	eph, ok := docOfKindT(t, cp, "VolumeConfig")
+	if !ok {
+		t.Fatalf("no VolumeConfig document\n"+
+			"  reason: uncapped, EPHEMERAL grows to the size of the disk and the user "+
+			"volume below has no free space to claim\n%s", redact(string(cp)))
+	}
+
+	for _, want := range []string{"name: EPHEMERAL", "maxSize: 120GB", "match: system_disk"} {
+		if !strings.Contains(eph, want) {
+			t.Errorf("the EPHEMERAL cap does not contain %q:\n%s", want, redact(eph))
+		}
+	}
+
+	vol, ok := docOfKindT(t, cp, "UserVolumeConfig")
+	if !ok {
+		t.Fatalf("no UserVolumeConfig beside the EPHEMERAL cap\n" +
+			"  reason: the cap alone frees space nothing then uses, and step 10 would " +
+			"install a StorageClass provisioning into a mount point that does not exist")
+	}
+
+	if !strings.Contains(vol, "match: system_disk") {
+		t.Errorf("the user volume does not select the system disk:\n%s\n"+
+			"  reason: the install target may have been named by WWID, and re-deriving that "+
+			"identity here is how the two drift apart", redact(vol))
+	}
+
+	if !strings.Contains(vol, "grow: true") {
+		t.Errorf("the user volume does not grow:\n%s\n"+
+			"  reason: without it the volume takes minSize and the space the cap freed is wasted", redact(vol))
+	}
+}
+
+// The two routes to a user volume are alternatives, and the DEDICATED DISK one
+// must not start capping EPHEMERAL as a side effect — that would repartition
+// the system disk of every machine that already has a data disk.
+func TestGenerateConfigLeavesEphemeralAloneWithADedicatedDataDisk(t *testing.T) {
+	cp := mustGenerateDefault(t).ControlPlane
+
+	if _, ok := docOfKindT(t, cp, "VolumeConfig"); ok {
+		t.Error("a machine with a dedicated data disk still caps EPHEMERAL\n" +
+			"  reason: nothing needs the space, and a cap is set at install time and " +
+			"cannot be undone without a wipe")
+	}
+}
+
+func TestGenerateConfigEmitsNoVolumeDocumentsWithNeither(t *testing.T) {
+	in := testInput()
+	in.DataDiskSerial = ""
+
+	cp := mustGenerate(t, in).ControlPlane
+
+	for _, kind := range []string{"VolumeConfig", "UserVolumeConfig"} {
+		if _, ok := docOfKindT(t, cp, kind); ok {
+			t.Errorf("a machine with no data disk and no cap still emits a %s\n"+
+				"  reason: it must behave exactly as every machine did before either field existed", kind)
+		}
+	}
+}
+
+func TestEphemeralCapRefusesASizeTalosCannotParse(t *testing.T) {
+	for _, tc := range []struct{ name, size string }{
+		{"a bare number with no unit", "120"},
+		{"words", "lots"},
+		// "" reaches ephemeralCap only through a caller that has stopped
+		// gating on non-empty — which would emit a cap that caps nothing.
+		{"the empty string", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ephemeralCap(tc.size); err == nil {
+				t.Errorf("ephemeralCap(%q) was accepted\n"+
+					"  reason: a cap that does not bound EPHEMERAL leaves the user volume "+
+					"nowhere to grow, and nothing fails to say so", tc.size)
+			}
+		})
+	}
+}
+
+// THE PROPERTY RECONFIGURE IS BUILT ON, and the one whose failure cannot be
+// undone on hardware: regenerating a config for a node that already exists must
+// keep the PKI that node was installed with. A fresh bundle is five new
+// certificate authorities and a new machine token — the node rejects the config
+// as signed by a CA it does not trust, and the talosconfig generated beside it
+// cannot authenticate to the node it is for. An installed node never serves the
+// maintenance API again, so there is no way back.
+func TestGenerateConfigReusesAnExistingSecretsBundle(t *testing.T) {
+	first := mustGenerateDefault(t)
+
+	in := testInput()
+	in.SecretsBundle = first.Secrets
+	// Something has to CHANGE, or this passes against a function that ignores
+	// its input entirely.
+	in.Registries = []RegistryMirror{{Host: "reg.lan:5000", Endpoint: "http://reg.lan:5000"}}
+
+	second := mustGenerate(t, in)
+
+	if !bytes.Equal(first.Secrets, second.Secrets) {
+		t.Error("regenerating with an existing bundle minted a new one\n" +
+			"  reason: new CAs mean the node rejects the config and the talosconfig cannot " +
+			"reach it — unrecoverable on hardware")
+	}
+
+	// NOT byte equality: the client certificate is MINTED at generation time,
+	// so a second run issues a different one with a different key and validity
+	// window. That is fine — what has to hold is that it is signed by the CA
+	// the node already trusts, which is the CA itself being unchanged.
+	//
+	// (Reconfigure never writes this file anyway; see writeArtifacts there. The
+	// assertion is about the CA, not about the file's fate.)
+	if a, b := talosconfigCA(t, first.Talosconfig), talosconfigCA(t, second.Talosconfig); a != b {
+		t.Error("the regenerated talosconfig carries a DIFFERENT CA\n" +
+			"  reason: the node authenticates against the CA it was installed with; a new one " +
+			"locks us out of a machine that never serves the maintenance API again")
+	}
+
+	// And the change asked for actually landed, so the reuse is not simply
+	// returning the first result.
+	if !strings.Contains(v1alpha1Doc(t, second.ControlPlane), "reg.lan:5000") {
+		t.Error("the regenerated config does not contain the new registry mirror")
+	}
+}
+
+// talosconfigCA returns the CA a talosconfig verifies nodes against. It is a
+// public certificate, so unlike the rest of the file it is safe to compare and
+// to fail on.
+func talosconfigCA(t *testing.T, talosconfig []byte) string {
+	t.Helper()
+
+	cfg, err := clientconfig.FromBytes(talosconfig)
+	if err != nil {
+		t.Fatalf("parsing a generated talosconfig: %v", err)
+	}
+
+	ctx, ok := cfg.Contexts[cfg.Context]
+	if !ok {
+		t.Fatalf("the talosconfig has no context named %q", cfg.Context)
+	}
+
+	return ctx.CA
+}
+
+// A secrets bundle that parses as YAML but is not a bundle would otherwise be
+// noticed as a nil dereference inside machinery.
+func TestGenerateConfigRefusesAnUnusableSecretsBundle(t *testing.T) {
+	for _, tc := range []struct{ name, bundle string }{
+		{"not yaml at all", "\tnot: [a bundle"},
+		{"valid yaml, wrong document", "hello: world\n"},
+		{"an empty document", "{}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := testInput()
+			in.SecretsBundle = []byte(tc.bundle)
+
+			_, err := GenerateConfig(in)
+			if err == nil {
+				t.Fatal("GenerateConfig accepted a secrets bundle it cannot have generated from")
+			}
+
+			// Same rule as every other secret parse: the message must not
+			// quote the document, because the document is private keys.
+			if strings.Contains(err.Error(), tc.bundle) {
+				t.Errorf("the refusal quotes the bundle it was given: %v", err)
+			}
+		})
 	}
 }
 
@@ -342,6 +561,30 @@ func TestGenerateConfigCarriesConsoleArgToTheInstalledSystem(t *testing.T) {
 	}
 }
 
+func TestEmptyConsoleArgEmitsNoKernelArgsAndLeavesUKIAlone(t *testing.T) {
+	in := testInput()
+	in.ConsoleArg = ""
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	if regexp.MustCompile(`(?m)^ {8}extraKernelArgs:`).MatchString(doc) {
+		t.Errorf("install emitted extraKernelArgs with no console arg set\n"+
+			"  reason: real hardware has a firmware-configured console; forcing one "+
+			"derived from the HOST's architecture is how a node boots with a dead "+
+			"console\n%s", redact(doc))
+	}
+
+	// The UKI switch exists ONLY to stop GRUB ignoring extraKernelArgs. With no
+	// extraKernelArgs there is nothing to stop, and flipping it anyway changes a
+	// node's boot path for no reason. Anchored to `: false` because the absent
+	// case and the explicitly-false case are different facts.
+	if regexp.MustCompile(`(?m)^ {8}grubUseUKICmdline: false`).MatchString(doc) {
+		t.Errorf("grubUseUKICmdline was forced false with no console arg to protect\n"+
+			"  reason: its only purpose is that GRUB's UKI cmdline and extraKernelArgs "+
+			"cannot coexist — with no extraKernelArgs there is no conflict\n%s", redact(doc))
+	}
+}
+
 // NewInput takes clusterName and endpoint adjacently and both are strings, so
 // a swap compiles and produces a self-consistent — and useless — cluster.
 func TestGenerateConfigNamesTheClusterAndTheEndpointTheRightWayRound(t *testing.T) {
@@ -382,25 +625,50 @@ func TestGenerateConfigSchedulesOnTheControlPlane(t *testing.T) {
 	}
 }
 
-func TestGenerateConfigAddsLoopbackToMachineCertSANs(t *testing.T) {
-	cfg, err := configloader.NewFromBytes(mustGenerateDefault(t).ControlPlane)
-	if err != nil {
-		t.Fatalf("generated config does not parse: %s", redactErr(err))
-	}
+func TestCertSANComesFromAPIAddress(t *testing.T) {
+	// Both arms matter. 127.0.0.1 is the QEMU regression — the generated config
+	// must not change. 192.168.1.50 is the one that was IMPOSSIBLE before this
+	// task and is the whole reason for it.
+	//
+	// mustGenerate rather than mustGenerateDefault: a non-default input cannot
+	// use the shared CA set, so this pays for two full generations. That is the
+	// price of proving the address is threaded rather than hardcoded.
+	for _, addr := range []string{"127.0.0.1", "192.168.1.50"} {
+		in := testInput()
+		in.APIAddress = addr
 
-	// Asserted through the typed API on purpose: `- 127.0.0.1` also appears
-	// under apiServer.certSANs, where the endpoint puts it for free, so a
-	// substring match would pass with the machine SAN missing entirely.
-	if sans := cfg.Machine().Security().CertSANs(); !slices.Contains(sans, "127.0.0.1") {
-		t.Errorf("machine certSANs = %v, want 127.0.0.1\n"+
-			"  reason: the Talos API is reached over a host port forward, so apid's cert must name the loopback or TLS fails", sans)
+		cfg, err := configloader.NewFromBytes(mustGenerate(t, in).ControlPlane)
+		if err != nil {
+			t.Fatalf("generated config does not parse: %s", redactErr(err))
+		}
+
+		// Asserted through the TYPED API on purpose, exactly as the test this
+		// replaces did: the address also appears under apiServer.certSANs,
+		// where the endpoint puts it for free, so a substring match would pass
+		// with the machine SAN missing entirely.
+		if sans := cfg.Machine().Security().CertSANs(); !slices.Contains(sans, addr) {
+			t.Errorf("machine certSANs = %v, want %s\n"+
+				"  reason: the cert must name the address the CLIENT DIALS, or every "+
+				"authenticated call fails the TLS handshake", sans, addr)
+		}
+	}
+}
+
+func TestGenerateConfigRefusesAnEmptyAPIAddress(t *testing.T) {
+	in := testInput()
+	in.APIAddress = ""
+
+	if _, err := GenerateConfig(in); err == nil {
+		t.Error("GenerateConfig accepted an empty APIAddress\n" +
+			"  reason: an empty SAN list yields a cert naming nothing, which fails at " +
+			"the handshake minutes later rather than here")
 	}
 }
 
 func TestGenerateConfigCreatesUserVolumeOnTheDataDisk(t *testing.T) {
 	cp := mustGenerateDefault(t).ControlPlane
 
-	vol, ok := docOfKind(t, cp, "UserVolumeConfig")
+	vol, ok := docOfKindT(t, cp, "UserVolumeConfig")
 	if !ok {
 		t.Fatalf("no UserVolumeConfig document\n"+
 			"  reason: PVCs would land on EPHEMERAL beside etcd, where a runaway PVC wedges the only control-plane node\n%s", redact(string(cp)))
@@ -443,7 +711,7 @@ func TestGenerateConfigOmitsUserVolumeWithoutDataDisk(t *testing.T) {
 
 	cp := mustGenerate(t, in).ControlPlane
 
-	if _, ok := docOfKind(t, cp, "UserVolumeConfig"); ok {
+	if _, ok := docOfKindT(t, cp, "UserVolumeConfig"); ok {
 		t.Errorf("user volume emitted with no data disk\n"+
 			"  reason: the volume would wait forever for a disk that was never attached, and the node never reaches ready\n%s", redact(string(cp)))
 	}
@@ -513,21 +781,44 @@ func TestGenerateConfigTargetsTheRequestedContract(t *testing.T) {
 	}
 }
 
+// BOTH PATHS, because machinery is what decides whether either one boots.
+//
+// The static arm is a guard rather than a live defect: v1alpha1.NetworkConfig's
+// fields are already marked Deprecated in machinery v1.13.7, and a bump that
+// turned deprecation into rejection would otherwise surface on a real node
+// mid-boot — the unrepairable failure this whole block exists to prevent —
+// instead of here. The DHCP arm is every machine that existed before it.
 func TestGenerateConfigProducesAConfigMachineryAcceptsBack(t *testing.T) {
-	cfg, err := configloader.NewFromBytes(mustGenerateDefault(t).ControlPlane)
-	if err != nil {
-		t.Fatalf("generated config does not parse: %s\n"+
-			"  reason: an unparseable config is discovered by the NODE, minutes into a boot", redactErr(err))
+	accepted := func(t *testing.T, cp []byte) {
+		t.Helper()
+
+		cfg, err := configloader.NewFromBytes(cp)
+		if err != nil {
+			t.Fatalf("generated config does not parse: %s\n"+
+				"  reason: an unparseable config is discovered by the NODE, minutes into a boot", redactErr(err))
+		}
+
+		warnings, err := cfg.Validate(metalMode{})
+		if err != nil {
+			t.Fatalf("generated config does not validate: %s", redactErr(err))
+		}
+
+		// Logged on the PASSING path too, so this is the one line in the
+		// package that prints on every run — the last place a raw secret
+		// should reach.
+		t.Logf("validation warnings: %s", redact(fmt.Sprint(warnings)))
 	}
 
-	warnings, err := cfg.Validate(metalMode{})
-	if err != nil {
-		t.Fatalf("generated config does not validate: %s", redactErr(err))
-	}
+	t.Run("dhcp", func(t *testing.T) {
+		accepted(t, mustGenerateDefault(t).ControlPlane)
+	})
 
-	// Logged on the PASSING path too, so this is the one line in the package
-	// that prints on every run — the last place a raw secret should reach.
-	t.Logf("validation warnings: %s", redact(fmt.Sprint(warnings)))
+	t.Run("static", func(t *testing.T) {
+		in := testInput()
+		in.Network = testNetwork()
+
+		accepted(t, mustGenerate(t, in).ControlPlane)
+	})
 }
 
 func TestGenerateConfigProducesATalosconfigPointingAtTheHostForward(t *testing.T) {
@@ -829,5 +1120,73 @@ func TestGenerateConfigLeavesKexecAloneByDefault(t *testing.T) {
 		t.Errorf("kexec was disabled without being asked\n"+
 			"  reason: kexec works on Linux/KVM and saves a firmware boot; the workaround is\n"+
 			"  for the hosts that need it, not for everyone\n%s", redact(doc))
+	}
+}
+
+// testNetwork is the block the target machine uses. Its values are deliberately
+// unlike anything else in this file: a fixture that reused 127.0.0.1 could pass
+// on a config that carried the loopback endpoint and no network at all.
+func testNetwork() *Network {
+	return &Network{
+		Address:      "192.168.2.10/24",
+		Gateway:      "192.168.2.1",
+		Nameservers:  []string{"1.1.1.1"},
+		HardwareAddr: "84:47:09:47:35:f9",
+	}
+}
+
+// EVERY assertion here is against v1alpha1Doc, never the raw bytes. Machinery's
+// encoder emits commented-out examples, several of which mention hardwareAddr
+// and addresses, so a Contains against the raw config matches a comment and
+// reports a field that was never set.
+func TestGenerateConfigWritesTheStaticNetwork(t *testing.T) {
+	in := testInput()
+	in.Network = testNetwork()
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	for _, want := range []string{
+		"hardwareAddr: 84:47:09:47:35:f9",
+		"192.168.2.10/24",
+		"gateway: 192.168.2.1",
+		"1.1.1.1",
+		"dhcp: false",
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("the generated config does not carry %q\n"+
+				"  reason: the installed system writes its own kernel cmdline and inherits\n"+
+				"  nothing from the ISO, so an address that is not in this config is gone\n"+
+				"  the moment the node reboots", want)
+		}
+	}
+
+	// The DEFAULT ROUTE, not merely a gateway value. A gateway on a route to
+	// some other network reads identically field by field and leaves the node
+	// with no way off its segment.
+	if !defaultRoute.MatchString(doc) {
+		t.Errorf("no default route through the gateway:\n%s", redact(doc))
+	}
+}
+
+// defaultRoute matches a route whose destination is everything. The pairing is
+// the point: `gateway:` anywhere in the file proves nothing about which
+// destination it serves.
+var defaultRoute = regexp.MustCompile(`network: 0\.0\.0\.0/0\n\s+gateway: 192\.168\.2\.1`)
+
+// REQUIREMENT 2, and the regression target for every machine that existed
+// before this feature. Absent means DHCP, which means machinery's own defaults
+// and not one byte from this branch.
+func TestGenerateConfigEmitsNoNetworkWithoutABlock(t *testing.T) {
+	doc := v1alpha1Doc(t, mustGenerateDefault(t).ControlPlane)
+
+	// Three markers that can ONLY come from networkOption. A `network:` key by
+	// itself is machinery's, and asserting on that would fail for a reason
+	// this branch never caused.
+	for _, never := range []string{"hardwareAddr:", "dhcp: false", "0.0.0.0/0"} {
+		if strings.Contains(doc, never) {
+			t.Errorf("a machine with no network block still got %q in its config\n"+
+				"  reason: every QEMU machine and every DHCP node takes this path, and a\n"+
+				"  static interface appearing in it is a node that stops answering", never)
+		}
 	}
 }
