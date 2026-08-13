@@ -1,8 +1,0 @@
-pool 2.pool.ntp.org iburst
-driftfile /var/lib/chrony/chrony.drift
-makestep 1.0 3
-rtcsync
-# serve time to the LAN (nodes with no internet reach the seed)
-allow {{ seed_lan_subnet }}/24
-# keep answering as a low-stratum server even if the upstream pool is unreachable
-local stratum 10

@@ -1,6 +1,0 @@
----
-- name: Seed bootstrap stack
-  hosts: seed
-  become: true
-  roles:
-    - seed

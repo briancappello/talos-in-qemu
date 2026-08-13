@@ -1,7 +1,0 @@
----
-# Override role defaults per environment here, e.g.:
-# seed_domain: lab
-#
-# LAN facts are per-host, not per-group: they live in inventory/host_vars/<host>.yml
-# (e.g. seed-dev.yml). Keeping them out of this shared group_vars avoids polluting
-# other members of group `seed` (e.g. seed-metal) with seed-dev's addresses.

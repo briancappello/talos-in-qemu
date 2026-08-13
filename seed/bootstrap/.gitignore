@@ -1,4 +1,0 @@
-# Built installer image (large, reproducible from build-usb-installer.sh)
-*.iso
-# Any rendered preseed with a real password hash must never be committed
-preseed.rendered.cfg

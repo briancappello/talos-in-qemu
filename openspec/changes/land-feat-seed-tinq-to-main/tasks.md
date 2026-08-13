@@ -9,11 +9,11 @@
 - [x] 2.1 Merge `feat/seed` → `main` (merge commit 35ebe2b, `--no-ff`; operator chose merge over rebase)
 - [x] 2.2 `go test ./...` green on the merge result (adopt/reconfigure/up/registries/driverkit/platform) — build rc=0; cluster 56s, cmd/tinq 6.2s, driverkit, platform all PASS
 
-## 3. Drop the seed (now homelab's) — DEFERRED (destructive; gated on homelab prod reconverge)
+## 3. Drop the seed (now homelab's) — DONE (homelab prod reconverge verified green first)
 
-- [ ] 3.1 `git rm -r seed/` — DEFERRED: keep `seed/` intact until homelab `pull-seed-into-homelab` §7.3 (prod reconverge) proves the import behaviour-equivalent. Tree is already verified byte-identical, but the fallback must survive until prod is green
-- [ ] 3.2 Move seed-only docs (`docs/superpowers/{plans,specs}/2026-08-07-seed-*`) to homelab / remove here; **keep** tinq's own plans (`machine-lifecycle`, `baremetal-foundation`, `static-network`) — DEFERRED with §3.1 (docs already landed in homelab via the import; removal here rides with the seed/ drop)
-- [ ] 3.3 `go build ./... && go test ./...` still green with `seed/` removed (no tinq package depended on seed content) — DEFERRED with §3.1
+- [x] 3.1 `git rm -r seed/` — DONE: 59 files removed. Unblocked by homelab `pull-seed-into-homelab` §7.3 (prod reconverge ok=147 changed=1(benign) failed=0) + §7.4 acceptance green; homelab branch pushed to origin for durability. Recoverable from this repo's history + `feat/seed` regardless
+- [x] 3.2 Move seed-only docs (`docs/superpowers/{plans,specs}/2026-08-07-seed-*`) to homelab / remove here; **keep** tinq's own plans (`machine-lifecycle`, `baremetal-foundation`, `static-network`) — DONE: removed the 5 `2026-08-07-seed-*` docs (already in homelab via the import); kept machine-lifecycle / baremetal-foundation / static-network
+- [x] 3.3 `go build ./... && go test ./...` still green with `seed/` removed (no tinq package depended on seed content) — DONE: build rc=0; cluster/cmd/tinq/driverkit/platform all PASS
 
 ## 4. Verify + integrate
 

@@ -1,9 +1,0 @@
-[Unit]
-Description=Seed backup to restic
-After=minio.service postgres.service
-Wants=minio.service
-
-[Service]
-Type=oneshot
-EnvironmentFile={{ seed_state_root }}/backup/seed-backup.env
-ExecStart=/usr/local/bin/seed-backup
