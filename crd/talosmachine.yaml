@@ -377,6 +377,32 @@ spec:
                       caFile:
                         type: string
                         description: Path (on the host running tinq) to a PEM CA bundle.
+                configPatches:
+                  type: array
+                  description: >-
+                    Machine-config patches applied LAST, over everything tinq
+                    generates -- the same strategic-merge / JSON6902 shape that
+                    `talosctl --config-patch` and talhelper take. The escape hatch
+                    for fields tinq has no dedicated knob for.
+
+                    The motivating case is machine.network.nameservers on the DHCP
+                    dev VM: the static network block cannot set nameservers without
+                    also inventing an address and gateway, but a one-line patch can
+                    -- which is how the dev cluster is pointed at the seed's DNS so
+                    it resolves *.lab the way the metal nodes already do.
+
+                    Like registries, NOT in the baremetal exclusion rule: a patch is
+                    a property of the node, and hardware wants them too. A patch that
+                    does not parse or apply is refused at generation, before any node
+                    boots.
+                  items:
+                    # A block-scalar STRING per entry, e.g.
+                    #   configPatches:
+                    #     - |
+                    #       machine:
+                    #         network:
+                    #           nameservers: [192.168.122.10]
+                    type: string
             status:
               type: object
               properties:

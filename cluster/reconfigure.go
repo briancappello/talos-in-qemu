@@ -48,6 +48,7 @@ type ReconfigureOptions struct {
 	DisableKexec     bool
 	Network          *Network
 	Registries       []RegistryMirror
+	ConfigPatches    []string
 }
 
 // Reconfigure regenerates this machine's config from its manifest and applies
@@ -105,6 +106,7 @@ func Reconfigure(ctx context.Context, opts ReconfigureOptions) ([]byte, error) {
 		DisableKexec:     opts.DisableKexec,
 		Network:          opts.Network,
 		Registries:       opts.Registries,
+		ConfigPatches:    opts.ConfigPatches,
 		SecretsBundle:    secretsBundle,
 	})
 	if err != nil {

@@ -415,6 +415,13 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		return err
 	}
 
+	// Same reader as a guest's: a config patch is a property of the node, and
+	// hardware wants them as much as a VM does (e.g. an extra CA or resolver).
+	patches, err := configPatches(m)
+	if err != nil {
+		return err
+	}
+
 	systemDisk := cluster.DiskRef{
 		Serial: str(spec["systemDiskSerial"], ""),
 		WWID:   str(spec["systemDiskWWID"], ""),
@@ -562,7 +569,8 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		// Same field, same reader as a guest's. On hardware the endpoint is a
 		// real address with a real certificate, so it is https:// and possibly
 		// insecureSkipVerify; the mechanism underneath is identical.
-		Registries: mirrors,
+		Registries:    mirrors,
+		ConfigPatches: patches,
 		// ALREADY RUNNING, by definition — that is what adopt means. Returning
 		// a pid of 0 is honest: this process did not start it and has no
 		// handle on it.

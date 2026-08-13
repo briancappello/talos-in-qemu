@@ -18,6 +18,7 @@ import (
 	// renaming that import, which is used for ParseContractFromVersion and has
 	// nothing to do with documents.
 	coreconfig "github.com/siderolabs/talos/pkg/machinery/config/config"
+	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
@@ -167,6 +168,22 @@ type ConfigInput struct {
 	// running turns every image pull into a timeout, so one is configured only
 	// when the caller knows there is something at the other end.
 	Registries []RegistryMirror
+	// ConfigPatches are machinery config patches applied LAST, over everything
+	// this package generated — the same strategic-merge or JSON6902 shape that
+	// `talosctl --config-patch` and talhelper accept. Empty means no patch and a
+	// byte-identical config to before the field existed.
+	//
+	// It is the escape hatch for machine-config fields tinq has no dedicated knob
+	// for. The motivating one is machine.network.nameservers on the DHCP dev VM:
+	// the Network block above cannot set nameservers without also inventing a
+	// static address and gateway, but a one-line patch can — which is how the dev
+	// cluster is pointed at the seed's DNS so it resolves *.lab the way the metal
+	// nodes already do.
+	//
+	// Applied after our own PatchV1Alpha1 and the volume documents on purpose:
+	// last writer wins, so a patch can override anything, and a bad patch fails
+	// generation here rather than on a node that already booted.
+	ConfigPatches []string
 	// SecretsBundle is an EXISTING secrets.yaml to generate against, or nil to
 	// mint a fresh one.
 	//
@@ -418,6 +435,30 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 		cfg, err = container.New(append(cfg.Documents(), docs...)...)
 		if err != nil {
 			return nil, fmt.Errorf("adding the volume documents: %w", err)
+		}
+	}
+
+	// LAST, over everything above — machinery's own patch mechanism, the same
+	// strategic-merge / JSON6902 shape talosctl --config-patch takes. It is the
+	// escape hatch for fields tinq has no dedicated knob for (the motivating one
+	// is machine.network.nameservers on the DHCP dev VM, pointed at the seed's
+	// DNS so pods resolve *.lab). Applied here so a patch can override the disk
+	// selector, registries and volumes this function just set, and so a patch
+	// that does not parse or apply fails NOW rather than on a booted node.
+	if len(in.ConfigPatches) > 0 {
+		patches, err := configpatcher.LoadPatches(in.ConfigPatches)
+		if err != nil {
+			return nil, fmt.Errorf("loading config patches: %w", err)
+		}
+
+		out, err := configpatcher.Apply(configpatcher.WithConfig(cfg), patches)
+		if err != nil {
+			return nil, fmt.Errorf("applying config patches: %w", err)
+		}
+
+		cfg, err = out.Config()
+		if err != nil {
+			return nil, fmt.Errorf("re-reading the patched config: %w", err)
 		}
 	}
 

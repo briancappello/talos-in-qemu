@@ -1190,3 +1190,56 @@ func TestGenerateConfigEmitsNoNetworkWithoutABlock(t *testing.T) {
 		}
 	}
 }
+
+// A config patch is machinery's own supported override — the same strategic-merge
+// shape `talosctl --config-patch` and talhelper accept — applied LAST, over
+// everything tinq generated. The motivating case is machine.network.nameservers
+// on the DHCP dev VM: the static Network block cannot set nameservers without
+// also inventing an address and gateway, but a one-line patch can, which is how
+// the dev cluster is pointed at the seed's DNS to resolve *.lab.
+func TestGenerateConfigAppliesAConfigPatch(t *testing.T) {
+	in := testInput()
+	in.ConfigPatches = []string{
+		"machine:\n  network:\n    nameservers:\n      - 192.168.122.10\n",
+	}
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	if !strings.Contains(doc, "192.168.122.10") {
+		t.Errorf("the patched nameserver is not in the generated config\n"+
+			"  reason: a config patch is the only way to set machine.network.nameservers\n"+
+			"  on the DHCP dev VM, and without it the dev cluster cannot resolve *.lab from\n"+
+			"  the seed the way the metal nodes already do\n%s", redact(doc))
+	}
+}
+
+// A patch overrides what tinq itself set, because it is applied AFTER the
+// package's own PatchV1Alpha1. Proven against the disk selector — install by
+// serial is tinq's, and a patch that flips it to a device path must win.
+func TestGenerateConfigConfigPatchOverridesGeneratedFields(t *testing.T) {
+	in := testInput()
+	in.ConfigPatches = []string{
+		"machine:\n  install:\n    disk: /dev/patched\n",
+	}
+
+	doc := v1alpha1Doc(t, mustGenerate(t, in).ControlPlane)
+
+	if !strings.Contains(doc, "/dev/patched") {
+		t.Errorf("the patch did not override the generated install section\n"+
+			"  reason: patches are the last writer; if tinq's own PatchV1Alpha1 wins\n"+
+			"  instead, a machine file cannot correct anything tinq generated\n%s", redact(doc))
+	}
+}
+
+// An unparseable patch is refused at GENERATION, on the workstation, not carried
+// to a node that then rejects it minutes after it has already installed.
+func TestGenerateConfigRejectsABadConfigPatch(t *testing.T) {
+	in := testInput()
+	in.ConfigPatches = []string{"this: is: not: valid: yaml\n"}
+
+	if _, err := GenerateConfig(in); err == nil {
+		t.Error("GenerateConfig accepted an unparseable config patch\n" +
+			"  reason: a patch that cannot be parsed must fail here, where the operator\n" +
+			"  sees it, not on a booted node where it reads as a broken cluster")
+	}
+}

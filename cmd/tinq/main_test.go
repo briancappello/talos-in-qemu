@@ -113,6 +113,81 @@ func TestSpecDataDisk(t *testing.T) {
 	}
 }
 
+// machineFromYAML builds the *unstructured.Unstructured the readers take from a
+// whole CR document, the way readMachine does off disk.
+func machineFromYAML(t *testing.T, doc string) *unstructured.Unstructured {
+	t.Helper()
+	var obj map[string]interface{}
+	if err := yaml.Unmarshal([]byte(doc), &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return &unstructured.Unstructured{Object: obj}
+}
+
+// A patch is a YAML block-scalar STRING — the same shape talosctl --config-patch
+// and talhelper take, and what the CRD schema declares. Two of them read back in
+// order, content intact.
+func TestConfigPatchesReadsBlockScalarStrings(t *testing.T) {
+	doc := "apiVersion: machine.hvf.fleet.io/v1alpha1\n" +
+		"kind: TalosMachine\n" +
+		"metadata:\n  name: dev\n" +
+		"spec:\n" +
+		"  configPatches:\n" +
+		"    - |\n" +
+		"      machine:\n" +
+		"        network:\n" +
+		"          nameservers:\n" +
+		"            - 192.168.122.10\n" +
+		"    - |\n" +
+		"      machine:\n" +
+		"        time:\n" +
+		"          servers: [seed.lab]\n"
+
+	patches, err := configPatches(machineFromYAML(t, doc))
+	if err != nil {
+		t.Fatalf("configPatches: %v", err)
+	}
+	if len(patches) != 2 {
+		t.Fatalf("got %d patches, want 2", len(patches))
+	}
+	if !strings.Contains(patches[0], "192.168.122.10") {
+		t.Errorf("first patch lost its content\n  got: %q", patches[0])
+	}
+	if !strings.Contains(patches[1], "seed.lab") {
+		t.Errorf("second patch lost its content\n  got: %q", patches[1])
+	}
+}
+
+// An inline mapping is refused with guidance, not silently coerced: the CRD
+// declares items as strings and the convention is a block scalar, so a bare
+// mapping is a mistake worth naming at read time rather than a shape to guess at.
+func TestConfigPatchesRejectsANonString(t *testing.T) {
+	doc := "spec:\n" +
+		"  configPatches:\n" +
+		"    - machine:\n" +
+		"        time:\n" +
+		"          servers: [seed.lab]\n"
+
+	if _, err := configPatches(machineFromYAML(t, doc)); err == nil {
+		t.Error("a non-string configPatches entry was accepted\n" +
+			"  reason: patches are block-scalar strings (talosctl/talhelper convention,\n" +
+			"  and what the CRD schema allows); an inline mapping must be named as a\n" +
+			"  mistake, not silently reshaped")
+	}
+}
+
+// Absent is nil, the load-bearing default: a machine that sets no patch must
+// produce exactly the config it produced before the field existed.
+func TestConfigPatchesAbsentIsNil(t *testing.T) {
+	patches, err := configPatches(machineFromYAML(t, "spec:\n  cpu: 2\n"))
+	if err != nil {
+		t.Fatalf("configPatches: %v", err)
+	}
+	if patches != nil {
+		t.Errorf("absent spec.configPatches must be nil, got %#v", patches)
+	}
+}
+
 const (
 	// The real x86_64 edk2 vars template size, and the size the padding version
 	// of this tool wrote. On x86_64 the poisoned file is what makes QEMU refuse

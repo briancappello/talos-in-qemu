@@ -102,6 +102,13 @@ func reconfigureMachine(ctx context.Context, d *hvf, path string) error {
 
 	opts.Registries = mirrors
 
+	patches, err := configPatches(m)
+	if err != nil {
+		return err
+	}
+
+	opts.ConfigPatches = patches
+
 	log.Printf("regenerating this machine's config from %s and applying it to %s", path, opts.TalosEndpoint)
 
 	if _, err := cluster.Reconfigure(ctx, opts); err != nil {

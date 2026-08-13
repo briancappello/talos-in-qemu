@@ -549,6 +549,14 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		return cluster.UpOptions{}, err
 	}
 
+	// Refused here for the same reason as the mirrors above: a malformed patch
+	// is provable from the file, and finding it after the boot costs a state dir
+	// and a maintenance wait for a verdict this line gives for free.
+	patches, err := configPatches(m)
+	if err != nil {
+		return cluster.UpOptions{}, err
+	}
+
 	// The MACHINE's state dir, never the state root: the artifacts carry the
 	// identity they belong to, which is the property that makes -destroy sweep
 	// them. Written one level up they would outlive the cluster whose keys
@@ -580,7 +588,8 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		// spec.registries is NOT in the baremetal exclusion rule, so this same
 		// list is read the same way by adopt: a mirror is a property of the
 		// node, and only its address differs between a guest and a machine.
-		Registries: mirrors,
+		Registries:    mirrors,
+		ConfigPatches: patches,
 
 		Boot: func() (int, error) {
 			// The same already-running rule `apply` applies, and it is what
@@ -1411,4 +1420,37 @@ func toMB(s string) int {
 func nestedSlice(m *unstructured.Unstructured, f ...string) []interface{} {
 	v, _, _ := unstructured.NestedSlice(m.Object, f...)
 	return v
+}
+
+// configPatches reads spec.configPatches — machinery config patches applied
+// LAST, over everything tinq generates, the same shape `talosctl --config-patch`
+// takes. Absent or empty is nil: no patch, byte-identical config.
+//
+// Each entry may be written EITHER as a block-scalar string OR as an inline
+// mapping — both are natural YAML and dropping one silently would apply a config
+// the operator did not ask for — so a non-string entry is marshalled back to a
+// YAML document. What the patch DOES is not validated here; a patch that cannot
+// be parsed or applied is refused at generation (cluster.GenerateConfig), on the
+// workstation, before any node has booted.
+func configPatches(m *unstructured.Unstructured) ([]string, error) {
+	var out []string
+
+	for i, raw := range nestedSlice(m, "spec", "configPatches") {
+		// A STRING, deliberately — the talosctl/talhelper convention and what the
+		// CRD schema allows. A YAML mapping written inline is a mistake worth
+		// naming here, not a shape to silently reshape into a patch nobody wrote.
+		s, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("spec.configPatches[%d] is not a string: each entry is a "+
+				"machine-config patch, written as a YAML block scalar\n\n"+
+				"    configPatches:\n      - |\n        machine:\n          network:\n"+
+				"            nameservers: [10.0.0.1]\n\n  (%s)", i, m.GetName())
+		}
+
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+
+	return out, nil
 }

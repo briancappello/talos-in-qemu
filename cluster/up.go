@@ -159,6 +159,10 @@ type UpOptions struct {
 	// about the caller's host, and the only honest test of a mirror is a pull.
 	// The shape is refused where it is read — cmd/tinq's registryMirrors.
 	Registries []RegistryMirror
+	// ConfigPatches are machinery config patches applied last, over everything
+	// generated — see ConfigInput.ConfigPatches. Carried through unchanged; a
+	// patch that does not parse or apply is refused at generation, not here.
+	ConfigPatches []string
 
 	// Boot starts the VM, or adopts one already running, and returns its pid.
 	// Owned by package main: this package knows nothing about qemu.
@@ -584,7 +588,8 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 		// succeeds at doing it — which is why nothing downstream would notice:
 		// the failure is an image that exists ONLY on the mirror, days later,
 		// in another repository's deploy.
-		Registries: opts.Registries,
+		Registries:    opts.Registries,
+		ConfigPatches: opts.ConfigPatches,
 	})
 	if err != nil {
 		return nil, err
