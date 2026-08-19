@@ -24,6 +24,8 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/types/block/blockhelpers"
 	"github.com/siderolabs/talos/pkg/machinery/proto"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
+	netres "github.com/siderolabs/talos/pkg/machinery/resources/network"
+	runtimeres "github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -170,6 +172,58 @@ func TestWaitBootstrapReadyRejectsAnAcceptOnlyListener(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("a socket that accepts but never speaks Talos was reported READY")
+	}
+}
+
+// THE GATE'S WHOLE JOB, reduced to the one decision it makes.
+//
+// MEASURED ON HARDWARE, TWICE: step 7 reported "api back after 2s". An install
+// to a USB SSD plus a firmware reboot cannot happen in two seconds, so what
+// answered was the node that had NOT rebooted yet — the maintenance boot, which
+// restarts apid with the cluster PKI as soon as the config lands and goes on
+// installing behind it. Everything after that raced the reboot: one run
+// bootstrapped into a node whose containerd was not up (FailedPrecondition),
+// the next got `connection refused` because apid had gone down for the reboot.
+//
+// So "an authenticated call succeeded" does NOT mean the installed system is
+// serving, and the stage is what does. `maintenance` is the state this gate
+// exists to exclude and it is reachable WITH the cluster PKI, which is exactly
+// what made the old gate look sound.
+func TestBootstrapStageAcceptsOnlyTheInstalledSystem(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		stage runtimeres.MachineStage
+		want  bool
+		why   string
+	}{
+		{runtimeres.MachineStageBooting, true,
+			"a control-plane node stays in booting until etcd exists, and bootstrap is what creates etcd — waiting for running is the deadlock this gate must not reintroduce"},
+		{runtimeres.MachineStageRunning, true,
+			"a re-run against an already-bootstrapped node finds it running, and step 8 needs to reach the AlreadyExists that makes it idempotent"},
+		{runtimeres.MachineStageMaintenance, false,
+			"THE BUG: after apply-config the maintenance boot serves the cluster PKI while it installs, so an authenticated probe passes against a node that has not rebooted"},
+		{runtimeres.MachineStageInstalling, false,
+			"the installer is still writing the disk; the reboot has not happened"},
+		{runtimeres.MachineStageRebooting, false,
+			"apid is about to go away, which is the connection-refused this gate exists to sit through"},
+		{runtimeres.MachineStageResetting, false, "the node is being wiped, not brought up"},
+		{runtimeres.MachineStageUpgrading, false, "not a bring-up at all"},
+	} {
+		t.Run(tc.stage.String(), func(t *testing.T) {
+			err := checkBootstrapStage(tc.stage)
+
+			if got := err == nil; got != tc.want {
+				t.Errorf("checkBootstrapStage(%s) accepted = %v, want %v\n  reason: %s",
+					tc.stage, got, tc.want, tc.why)
+			}
+
+			// The refusal is what waitFor prints as "last attempt", so it has
+			// to say which stage the node was actually in.
+			if err != nil && !strings.Contains(err.Error(), tc.stage.String()) {
+				t.Errorf("the refusal does not name the stage it saw: %v", err)
+			}
+		})
 	}
 }
 
@@ -874,6 +928,27 @@ func TestAgainstARealNode(t *testing.T) {
 			"  installed system is up; if maintenance mode satisfies it, they all return early")
 	}
 
+	// RISK 1 FROM THE DESIGN SPEC, resolved against a live node: whether a
+	// maintenance-mode node reports a populated version tag before any config
+	// is applied. If this ever fails, spec.baremetal.talosVersion is the
+	// documented fallback.
+	//
+	// Not fatal: the disk.serial evidence below is the reason this test needs a
+	// booted VM at all, and aborting here would cost the whole run to report a
+	// question that has its own documented fallback.
+	version, err := NodeVersion(ctx, endpoint)
+
+	switch {
+	case err != nil:
+		t.Errorf("NodeVersion(%s): %s", endpoint, redactErr(err))
+	case version == "":
+		t.Error("a maintenance-mode node reported no Talos version tag\n" +
+			"  reason: adopt pins the installer image to this value; with no tag it " +
+			"must fall back to spec.baremetal.talosVersion")
+	default:
+		t.Logf("the node reports Talos %s", version)
+	}
+
 	c, err := MaintenanceClient(ctx, endpoint)
 	if err != nil {
 		t.Fatalf("MaintenanceClient(%s): %s", endpoint, redactErr(err))
@@ -884,6 +959,13 @@ func TestAgainstARealNode(t *testing.T) {
 	// The branch's one openly-unverified assumption: config.go selects both the
 	// install target and the user volume by disk.serial, and nothing had ever
 	// read a serial off a real qemu virtio disk.
+	//
+	// ONE list, for every question below. The raw resources are what the CEL
+	// fallback needs — it converts each one to proto — and toDisks is the same
+	// reduction ListDisks performs, so the table logged below is the one adopt
+	// refuses on. Calling ListDisks here instead would open a second
+	// maintenance connection and gather a SECOND list, leaving the emptiness
+	// check guarding something other than what CEL is then evaluated against.
 	disks, err := safe.StateListAll[*block.Disk](ctx, c.COSI)
 	if err != nil {
 		t.Fatalf("listing disks over COSI: %s", redactErr(err))
@@ -895,8 +977,47 @@ func TestAgainstARealNode(t *testing.T) {
 
 	// Nothing here is generated material, so it is logged unredacted: this is
 	// the evidence.
-	for d := range disks.All() {
-		t.Logf("%s: %+v", d.Metadata().ID(), *d.TypedSpec())
+	t.Logf("disks:\n%s", FormatDisks(toDisks(slices.Collect(disks.All()))))
+
+	// THE ONE ASSUMPTION THIS BRANCH COULD NOT PROVE FROM SOURCE. Whether
+	// maintenance mode serves LinkStatuses is a fact about the Talos server,
+	// and machinery holds no answer. If this fails, adopt cannot print a links
+	// table and spec.baremetal.network.hardwareAddr has to be copied off the
+	// node's own console instead.
+	//
+	// Not fatal, for the same reason the version question above is not: it has
+	// a documented fallback, and aborting here would cost the rest of the run.
+	//
+	// ASKED HERE, ahead of every t.Fatalf the disk questions below still make.
+	// Hardware access is transient and this gate gets one run; downstream of
+	// those fatals, an unrelated disk regression consumes the run and this
+	// question — the only one on the branch nothing else can answer — comes
+	// back unreported.
+	links, err := safe.StateListAll[*netres.LinkStatus](ctx, c.COSI)
+
+	switch {
+	case err != nil:
+		t.Errorf("listing LinkStatuses over COSI: %s\n"+
+			"  reason: adopt's links table and its carrier check both depend on this call",
+			redactErr(err))
+	default:
+		// toLinks' FILTERED output, not links.Len(). A node reporting nothing
+		// but loopback passes a raw COSI count, and this gate then logs a table
+		// header over no rows — green, with none of the evidence it exists to
+		// produce.
+		physical := toLinks(slices.Collect(links.All()))
+
+		if len(physical) == 0 {
+			t.Error("the node reports no physical links at all\n" +
+				"  reason: adopt chooses a NIC by MAC out of this list, and loopback " +
+				"is not one an operator can plug a cable into")
+
+			break
+		}
+
+		// Nothing here is generated material, so it is logged unredacted: this
+		// is the evidence.
+		t.Logf("links:\n%s", FormatLinks(physical))
 	}
 
 	in := testInput()
@@ -950,7 +1071,7 @@ func TestAgainstARealNode(t *testing.T) {
 			"disk": spec,
 			// What the node itself would set, emulated from the same serial the
 			// install selector uses.
-			"system_disk": d.TypedSpec().Serial == in.SystemDiskSerial,
+			"system_disk": d.TypedSpec().Serial == in.SystemDisk.Serial,
 		})
 		if err != nil {
 			t.Fatalf("evaluating the fallback against %s: %s", d.Metadata().ID(), redactErr(err))
@@ -975,4 +1096,5 @@ func TestAgainstARealNode(t *testing.T) {
 			"  reason: if elimination were unambiguous on a real node, this test would be arguing "+
 			"for a selector nobody needs", matchedByElimination)
 	}
+
 }

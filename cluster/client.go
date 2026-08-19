@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
+	runtimeres "github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -36,6 +38,13 @@ import (
 // (3) BOOTSTRAP FIRES WHILE THE NODE IS `booting`, NOT `running`. See
 // WaitBootstrapReady. There is no wait-for-stage-running function in this
 // package, and that absence is deliberate.
+//
+// (4) AN AUTHENTICATED CALL DOES NOT PROVE THE INSTALLED SYSTEM IS SERVING.
+// Once a config has been applied, the node's MAINTENANCE boot holds the cluster
+// CA too, and answers with it while it installs. The credentials stop being a
+// discriminator at exactly the moment the only wait that needed them runs; the
+// machine's STAGE is what tells the two apart. Also see WaitBootstrapReady —
+// this one cost two failed hardware bring-ups.
 
 const (
 	// probeInterval is the pause between attempts. Bring-up waits run for
@@ -81,9 +90,16 @@ func errSecretParse(what string) error {
 
 // errNoEndpoint refuses an empty endpoint up front rather than spending the
 // caller's whole timeout discovering that "" is not an address.
+//
+// It says what the endpoint IS and names no remedy, because the remedy differs
+// by substrate and this package no longer knows which one it is looking at: a
+// VM's endpoint is the host side of a port forward, an adopted node's is the
+// node's own address, where there is no forward to add. A message naming one
+// of the two sends half its readers to a field that does not apply to them.
 func errNoEndpoint() error {
-	return errors.New("no Talos API endpoint given (want host:port, e.g. 127.0.0.1:50000 — " +
-		"the host side of the qemu forward)")
+	return errors.New("no Talos API endpoint given: this is the address a client dials to reach " +
+		"this node's Talos API, as host:port — e.g. 127.0.0.1:50000 for a forwarded VM, " +
+		"192.168.1.50:50000 for a node reached at its own address")
 }
 
 // MaintenanceClient dials a node running in MAINTENANCE mode: booted from the
@@ -93,10 +109,30 @@ func errNoEndpoint() error {
 // serves a self-signed certificate for CN=maintenance-service.talos.dev,
 // generated on the node at boot, and it asks for no client certificate: there
 // is no CA anywhere that could sign it, because the CA is in the config we
-// have not sent yet. The exposure is bounded by what maintenance mode is —
-// a node holding no secrets, reached over a loopback forward — and it ends the
-// moment ApplyConfiguration lands, after which AuthenticatedClient verifies
-// properly.
+// have not sent yet. `talosctl apply-config --insecure` is the same trade for
+// the same reason, and there is no trust anchor to substitute before the
+// config lands.
+//
+// TWO OF THE THREE BOUNDS STILL HOLD, AND THE THIRD NO LONGER DOES. The node
+// still holds no secrets while it is in maintenance mode, and the window still
+// closes the moment ApplyConfiguration lands, after which AuthenticatedClient
+// verifies properly. What is gone is loopback-by-construction: `adopt` dials
+// spec.baremetal.maintenanceEndpoint, the node's own LAN address, and `up`
+// dials hostForwards[].hostAddr, which the README documents as a way to publish
+// on a LAN. The channel is whatever network segment lies between.
+//
+// So the exposure is not "nothing", it is bounded by WHO CAN SIT IN THAT PATH,
+// and it has to be: applyConfiguration sends the machine config over this
+// client, and that config is five certificate authorities and the machine
+// token. An attacker able to answer at <endpoint>:50000 impersonates the node
+// and is handed the cluster's CA private keys; one able to sit in the middle
+// reads them and edits the config the real node installs. Neither is detected,
+// because there is nothing here to detect it with.
+//
+// The operator's decision, therefore: trust the path to the node for the
+// duration of an adopt. A directly-attached segment or a trusted lab LAN is
+// the case this is built for; a network with hosts you would not hand the
+// cluster's CA to is not, and no flag here changes that.
 //
 // The caller owns the returned client and must Close it.
 func MaintenanceClient(ctx context.Context, endpoint string) (*client.Client, error) {
@@ -177,7 +213,13 @@ func WaitMaintenance(ctx context.Context, endpoint string, timeout time.Duration
 //
 // Same probe, same discarded response. What differs is what a success PROVES:
 // maintenance mode cannot produce one, so this returning nil means the applied
-// config is on disk and the installed system's apid is serving.
+// config is on disk and apid is serving with the cluster PKI.
+//
+// THAT IS ALL IT PROVES, and the boundary is load-bearing. apid comes up early;
+// the node's other services are still starting behind it, and this probe cannot
+// see any of them. A caller that needs one of them needs its own wait — see
+// bootstrapWithRetry, which exists because containerd is routinely NOT up when
+// this returns.
 //
 // talosconfig is secret and is neither logged nor placed in an error.
 func WaitAPI(ctx context.Context, talosconfig []byte, endpoint string, timeout time.Duration) error {
@@ -204,17 +246,64 @@ func WaitAPI(ctx context.Context, talosconfig []byte, endpoint string, timeout t
 // `running` and you wait forever, with a node that looks healthy on the console
 // and a tool that looks hung.
 //
-// So the signal is the AUTHENTICATED API answering, and nothing else. That
-// already proves everything bootstrap needs — the config is applied, the
-// installed system booted, apid serves with the cluster PKI — while the node
-// is still, correctly, `booting`.
+// So the gate cannot be `running`. But it also cannot be "an authenticated call
+// succeeded", which is what it used to be:
 //
-// This is a thin alias for WaitAPI and stays a separate function on purpose:
-// the name is the artifact. It is what a caller reaches for instead of
-// inventing a wait-for-`running`, and this package has no such wait to reach
-// for by design.
+// TRAP 4, MEASURED ON HARDWARE TWICE. `apply-config` returns, and the
+// MAINTENANCE BOOT restarts apid with the cluster PKI it was just handed — then
+// keeps installing. An authenticated probe succeeds against that node in about
+// two seconds, minutes before the machine reboots into anything. Both hardware
+// bring-ups reported "api back after 2s" and both then raced the reboot: one
+// bootstrapped into a node whose containerd was not up, the next got
+// `connection refused` as apid went down to reboot.
+//
+// The claim that maintenance mode cannot satisfy the cluster PKI is true only
+// BEFORE a config is applied. Afterwards it holds the CA, and this wait runs
+// entirely in the window where it does — so the credentials cannot be the
+// discriminator here, and the stage is.
+//
+// `booting` and `running` are the two stages the INSTALLED system reports, and
+// accepting both is what keeps this reachable at bootstrap time while still
+// excluding `maintenance`, `installing` and `rebooting`. Under QEMU the old
+// gate happened to work, because a VM's install and reboot are fast enough that
+// the race almost always resolved the right way — which is exactly why this was
+// never seen until real hardware ran it.
 func WaitBootstrapReady(ctx context.Context, talosconfig []byte, endpoint string, timeout time.Duration) error {
-	return WaitAPI(ctx, talosconfig, endpoint, timeout)
+	c, err := AuthenticatedClient(ctx, talosconfig, endpoint)
+	if err != nil {
+		return err
+	}
+
+	defer c.Close() //nolint:errcheck
+
+	return waitFor(ctx, timeout, "the installed system to boot at "+endpoint, func(ctx context.Context) error {
+		// EVERY failure here is a retry, and the two that matter look nothing
+		// alike: a node mid-reboot refuses the connection, and a node still in
+		// its maintenance boot answers perfectly and reports the wrong stage.
+		status, err := safe.StateGet[*runtimeres.MachineStatus](ctx, c.COSI,
+			runtimeres.NewMachineStatus().Metadata())
+		if err != nil {
+			return err
+		}
+
+		return checkBootstrapStage(status.TypedSpec().Stage)
+	})
+}
+
+// checkBootstrapStage decides whether a stage is the installed system's own
+// boot. Split out so the decision is testable without a node, because it is the
+// entire content of the gate above and every other line there is plumbing.
+func checkBootstrapStage(stage runtimeres.MachineStage) error {
+	switch stage {
+	// The installed system is up. `booting` is the normal answer and `running`
+	// is what a re-run finds, and REFUSING `running` would break `up`'s
+	// idempotency: step 8 has to reach the node to be told AlreadyExists.
+	case runtimeres.MachineStageBooting, runtimeres.MachineStageRunning:
+		return nil
+
+	default:
+		return fmt.Errorf("the node reports stage %s, which is not the installed system serving", stage)
+	}
 }
 
 // WaitNodeReady waits for every registered Kubernetes node to report Ready.
@@ -276,8 +365,27 @@ func nodeIsReady(node *corev1.Node) bool {
 	return false
 }
 
-// waitFor polls probe until it succeeds, the timeout expires or ctx is
-// cancelled, whichever comes first.
+// stopWaiting wraps an error a probe wants waitFor to STOP on rather than
+// retry, and waitFor returns the wrapped error unchanged.
+//
+// It exists because a probe has two kinds of failure and one return value could
+// not tell them apart: "not yet" and "not ever". Without it, the only way to
+// end a wait early is for the probe to report success, which is a lie the
+// caller then has to un-tell — and the only way to report a permanent failure
+// is to let the wait burn its whole budget first, so an operator watches five
+// minutes elapse to be told something the first attempt already knew.
+//
+// The error comes back UNWRAPPED on purpose: callers match on gRPC codes
+// through it (see alreadyBootstrapped), and a "gave up waiting" sentence
+// around a refusal the node gave instantly would describe a timeout that never
+// happened.
+type stopWaiting struct{ err error }
+
+func (s stopWaiting) Error() string { return s.err.Error() }
+func (s stopWaiting) Unwrap() error { return s.err }
+
+// waitFor polls probe until it succeeds, the timeout expires, ctx is cancelled
+// or the probe returns a stopWaiting, whichever comes first.
 //
 // It honours BOTH deadlines because they answer different questions: timeout
 // is "how long is this step allowed to take", ctx is "has the whole operation
@@ -317,6 +425,15 @@ func waitFor(ctx context.Context, timeout time.Duration, what string, probe func
 
 		if err == nil {
 			return nil
+		}
+
+		// BEFORE the last-error bookkeeping below, because none of it applies:
+		// there is no next attempt to preserve an error for, and the caller
+		// wants the node's own refusal rather than this function's wording
+		// about a budget it did not spend.
+		var stop stopWaiting
+		if errors.As(err, &stop) {
+			return stop.err
 		}
 
 		// An attempt cut short by the deadline reports the CLOCK rather than

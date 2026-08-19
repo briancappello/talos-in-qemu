@@ -159,24 +159,85 @@ they cannot disagree. **Mind the unit**: `dataDisk: 40` is not a size, decodes
 as a number and reads as unset. `up` announces the resulting skip rather than
 letting the first sign of it be a `Pending` PVC an hour later.
 
+`spec.registries` is optional and is how a cluster pulls images that exist
+nowhere on the internet — a registry on your own workstation, or one on the LAN:
+
+```yaml
+  registries:
+    - host: 10.0.2.2:5000                 # the image reference's FIRST SEGMENT
+      endpoint: http://10.0.2.2:5000      # the scheme is the cleartext switch
+```
+
+Three things about it are load-bearing:
+
+- **`host` must match the image reference byte for byte, port included.** An
+  image tagged `10.0.2.2:5000/app:v1` is looked up under `10.0.2.2:5000`; an
+  entry of `10.0.2.2` alone never matches it, and the result is a mirror that is
+  configured, accepted, and never consulted.
+- **The scheme is the plain-HTTP switch, not decoration.** `http://` is what
+  makes containerd speak cleartext to a registry that has no certificate, and no
+  boolean anywhere does that job. `insecureSkipVerify` is a *different*
+  decision about a *different* failure — an `https://` endpoint whose
+  certificate is self-signed — and it does nothing at all for `http://`.
+- **`10.0.2.2` needs no `hostForwards` entry.** It is QEMU user-mode
+  networking's alias for the host, and a forward is the other direction
+  (host → guest). A registry bound to the host's `127.0.0.1:5000` is reachable
+  there with nothing forwarded.
+
+The same field is read for an adopted hardware node, where only the address
+differs. Omit it and the node pulls from upstream, exactly as every machine did
+before the field existed.
+
 Both `hostForwards` entries are load-bearing for `up`: 50000 is where it
 applies config and bootstraps etcd, and 6443 is written into both the generated
 machine config's control-plane endpoint and the kubeconfig, so it has to be an
 address *the host* can reach. `up` refuses up front when either is missing
 rather than spending a wait's whole budget on an address that was never there.
 
-Three ways to reconcile it:
+Four ways to reconcile it:
 
 ```sh
 # BOOTSTRAP: one machine from a file, no control plane needed
 tinq apply   machine.yaml    # a booted VM in maintenance mode, nothing more
 tinq up      machine.yaml    # apply, then all the way to a Kubernetes cluster
-tinq destroy machine.yaml
+                             # idempotent: also how you restart a stopped machine
+tinq stop    machine.yaml    # halt the VM, KEEP its disks
+tinq destroy machine.yaml    # halt the VM, DELETE its disks
 
 # CONTROLLER: watch TalosMachine resources in a cluster
 kubectl apply -f crd/talosmachine.yaml
 tinq controller --kubeconfig ~/.kube/config
 ```
+
+`stop` is a shutdown: the installed OS and any PVCs survive, and **`tinq up`
+starts the machine again** from the same disks — back to a `Ready` cluster,
+not just a booted VM. `destroy` is **not
+recoverable** — it takes the state directory, and the PVCs inside it, with it.
+That distinction is the only reason both exist; if you want the node back
+tomorrow, `stop` is the one. A machine that is merely stopped is still
+destroyable: it has disks to sweep, and leaving them is exactly the residue
+`destroy` exists to prevent.
+
+Verbs, not flags, and that is what makes the pair safe. `tinq stop a.yaml
+destroy b.yaml` is rejected by the parser (`accepts 1 arg(s), received 3`)
+rather than silently resolving to one of them: there is no precedence rule to
+learn because a contradictory command line is no longer expressible.
+
+`stop` asks the guest first. A **bootstrapped** machine is sent Talos's
+`Shutdown` over the authenticated API, using the `talosconfig` `up` wrote into
+that machine's state directory, and gets a clean power-off with its filesystem
+quiesced. Only if that fails, or if the guest is still up sixty seconds later,
+does it fall back to signalling QEMU (SIGTERM, then SIGKILL), and it says so in
+the log rather than claiming a clean shutdown it did not perform.
+
+A machine still in **maintenance mode** — created by `apply`, never
+bootstrapped — has no `talosconfig`, so it cannot satisfy the mutual TLS
+`Shutdown` requires and always takes the signal path. That is a power cut the
+guest never learns about, and it is safe here rather than a compromise: a
+maintenance node is a booted ISO with no applied config and nothing persistent
+to corrupt. The same is true of a bootstrapped guest that is too wedged to
+answer — a hard stop is still better than an unstoppable machine, and whatever
+a workload had in flight is the exposure.
 
 `apply` exists because of a chicken-and-egg: a controller needs a control plane
 to read resources from, and on a fresh laptop the control plane is the thing you
@@ -193,8 +254,74 @@ layout — with the Talos side driven afterwards. A VM already sitting in
 maintenance mode is *adopted*, not duplicated, so `apply` then `up` works.
 `destroy` keeps working with no hypervisor and no reachable node.
 
+`up` is also **idempotent and safe to re-run**, which is what makes `stop` then
+`up` work. It brings a machine to a running cluster from wherever it already
+is, and both questions it asks are put to the *node*, never to a file this tool
+wrote:
+
+- **Has this machine been configured?** A machine with a `talosconfig` in its
+  state directory skips config generation and `apply-config` and waits for the
+  **authenticated** API instead of the maintenance one. That file is a
+  *credential*, not a status: it is what makes the authenticated call possible
+  at all, and the answer still comes from whether the node completes the mutual
+  TLS handshake — which a node in maintenance mode cannot. Regenerating instead
+  would mint a fresh secrets bundle whose CA the installed node has never seen.
+- **Does etcd already exist?** `bootstrap` is *attempted*, and Talos's refusal
+  (`AlreadyExists`, "etcd data directory is not empty") counts as success. It is
+  asked rather than probed because there is a window — config applied, node
+  rebooted, etcd not yet bootstrapped — where the authenticated API answers and
+  etcd does not exist, and skipping bootstrap there waits forever for a node
+  that can never report `Ready`.
+
+Steps a resumed run skips are still **announced, under their own numbers**, with
+the reason. The numbering never closes up: a transcript that jumped from `4/10`
+to `8/10` would read as a bring-up that lost three steps rather than one that
+had already passed them.
+
 Once the first node is bootstrapped it can host the CRD and TinQ itself, and
 every machine after that arrives the normal way.
+
+### `spec.powerState`, and the one place it is ignored
+
+In controller mode, power is *declared* rather than commanded:
+
+```yaml
+spec:
+  powerState: Stopped     # or Running, the default
+```
+
+The controller stops a running machine to converge on `Stopped`, and starts a
+stopped one to converge on `Running` — reusing the existing disks, so `Create`
+is as much *start* as create. Two behaviours surprise people, and both are
+deliberate.
+
+**The standalone verbs do not read `spec.powerState`.** A manifest carrying
+`powerState: Stopped` **boots anyway** under `tinq apply` or `tinq up` — a
+perfectly valid value, silently ignored. Those are the bootstrap paths: they
+run before any control plane exists to hold desired state, and their one job is
+to get a node up. Only the controller reconciles `powerState`. So on this path,
+editing the file does nothing — `tinq stop` is the verb that halts a machine.
+
+**A machine that does not exist yet converges on `Stopped` by booting first.**
+That looks like a bug and is not. Talos cannot be installed without booting, so
+"exists but never booted" is empty disks impersonating a machine. Converging
+costs one wasted boot in an uncommon case; refusing would leave the resource
+permanently un-converged, which is not how a controller should behave.
+
+**You will not watch that happen in `kubectl get tm`.** The acting ticks publish
+no status at all — a create or stop tick returns and lets the *next* tick observe
+the result, rather than reporting the pre-action state as converged — and
+`status.powerState` has no default. So the `Power` column stays empty from
+creation right through the boot and the halt, and only fills in once the machine
+settles: `<none> -> <none> -> <none> -> Stopped`. The wasted boot is visible in
+tinq's own log (`created`, then `stopped`) and in the VM actually running, not in
+`kubectl`.
+
+The `Synced` column is what tells the two ways of reaching `Stopped` apart:
+`Synced=True, Ready=False` is a machine stopped *because that is what was asked
+for*, `Synced=False` is one that failed. `Ready` tracks usability, which a
+stopped machine does not have — without that split the deliberate case and the
+incident print identical rows.
 
 ## One command to a cluster
 
@@ -209,7 +336,7 @@ knowing more about Talos than when you started — not that you trust a spinner:
 
 ```
 [ 1/10] platform      linux/amd64, kvm, qemu-system-x86_64
-[ 2/10] image         talos-v1.13.7-amd64.iso -> v1.13.7 (ISO volume id)
+[ 2/10] version       talos-v1.13.7-amd64.iso (ISO volume id) -> v1.13.7
 [ 3/10] version guard machinery v1.13.7 >= image v1.13.7  ok
 [ 4/10] boot          pid 1003824, api 127.0.0.1:50000
 [ 5/10] maintenance   reachable after 18s
@@ -258,10 +385,13 @@ kubectl get nodes
 ```
 
 `up` is **bootstrap only**. It creates a cluster; it never upgrades, scales or
-reconciles one. It is also **not resumable** — a failure part way through leaves
-a running VM and a state dir, and re-running `up` waits out the maintenance
-timeout against a node that has already left maintenance mode. Recovery is
-`destroy` and try again, which is what the error tells you.
+reconciles one. It *is* **idempotent** — re-running it after a failure part way
+through is the first thing to try, and it resumes from whatever the machine
+already reached. The one failure a retry cannot repair is a config written to
+the state directory but never accepted by the node: the state dir then says
+configured while the node is still in maintenance mode, and the authenticated
+wait can only time out. That one is `tinq destroy` and try again, which is what
+the error tells you.
 
 Three probes that look right and are not, and all three shape the code above: a
 TCP connect to a forwarded port succeeds even when nothing listens in the guest
@@ -426,10 +556,148 @@ leaving you to find out:
 machine's state directory, and `destroy` takes the whole state directory. This
 is a local development cluster, not a place to keep anything.
 
+## `adopt` — a node TinQ did not create
+
+*Verified against a QEMU node published on a LAN address. **Not yet run on
+physical hardware** — see Status.*
+
+Every verb above builds a VM. `adopt` is the one that does not: it takes a Talos
+machine **already booted into maintenance mode** — from a USB stick, IPMI virtual
+media, or netboot — and drives it to a Ready single-node cluster using the same
+ten steps `up` uses.
+
+It never powers anything on, and it never installs without a disk serial you
+chose.
+
+```yaml
+spec:
+  site: lab
+  role: talos-cp
+  baremetal:
+    maintenanceEndpoint: 192.168.1.50      # the node's address, NO port
+
+    # static addressing — omit for DHCP; the address must be on maintenanceEndpoint's segment
+    # network:
+    #   address: 192.168.1.50/24
+    #   gateway: 192.168.1.1
+    #   nameservers: [1.1.1.1]
+    #   hardwareAddr: 84:47:09:47:35:f9
+```
+
+`maintenanceEndpoint` carries **no port**. Talos's own defaults are used —
+50000 for apid, 6443 for kube-apiserver — because there is no forward to
+describe. Writing `192.168.1.50:50000` produced `192.168.1.50:50000:50000` and
+hung for the full ten-minute budget before that was refused up front.
+
+**No `network` block means DHCP**, which is what every QEMU machine uses and
+what every node used before the block existed. With one, the four fields are
+required together — a static node with no nameservers cannot resolve a registry
+and so cannot pull the image it was just told to install.
+
+`address` must sit **inside the same prefix as `maintenanceEndpoint`**, and adopt
+checks that from the file before it dials anything. Inside it, the node re-pins
+itself on the same wire and comes back reachable; outside it, the node boots onto
+an address that does not exist on the wire it is plugged into — and re-running
+cannot repair that, because an installed node never serves the maintenance API
+again. That address becomes apid's certificate SAN, the talosconfig endpoint and
+the kubeconfig server.
+
+A segment with no DHCP also leaves the node with **no address from the ISO**, so
+there is nothing for adopt to dial in the first place. Give the maintenance boot
+one at the GRUB menu — press `e`, append `ip=` to the linux line, Ctrl-X:
+
+```
+ip=192.168.1.50::192.168.1.1:255.255.255.0::enp1s0:off
+```
+
+That covers the **maintenance boot only**; the installed system writes its own
+command line and inherits nothing from the ISO, which is what the `network` block
+carries. `hardwareAddr` is a MAC rather than an interface name for the reason the
+install disk is a serial rather than a size — a stable identity, not an
+enumeration artifact. Omitting it is refused from the file; a MAC that is
+well-formed but **wrong** is refused once the node has answered, with this node's
+real links printed to copy from.
+
+### Run it twice, on purpose
+
+The first run is **expected to refuse**, because a serial cannot be guessed and
+guessing wrong overwrites a disk that may hold data:
+
+```
+$ tinq adopt node.yaml
+tinq: no serial given for the install target, and one cannot be guessed
+
+this node's disks:
+
+  DEVICE   SERIAL         MODEL          SIZE     NOTES
+  loop0    (none)                        84 MB    readonly — probably the medium you booted from
+  sr0      (none)         QEMU DVD-ROM   0 B      readonly — …, cdrom, sata
+  vda      talos-system                  22 GB    rotational, virtio
+  vdb      (none)                        336 MB   readonly — …, rotational, virtio
+  vdc      talos-data                    22 GB    rotational, virtio
+
+  put one of those serials in the machine file, then run adopt again
+```
+
+That table is the remedy, not decoration — without `talosctl` there is no other
+way to learn a serial. Note **`readonly`, not `cdrom`, identifies the medium you
+booted from**: a Talos ISO presents as a read-only virtio-blk device (`vdb`
+above), so a table flagging only CDROM would list your USB stick as an ordinary
+install candidate.
+
+Write a serial into `spec.baremetal.systemDiskSerial`, add `dataDiskSerial` if
+you want a StorageClass, and run it again. A serial matching **no** disk is
+refused the same way — that is the realistic failure, and Talos does not report
+it as one: it installs nowhere and the bring-up hangs.
+
+### The other verbs refuse hardware
+
+`apply`, `up`, `stop` and `destroy` all refuse a machine with `spec.baremetal`,
+each naming `adopt`. `destroy` matters most: its contract is to take the entire
+state directory, and on hardware that would delete the **only talosconfig that
+can reach a node it has no way to destroy** — a node that has left maintenance
+mode and can never be re-adopted.
+
+The controller applies the same rule from the other side. Deleting an adopted
+machine's resource **forgets** it: nothing on disk is removed, the node keeps
+running, and the finalizer clears so the resource goes away. Deleting a
+*registration* must not delete the credential to a machine that outlives it.
+
+There is no `forget` verb yet, so clearing an adopted node's state directory is
+`rm -rf` for now. The refusals say so.
+
+### Known rough edges
+
+- **Re-running `adopt` on an already-adopted node waits out the full ten-minute
+  maintenance budget** and then fails. `up`'s resume logic knows this case; the
+  pre-flight runs before it. Use `up`'s idempotency story only for VMs.
+- `powerState: Stopped` on a baremetal machine publishes no status at all.
+- The transcript's step 4 prints `boot: pid 0` — honest (TinQ booted nothing),
+  but it reads oddly.
+- **DHCP is assumed.** A node that comes up without a lease is unreachable, and
+  TinQ cannot tell that apart from a node that never booted.
+- **The apply is unverified — trust the path to the node.** A node in
+  maintenance mode has no cluster PKI yet, so its certificate cannot be checked
+  against anything and TinQ does not try (`talosctl apply-config --insecure`
+  makes the same trade for the same reason). The machine config that crosses
+  that connection is the cluster's **five certificate authorities and its
+  machine token**. Whoever answers at `<endpoint>:50000` receives them, and
+  whoever sits in the middle can read them and edit the config the node
+  installs — neither is detectable from this side. Adopting across a
+  directly-attached segment or a trusted lab LAN is the intended case; adopting
+  across a network carrying hosts you would not hand the cluster's CA to is
+  not. The window closes as soon as the config lands: every call after it is
+  mutually authenticated.
+
 ## Unprivileged by construction
 
 QEMU **user-mode networking** (SLIRP), so no `vmnet`, no `tap`, no bridge, no
 `sudo`. `hostForwards` is how the host reaches the guest.
+
+`hostForwards[].hostAddr` sets the bind address per forward and defaults to
+`127.0.0.1`. QEMU binds it **exclusively**, so publishing on a LAN address means
+nothing is listening on loopback — TinQ dials whatever address the forward is
+actually bound to.
 
 The tradeoff is real and worth stating: user-mode networking gives each VM NAT'd
 egress and forwarded ingress, and **VMs cannot reach each other**. For a single
@@ -440,22 +708,33 @@ them yet (see Status).
 
 ## How it works
 
-`driverkit` (174 lines) is the whole controller contract — three verbs:
+`driverkit` is the whole controller contract — four verbs:
 
 ```go
 type Driver interface {
-    Observe(ctx, *unstructured.Unstructured) (exists bool, status map[string]any, err error)
+    Observe(ctx, *unstructured.Unstructured) (state State, status map[string]any, err error)
     Create (ctx, *unstructured.Unstructured) error
+    Stop   (ctx, *unstructured.Unstructured) error
     Destroy(ctx, *unstructured.Unstructured) error
 }
 ```
 
-`Observe` must ask the **external system**, never a local state file. TinQ reads
-the pidfile QEMU itself wrote and checks liveness, because a state file happily
-reports a long-dead VM as present — that is the bug the signature exists to
-prevent.
+`Observe` reports one of three states — `Absent`, `Stopped`, `Running` — because
+"the disks exist but nothing is running" is a real condition and must not be
+confused with "never created". It asks the **external system**: TinQ verifies
+that a live process is *this machine's* QEMU, not merely that some process holds
+the pid a state file claims. A state file happily reports a long-dead VM as
+present, and that is the bug the signature exists to prevent.
 
-To support another hypervisor or cloud, implement those three verbs. Everything
+Reading disk only ever tells `Absent` from `Stopped`, and neither claims the
+machine is usable. The invariant is narrower than "never read a file" and
+stronger for it: never report a dead thing as `Ready`.
+
+`Create` brings a machine to `Running` from either `Absent` or `Stopped`, so it
+is as much start as create. `Stop` halts it and **keeps its disks**; only
+`Destroy` deletes them.
+
+To support another hypervisor or cloud, implement those four verbs. Everything
 else — the finalizer, the reconcile loop, status publication, delete ordering —
 is `driverkit`'s.
 
@@ -486,7 +765,7 @@ idempotently.
 
 Working and exercised:
 
-- `apply` / `destroy`, including re-apply (`Observe` reports present, so it
+- `apply` / `destroy`, including re-apply (`Observe` reports `Running`, so it
   will not start a second QEMU against the same state directory)
 - Talos boots on KVM (Linux/amd64, `q35` + `-cpu host` + distro OVMF); Talos
   API via `hostForwards`
@@ -495,6 +774,19 @@ Working and exercised:
   below
 - Controller mode against a cluster with the CRD installed
 - `Destroy` sweeps process + state directory
+- `adopt` against a **QEMU node published on a LAN address** — the full ten
+  steps to Ready, with the apiserver certificate naming that address and
+  `kubectl` reaching it. Both disk refusals fired; a PVC bound onto the
+  serial-selected data disk (`/dev/vdc1`). This rehearses everything hardware
+  needs except a real NIC and disk serials TinQ did not choose
+
+Not yet exercised:
+
+- **`adopt` against physical hardware.** Nothing in this branch has met a
+  machine that is not a VM. The rehearsal above is deliberately as close as a
+  VM can get, and the two remaining unknowns are named: a real NIC taking a
+  DHCP lease, and real disk serials (some consumer NVMe report none, in which
+  case WWID is the fallback and the table shows it)
 
 - **A real cluster, end to end** — *before this branch, by hand, on
   macOS/arm64*. Single-node control plane, Kubernetes v1.36.1 on Talos v1.9.5,
@@ -530,11 +822,40 @@ Working and exercised:
   through the pinned `busybox:1.38.0` helper pod, which wrote and read a file
   on it.
 
+- **`spec.registries`, end to end, on Linux/KVM.** A `distribution` v3.0.0
+  registry bound to the host's `127.0.0.1:5000`, an image built with `crane
+  append` and pushed there and nowhere else, and a Pod with
+  `imagePullPolicy: Always` reaching `Ready` off it inside a v1.13.7 guest —
+  which is the only thing that proves both halves, since a `curl` from the host
+  proves the registry is up and says nothing about containerd. The generated
+  config carried `machine.registries.mirrors` keyed `10.0.2.2:5000`, and the
+  guest reached the host's loopback listener at that alias with no forward
+  configured. Verified with libslirp on one host; a libslirp that does not
+  remap `10.0.2.2` would need the registry bound wider.
+
 Not done yet — stated plainly rather than implied:
 
-- **`up` is bootstrap only, and not resumable.** It creates a cluster; it
-  never upgrades, scales or reconciles one, and a failure part way through is
-  recovered with `destroy` and a retry rather than by re-running `up`.
+- **`stop` and `up` are hardware-verified; the escalation ladder is not.** One
+  `up` -> `stop` -> `up` -> `destroy` round trip was run against a real Talos
+  v1.13.7 guest. `stop` asked the guest and it powered itself off in 36s — the
+  clean rung, not a fallback, since every non-graceful path logs and that run
+  was silent. `up` then resumed the stopped node in 1m14s, printing steps 5-7
+  as skipped and step 8 as `already bootstrapped (the node refused a second
+  one)`; the node came back as the SAME object with an age spanning the stop,
+  so etcd survived. What that run did NOT exercise is the escalation: a guest
+  that ignores `Shutdown` has never been observed, so SIGTERM -> SIGKILL is
+  still only tested against a decoy process. A node in maintenance mode never
+  gets the graceful rung by design — it cannot satisfy the mutual TLS, which is
+  safe rather than a compromise, since it holds no applied config and nothing
+  persistent to corrupt.
+- **`spec.powerState` reconciliation is unit-tested, not hardware-exercised.**
+  The transition table and the `Synced`/`Ready` split have tests, but the
+  controller loop driving a real machine between states — including the
+  `Absent -> Running -> Stopped` convergence — has only been run against the
+  hook seam. The standalone verbs are what the hardware run covered.
+- **`up` is bootstrap only.** It creates a cluster; it never upgrades, scales
+  or reconciles one. It is idempotent — re-running resumes from wherever the
+  machine already is, which is how a machine halted with `stop` comes back.
 - **One stderr line still interleaves with the transcript.** client-go relays
   the API server's `restricted:latest` PodSecurity *warning* during step 10,
   which reads like a failure and is not — the namespace is labelled
