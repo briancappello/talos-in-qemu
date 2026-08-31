@@ -386,8 +386,21 @@ func TestAdoptRefusesAnInstallTargetNamedTwice(t *testing.T) {
     systemDiskWWID: naa.5000c5001b82df21
 `)
 
-	if !strings.Contains(err.Error(), "named twice") {
-		t.Errorf("the refusal does not say the install target is named twice: %v", err)
+	// Asserted on the two VALUES the config supplied, not on the refusal's
+	// wording. This test was red at HEAD because it grepped for "named twice"
+	// while the message says "named more than once" -- the refusal was correct
+	// and the check was coupled to prose. The values are what make the message
+	// actionable, and a generic refusal cannot contain them by coincidence.
+	if err == nil {
+		t.Fatal("a config naming the install target by serial AND wwid was accepted; " +
+			"machinery ANDs the fields, so it selects nothing and the bring-up hangs")
+	}
+
+	for _, want := range []string{"S1", "naa.5000c5001b82df21"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q, so it does not say which two "+
+				"fields collide: %v", want, err)
+		}
 	}
 }
 

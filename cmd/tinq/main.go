@@ -1175,7 +1175,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		"-drive", "if=none,id=sys,format=qcow2,file=" + diskPath,
 		"-device", "virtio-blk-pci,drive=sys,serial=" + DiskSerialSystem + ",bootindex=0",
 		"-drive", "if=none,id=cd,media=cdrom,file=" + image,
-		"-device", "virtio-blk-pci,drive=cd,bootindex=1",
+		"-device", fmt.Sprintf("virtio-blk-pci,drive=cd,bootindex=%d", isoBootIndex),
 		"-netdev", netdev,
 		"-device", "virtio-net-pci,netdev=n0",
 		// ENTROPY, and it decides whether the bring-up works at all. Talos's
@@ -1428,10 +1428,34 @@ const (
 	// config selects them as a SET: disk.serial.startsWith("talos-extra-").
 	DiskSerialExtra = "talos-extra"
 
-	// extraDiskBootIndex is where extra disks enter the boot order: after the system disk
-	// (0) and the install media (1).
+	// extraDiskBootIndex is where extra disks enter the boot order: after the system
+	// disk (0), and BEFORE the install media, which sits at isoBootIndex.
 	extraDiskBootIndex = 2
-	DiskSerialData     = "talos-data"
+
+	// isoBootIndex puts the install media LAST, behind every disk that could become
+	// bootable.
+	//
+	// The comment on the boot devices above states the design: firmware tries the
+	// disks first and falls through to the ISO only while they are still blank, so
+	// installing flips the behaviour without anything having to record that it did.
+	// That held while the only install target was the system disk at 0. It stopped
+	// holding the moment a layout put its ESP on the EXTRA disks -- they enter at 2,
+	// which is BEHIND an ISO at 1, so the one disk that does become bootable is never
+	// reached and the guest boots the media forever.
+	//
+	// Talos then refuses to install over itself and halts, correctly, with "already
+	// installed to disk but booted from another media -- please reboot from the disk",
+	// repeating every 30s. Measured in a venue on 2026-08-31: two kernel boots in the
+	// serial log, so the guest completed its own post-install reboot exactly as it
+	// should have, and landed back on the ISO. For days that was read as a Talos
+	// defect -- "the guest never completes its post-install reboot" -- because the
+	// unattended-install path drops machine.install and with it extraKernelArgs, so
+	// there was no serial console to say otherwise.
+	//
+	// Last, not 1, keeps the stated invariant true for ANY install target: the ISO is
+	// reached only when nothing else can boot.
+	isoBootIndex   = 99
+	DiskSerialData = "talos-data"
 )
 
 // specDataDisk resolves spec.dataDisk, the OPTIONAL second disk for PVCs.

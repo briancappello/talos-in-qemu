@@ -475,10 +475,14 @@ func TestCreateQEMUArgs(t *testing.T) {
 				"-m", "2048",
 				"-drive", "if=pflash,format=raw,readonly=on,file=" + code,
 				"-drive", "if=pflash,format=raw,file=" + filepath.Join(dir, "efivars.fd"),
+				// Added to main.go by f3bd907 and never added here, so this
+				// whole-argv assertion -- the one that exists to catch exactly
+				// this drift -- has been failing at HEAD ever since.
+				"-uuid", machineUUID(m.GetName()),
 				"-drive", "if=none,id=sys,format=qcow2,file=" + filepath.Join(dir, "system.qcow2"),
 				"-device", "virtio-blk-pci,drive=sys,serial=talos-system,bootindex=0",
 				"-drive", "if=none,id=cd,media=cdrom,file=" + image,
-				"-device", "virtio-blk-pci,drive=cd,bootindex=1",
+				"-device", "virtio-blk-pci,drive=cd,bootindex=99",
 				"-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:50000-:50000",
 				"-device", "virtio-net-pci,netdev=n0",
 				// Without this the guest can sit at "executing /sbin/init"
@@ -2257,5 +2261,107 @@ func requireSWTPM(t *testing.T) {
 
 	if _, err := exec.LookPath("swtpm"); err != nil {
 		t.Skip("swtpm not on PATH")
+	}
+}
+
+// TestISOBootsLastOfAllDisks pins the ONE ordering property that decides whether a
+// machine can ever boot what it just installed: the install media must sit behind
+// every disk that could become bootable.
+//
+// This is a regression test with a measured cost. The design comment on the boot
+// devices says firmware tries the disks first and falls through to the ISO only
+// while they are blank -- true while the sole install target was the system disk at
+// bootindex 0, and false the moment a layout put its ESP on the EXTRA disks, which
+// enter at 2 and so sit BEHIND an ISO at 1. Such a guest reboots after installing,
+// reaches the ISO again, and Talos halts with "already installed to disk but booted
+// from another media", repeating every 30s. It reads as a hung post-install reboot;
+// it is a completed reboot landing on the wrong device.
+//
+// TestCreateQEMUArgs asserts the argv whole, but has no extra-disk case, so it
+// agreed with the broken order. Asserting the RELATION rather than the literal 99
+// is deliberate: renumbering the disks must not be able to make this pass.
+func TestISOBootsLastOfAllDisks(t *testing.T) {
+	requireQEMUImg(t)
+
+	root, imageRoot := t.TempDir(), t.TempDir()
+	fw := t.TempDir()
+	code := filepath.Join(fw, "OVMF_CODE.fd")
+	vars := filepath.Join(fw, "OVMF_VARS.fd")
+	writeSized(t, code, 1024, 'C')
+	writeSized(t, vars, x86VarsSize, 'T')
+	image := filepath.Join(imageRoot, "talos.iso")
+	writeSized(t, image, 4096, 'I')
+	bin, argv := fakeQEMU(t, fw)
+
+	h := &hvf{
+		stateRoot: root,
+		imageRoot: imageRoot,
+		detect: func() (*platform.Platform, error) {
+			return &platform.Platform{
+				QEMUBinary: bin, Machine: "q35", Accel: "kvm", CPU: "host",
+				FirmwareCode: code, FirmwareVars: vars,
+				ConsoleArg: "console=ttyS0", ImageArch: "amd64",
+			}, nil
+		},
+	}
+
+	var obj map[string]interface{}
+	if err := yaml.Unmarshal([]byte(machineDoc+"  extraDisks: [4Gi, 4Gi]\n"), &obj); err != nil {
+		t.Fatal(err)
+	}
+	m := &unstructured.Unstructured{Object: obj}
+	m.SetUID("bootstrap-default-cp0")
+
+	if _, err := h.create(m, h.dir(m)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	idx := func(substr string) (int, bool) {
+		for _, a := range argv() {
+			if !strings.Contains(a, substr) || !strings.Contains(a, "bootindex=") {
+				continue
+			}
+
+			n, err := strconv.Atoi(a[strings.LastIndex(a, "bootindex=")+len("bootindex="):])
+			if err != nil {
+				t.Fatalf("unparsable bootindex in %q: %v", a, err)
+			}
+
+			return n, true
+		}
+
+		return 0, false
+	}
+
+	iso, ok := idx("drive=cd")
+	if !ok {
+		t.Fatal("the ISO carries no bootindex; nothing orders it against the disks")
+	}
+
+	// Non-vacuity: without extra disks in the argv this test would pass against
+	// the very defect it exists to catch.
+	found := 0
+
+	for _, d := range []string{"drive=sys", "drive=extra0", "drive=extra1"} {
+		n, ok := idx(d)
+		if !ok {
+			t.Errorf("%s carries no bootindex", d)
+
+			continue
+		}
+
+		found++
+
+		if n >= iso {
+			t.Errorf("%s is at bootindex %d, at or behind the ISO at %d -- firmware "+
+				"reaches the install media before the disk it installed to, so the "+
+				"guest boots the ISO forever and Talos halts with "+
+				"\"already installed to disk but booted from another media\"", d, n, iso)
+		}
+	}
+
+	if found != 3 {
+		t.Fatalf("only %d of 3 disks carried a bootindex; the ordering above was "+
+			"asserted against an argv that does not contain what it must order", found)
 	}
 }
