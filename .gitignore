@@ -7,3 +7,6 @@
 .idea/
 *.iml
 .vscode/
+
+# Talos checkout materialised by scripts/build-secureboot-media.sh
+.build/

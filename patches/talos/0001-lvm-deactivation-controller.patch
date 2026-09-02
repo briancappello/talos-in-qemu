@@ -1,0 +1,538 @@
+diff --git a/internal/app/machined/pkg/controllers/storage/lvm_deactivation.go b/internal/app/machined/pkg/controllers/storage/lvm_deactivation.go
+new file mode 100644
+index 0000000..9911564
+--- /dev/null
++++ b/internal/app/machined/pkg/controllers/storage/lvm_deactivation.go
+@@ -0,0 +1,231 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++package storage
++
++import (
++	"context"
++	"fmt"
++	"path/filepath"
++
++	"github.com/cosi-project/runtime/pkg/controller"
++	"github.com/cosi-project/runtime/pkg/resource"
++	"github.com/cosi-project/runtime/pkg/safe"
++	"go.uber.org/zap"
++
++	machineruntime "github.com/siderolabs/talos/internal/app/machined/pkg/runtime"
++	"github.com/siderolabs/talos/pkg/machinery/resources/block"
++	"github.com/siderolabs/talos/pkg/machinery/resources/storage"
++)
++
++// LVMDeactivator is the deactivation controller's LVM subset.
++type LVMDeactivator interface {
++	VGChangeDeactivate(ctx context.Context, vgName string) error
++}
++
++// LVMDeactivationController deactivates an LVM volume group before the volume
++// backing it is closed.
++//
++// Without this, a VG stacked on an encrypted volume wedges shutdown: the volume
++// manager closes a volume as soon as its VolumeStatus has no finalizers
++// (volume_manager.go, shouldCloseVolume), and the LVM subsystem registers
++// nothing there. `cryptsetup luksClose` then fails with "mapped device is still
++// in use" because the logical volumes still hold the decrypted mapper open, and
++// the node retries until the teardown budget expires and reboots uncleanly.
++//
++// A raw volume never gets the MountController finalizer that protects mounted
++// volumes -- RawVolumeTransformer uses SkipMountTransform, so there is no mount
++// request and no refcount -- which is why LVM has to hold its own.
++//
++// This mirrors MountController: hold a finalizer on the backing VolumeStatus
++// while the VG is active, and release it only after `vgchange -an`.
++// Deactivation is not destructive; the VG reactivates on the next boot.
++type LVMDeactivationController struct {
++	V1Alpha1Mode machineruntime.Mode
++	LVM          LVMDeactivator
++}
++
++// Name implements controller.Controller interface.
++func (ctrl *LVMDeactivationController) Name() string {
++	return "storage.LVMDeactivationController"
++}
++
++// Inputs implements controller.Controller interface.
++func (ctrl *LVMDeactivationController) Inputs() []controller.Input {
++	return []controller.Input{
++		{
++			// Desired state, available as soon as the volume is unlocked --
++			// well before the `pvs` scan produces LVMPhysicalVolumeStatus.
++			// Without this the first post-install reboot races the scan and
++			// tears the volume down with no finalizer held.
++			Namespace: storage.NamespaceName,
++			Type:      storage.LVMPhysicalVolumeSpecType,
++			Kind:      controller.InputWeak,
++		},
++		{
++			Namespace: storage.NamespaceName,
++			Type:      storage.LVMPhysicalVolumeStatusType,
++			Kind:      controller.InputWeak,
++		},
++		{
++			// Strong: this controller places finalizers on VolumeStatus.
++			Namespace: block.NamespaceName,
++			Type:      block.VolumeStatusType,
++			Kind:      controller.InputStrong,
++		},
++	}
++}
++
++// Outputs implements controller.Controller interface.
++func (ctrl *LVMDeactivationController) Outputs() []controller.Output {
++	return nil
++}
++
++// Run implements controller.Controller interface.
++func (ctrl *LVMDeactivationController) Run(ctx context.Context, r controller.Runtime, logger *zap.Logger) error {
++	for {
++		select {
++		case <-ctx.Done():
++			return nil
++		case <-r.EventCh():
++		}
++
++		if err := ctrl.reconcile(ctx, r, logger); err != nil {
++			return err
++		}
++	}
++}
++
++func (ctrl *LVMDeactivationController) reconcile(ctx context.Context, r controller.Runtime, logger *zap.Logger) error {
++	// No device-mapper in a container; nothing to hold and nothing to deactivate.
++	if ctrl.V1Alpha1Mode == machineruntime.ModeContainer {
++		return nil
++	}
++
++	vgByDevice, err := ctrl.volumeGroupsByDevice(ctx, r)
++	if err != nil {
++		return err
++	}
++
++	volumeStatuses, err := safe.ReaderListAll[*block.VolumeStatus](ctx, r)
++	if err != nil {
++		return fmt.Errorf("list volume statuses: %w", err)
++	}
++
++	for volumeStatus := range volumeStatuses.All() {
++		// MountLocation is the device LVM actually consumes: for an encrypted
++		// volume that is the decrypted mapper, not the ciphertext partition.
++		vgName := vgByDevice[resolveDevice(volumeStatus.TypedSpec().MountLocation)]
++		held := volumeStatus.Metadata().Finalizers().Has(ctrl.Name())
++
++		switch volumeStatus.Metadata().Phase() {
++		case resource.PhaseRunning:
++			if vgName == "" || held {
++				continue
++			}
++
++			if err := r.AddFinalizer(ctx, volumeStatus.Metadata(), ctrl.Name()); err != nil {
++				return fmt.Errorf("add finalizer to volume status %q: %w", volumeStatus.Metadata().ID(), err)
++			}
++		case resource.PhaseTearingDown:
++			if !held {
++				continue
++			}
++
++			if vgName != "" {
++				logger.Info(
++					"deactivating LVM volume group before closing backing volume",
++					zap.String("vg", vgName),
++					zap.String("volume", volumeStatus.Metadata().ID()),
++					zap.String("device", volumeStatus.TypedSpec().MountLocation),
++				)
++
++				if err := ctrl.LVM.VGChangeDeactivate(ctx, vgName); err != nil {
++					// Deliberately NOT fatal, and the finalizer is released
++					// below regardless. Holding it on a failed deactivation
++					// would block the volume from ever closing -- strictly
++					// worse than the busy-device retry this controller exists
++					// to avoid.
++					logger.Warn(
++						"failed to deactivate LVM volume group; closing backing volume anyway",
++						zap.String("vg", vgName),
++						zap.Error(err),
++					)
++				}
++			}
++
++			if err := r.RemoveFinalizer(ctx, volumeStatus.Metadata(), ctrl.Name()); err != nil {
++				return fmt.Errorf("remove finalizer from volume status %q: %w", volumeStatus.Metadata().ID(), err)
++			}
++		}
++	}
++
++	return nil
++}
++
++// volumeGroupsByDevice maps each PV's backing device to its volume group name,
++// keyed by resolved device path so a /dev/mapper/<name> symlink and the
++// /dev/dm-N it points at compare equal.
++//
++// Both desired (LVMPhysicalVolumeSpec) and observed (LVMPhysicalVolumeStatus)
++// state are folded in. The spec appears as soon as the volume is unlocked; the
++// status only after the `pvs` scan runs. Taking the union means the finalizer
++// is in place from the moment a VG is intended on a device, which is what
++// makes the very first post-install reboot safe. Claiming a device whose VG was
++// never actually created is harmless: `vgchange -an` on a missing VG fails, and
++// the failure path releases the finalizer anyway.
++func (ctrl *LVMDeactivationController) volumeGroupsByDevice(ctx context.Context, r controller.Runtime) (map[string]string, error) {
++	vgByDevice := map[string]string{}
++
++	pvSpecs, err := safe.ReaderListAll[*storage.LVMPhysicalVolumeSpec](ctx, r)
++	if err != nil {
++		return nil, fmt.Errorf("list LVM physical volume specs: %w", err)
++	}
++
++	for pvSpec := range pvSpecs.All() {
++		spec := pvSpec.TypedSpec()
++
++		if spec.Device == "" || spec.VGName == "" {
++			continue
++		}
++
++		vgByDevice[resolveDevice(spec.Device)] = spec.VGName
++	}
++
++	pvStatuses, err := safe.ReaderListAll[*storage.LVMPhysicalVolumeStatus](ctx, r)
++	if err != nil {
++		return nil, fmt.Errorf("list LVM physical volume statuses: %w", err)
++	}
++
++	for pvStatus := range pvStatuses.All() {
++		spec := pvStatus.TypedSpec()
++
++		// An orphan PV (no VG) holds nothing open.
++		if spec.Device == "" || spec.VGName == "" {
++			continue
++		}
++
++		vgByDevice[resolveDevice(spec.Device)] = spec.VGName
++	}
++
++	return vgByDevice, nil
++}
++
++// resolveDevice canonicalises a device path through its symlinks. LVM reports a
++// PV as /dev/mapper/luks2-r-lvm while VolumeStatus reports /dev/dm-0, and those
++// are the same device. Falls back to the input when the link cannot be resolved
++// (e.g. the device is already gone), which merely fails the match rather than
++// matching the wrong device.
++func resolveDevice(devPath string) string {
++	if devPath == "" {
++		return ""
++	}
++
++	resolved, err := filepath.EvalSymlinks(devPath)
++	if err != nil {
++		return devPath
++	}
++
++	return resolved
++}
+diff --git a/internal/app/machined/pkg/controllers/storage/lvm_deactivation_test.go b/internal/app/machined/pkg/controllers/storage/lvm_deactivation_test.go
+new file mode 100644
+index 0000000..560c356
+--- /dev/null
++++ b/internal/app/machined/pkg/controllers/storage/lvm_deactivation_test.go
+@@ -0,0 +1,253 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++package storage_test
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/cosi-project/runtime/pkg/resource"
++	"github.com/siderolabs/go-retry/retry"
++	"github.com/stretchr/testify/suite"
++
++	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
++	storagectrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/storage"
++	blockres "github.com/siderolabs/talos/pkg/machinery/resources/block"
++	storageres "github.com/siderolabs/talos/pkg/machinery/resources/storage"
++)
++
++const (
++	deactVGName     = "vg-pool"
++	deactVolumeID   = "r-lvm"
++	deactMapperPath = "/dev/mapper/luks2-r-lvm"
++	deactFinalizer  = "storage.LVMDeactivationController"
++)
++
++// fakeDeactivator records vgchange -an calls.
++type fakeDeactivator struct {
++	mu sync.Mutex
++
++	deactivated []string
++	err         error
++}
++
++func (f *fakeDeactivator) VGChangeDeactivate(_ context.Context, vgName string) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++
++	f.deactivated = append(f.deactivated, vgName)
++
++	return f.err
++}
++
++func (f *fakeDeactivator) calls() []string {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++
++	return append([]string(nil), f.deactivated...)
++}
++
++func (f *fakeDeactivator) reset() {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++
++	f.deactivated = nil
++	f.err = nil
++}
++
++func (f *fakeDeactivator) setErr(err error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++
++	f.err = err
++}
++
++type LVMDeactivationSuite struct {
++	ctest.DefaultSuite
++
++	deactivator *fakeDeactivator
++}
++
++func (suite *LVMDeactivationSuite) SetupTest() {
++	suite.deactivator.reset()
++	suite.DefaultSuite.SetupTest()
++}
++
++// createPV registers a PV whose backing device is the LUKS mapper, exactly as
++// `pvs` reports it for an encrypted raw volume.
++func (suite *LVMDeactivationSuite) createPV(id, device, vgName string) {
++	pv := storageres.NewLVMPhysicalVolumeStatus(storageres.NamespaceName, id)
++	pv.TypedSpec().Device = device
++	pv.TypedSpec().VGName = vgName
++
++	suite.Create(pv)
++}
++
++// createPVSpec registers the DESIRED PV state, which the spec controller emits
++// as soon as the volume is unlocked -- before the `pvs` scan runs. Its device is
++// the decrypted mapper path (/dev/dm-N), not the /dev/mapper alias.
++func (suite *LVMDeactivationSuite) createPVSpec(id, device, vgName string) {
++	pv := storageres.NewLVMPhysicalVolumeSpec(storageres.NamespaceName, id)
++	pv.TypedSpec().Device = device
++	pv.TypedSpec().VGName = vgName
++
++	suite.Create(pv)
++}
++
++// createVolumeStatus registers a ready encrypted volume whose decrypted mapper
++// is mountLocation.
++func (suite *LVMDeactivationSuite) createVolumeStatus(id, mountLocation string) {
++	vs := blockres.NewVolumeStatus(blockres.NamespaceName, id)
++	vs.TypedSpec().Phase = blockres.VolumePhaseReady
++	vs.TypedSpec().MountLocation = mountLocation
++
++	suite.Create(vs)
++}
++
++func (suite *LVMDeactivationSuite) eventually(check func() error) {
++	suite.AssertWithin(2*time.Second, 50*time.Millisecond, func() error {
++		return check()
++	})
++}
++
++func (suite *LVMDeactivationSuite) volumeStatusMD(id string) *resource.Metadata {
++	return blockres.NewVolumeStatus(blockres.NamespaceName, id).Metadata()
++}
++
++func (suite *LVMDeactivationSuite) assertFinalizer(id string, want bool) {
++	suite.eventually(func() error {
++		res, err := suite.State().Get(suite.Ctx(), *suite.volumeStatusMD(id))
++		if err != nil {
++			return retry.ExpectedError(err)
++		}
++
++		if got := res.Metadata().Finalizers().Has(deactFinalizer); got != want {
++			return retry.ExpectedErrorf("finalizer present=%v, want %v", got, want)
++		}
++
++		return nil
++	})
++}
++
++// TestHoldsFinalizerWhileVGActive is the ordering guarantee: without this
++// finalizer the volume manager closes the LUKS mapper while the VG still holds
++// it open, and cryptsetup fails with "mapped device is still in use".
++func (suite *LVMDeactivationSuite) TestHoldsFinalizerWhileVGActive() {
++	suite.createPV("mapper-luks2-r-lvm", deactMapperPath, deactVGName)
++	suite.createVolumeStatus(deactVolumeID, deactMapperPath)
++
++	suite.assertFinalizer(deactVolumeID, true)
++	suite.Assert().Empty(suite.deactivator.calls(), "must not deactivate while the volume is running")
++}
++
++// TestDeactivatesVGOnTeardown is the regression test proper.
++func (suite *LVMDeactivationSuite) TestDeactivatesVGOnTeardown() {
++	suite.createPV("mapper-luks2-r-lvm", deactMapperPath, deactVGName)
++	suite.createVolumeStatus(deactVolumeID, deactMapperPath)
++
++	suite.assertFinalizer(deactVolumeID, true)
++
++	_, err := suite.State().Teardown(suite.Ctx(), *suite.volumeStatusMD(deactVolumeID))
++	suite.Require().NoError(err)
++
++	suite.eventually(func() error {
++		if calls := suite.deactivator.calls(); len(calls) == 0 || calls[0] != deactVGName {
++			return retry.ExpectedErrorf("vgchange -an %q not called, got %v", deactVGName, calls)
++		}
++
++		return nil
++	})
++
++	// The finalizer must be released so the volume manager can finally close.
++	suite.assertFinalizer(deactVolumeID, false)
++}
++
++// TestReleasesFinalizerWhenDeactivationFails guards the failure mode that would
++// be WORSE than the original bug: holding the finalizer on a failed vgchange
++// would block the volume from ever closing, hanging shutdown entirely.
++func (suite *LVMDeactivationSuite) TestReleasesFinalizerWhenDeactivationFails() {
++	suite.deactivator.setErr(errors.New("vgchange boom"))
++
++	suite.createPV("mapper-luks2-r-lvm", deactMapperPath, deactVGName)
++	suite.createVolumeStatus(deactVolumeID, deactMapperPath)
++
++	suite.assertFinalizer(deactVolumeID, true)
++
++	_, err := suite.State().Teardown(suite.Ctx(), *suite.volumeStatusMD(deactVolumeID))
++	suite.Require().NoError(err)
++
++	suite.assertFinalizer(deactVolumeID, false)
++}
++
++// TestIgnoresVolumesNotBackingAPV keeps the controller off every unrelated
++// volume (EPHEMERAL, STATE, ...), which must not gain a finalizer.
++func (suite *LVMDeactivationSuite) TestIgnoresVolumesNotBackingAPV() {
++	suite.createPV("mapper-luks2-r-lvm", deactMapperPath, deactVGName)
++	suite.createVolumeStatus("EPHEMERAL", "/dev/md127p4")
++
++	// Give the controller a chance to do the wrong thing before asserting.
++	time.Sleep(500 * time.Millisecond)
++
++	suite.assertFinalizer("EPHEMERAL", false)
++	suite.Assert().Empty(suite.deactivator.calls())
++}
++
++// TestHoldsFinalizerFromSpecAlone covers the first-post-install-reboot window:
++// LVMScanController has not run yet, so LVMPhysicalVolumeStatus does not exist
++// and only the desired-state spec is available. Without this the volume is torn
++// down with no finalizer and the LUKS close fails "mapped device is still in
++// use" on exactly the reboot that follows an install.
++func (suite *LVMDeactivationSuite) TestHoldsFinalizerFromSpecAlone() {
++	// NOTE: no createPV() here -- status is deliberately absent.
++	suite.createPVSpec("dm-0", "/dev/dm-0", deactVGName)
++	suite.createVolumeStatus(deactVolumeID, "/dev/dm-0")
++
++	suite.assertFinalizer(deactVolumeID, true)
++
++	_, err := suite.State().Teardown(suite.Ctx(), *suite.volumeStatusMD(deactVolumeID))
++	suite.Require().NoError(err)
++
++	suite.eventually(func() error {
++		if calls := suite.deactivator.calls(); len(calls) == 0 || calls[0] != deactVGName {
++			return retry.ExpectedErrorf("vgchange -an %q not called, got %v", deactVGName, calls)
++		}
++
++		return nil
++	})
++
++	suite.assertFinalizer(deactVolumeID, false)
++}
++
++// TestIgnoresOrphanPV: a PV with no VG holds nothing open.
++func (suite *LVMDeactivationSuite) TestIgnoresOrphanPV() {
++	suite.createPV("mapper-luks2-r-lvm", deactMapperPath, "")
++	suite.createVolumeStatus(deactVolumeID, deactMapperPath)
++
++	time.Sleep(500 * time.Millisecond)
++
++	suite.assertFinalizer(deactVolumeID, false)
++}
++
++func TestLVMDeactivationSuite(t *testing.T) {
++	t.Parallel()
++
++	deactivator := &fakeDeactivator{}
++
++	s := &LVMDeactivationSuite{deactivator: deactivator}
++
++	s.DefaultSuite = ctest.DefaultSuite{
++		Timeout: 10 * time.Second,
++		AfterSetup: func(suite *ctest.DefaultSuite) {
++			suite.Require().NoError(suite.Runtime().RegisterController(&storagectrl.LVMDeactivationController{
++				LVM: deactivator,
++			}))
++		},
++	}
++
++	suite.Run(t, s)
++}
+diff --git a/internal/app/machined/pkg/runtime/v1alpha2/v1alpha2_controller.go b/internal/app/machined/pkg/runtime/v1alpha2/v1alpha2_controller.go
+index baa2ccc..12835a8 100644
+--- a/internal/app/machined/pkg/runtime/v1alpha2/v1alpha2_controller.go
++++ b/internal/app/machined/pkg/runtime/v1alpha2/v1alpha2_controller.go
+@@ -185,6 +185,10 @@ func (ctrl *Controller) Run(ctx context.Context, drainer *runtime.Drainer) error
+ 			V1Alpha1Mode: ctrl.v1alpha1Runtime.State().Platform().Mode(),
+ 			LVM:          lvmProvisioner,
+ 		},
++		&storage.LVMDeactivationController{
++			V1Alpha1Mode: ctrl.v1alpha1Runtime.State().Platform().Mode(),
++			LVM:          lvmProvisioner,
++		},
+ 		&storage.LVMLogicalVolumeReconcileController{
+ 			V1Alpha1Mode: ctrl.v1alpha1Runtime.State().Platform().Mode(),
+ 			LVM:          lvmProvisioner,
+diff --git a/internal/pkg/lvm/activate.go b/internal/pkg/lvm/activate.go
+index 57a0ed5..f8e20a8 100644
+--- a/internal/pkg/lvm/activate.go
++++ b/internal/pkg/lvm/activate.go
+@@ -28,6 +28,22 @@ func (lvm *LVM) VGChangeActivate(ctx context.Context, vgName string) error {
+ 	return nil
+ }
+ 
++// VGChangeDeactivate deactivates the given volume group via
++// `lvm vgchange -an <vg>`, releasing every logical volume in it.
++//
++// This is the unwind of VGChangeActivate, and it exists for teardown: a VG
++// stacked on an encrypted volume keeps the LUKS mapper open, so `cryptsetup
++// luksClose` fails with "mapped device is still in use" until the VG is
++// deactivated. Deactivation is NOT destructive -- no metadata is touched, and
++// the VG reactivates normally on the next boot.
++func (lvm *LVM) VGChangeDeactivate(ctx context.Context, vgName string) error {
++	if _, err := lvm.run(ctx, "vgchange", "-an", vgName); err != nil {
++		return fmt.Errorf("deactivate volume group %q: %w", vgName, err)
++	}
++
++	return nil
++}
++
+ // PVScanAutoActivation runs `lvm pvscan --cache --listvg --checkcomplete
+ // --vgonline --autoactivation event --udevoutput <devicePath>` and returns the
+ // parsed udev-style key/value pairs.

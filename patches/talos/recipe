@@ -1,0 +1,22 @@
+# Sources layered onto --base, in order, when no --pr/--patch is given.
+#
+#   pr:<n>        siderolabs/talos pull request, fetched at build time
+#   patch:<file>  path relative to this file
+#
+# Prefer pr: over vendoring. A PR that is already open needs no copy here, and
+# a copy silently goes stale the moment the PR is updated. Vendor a patch only
+# for work that exists nowhere upstream yet.
+#
+# Each source is dropped from this file once it lands in --base; the script
+# says so when a source is already present. When this file is empty, the whole
+# custom-media path retires in favour of stock upstream images.
+
+# LVM physical volumes must be created on the decrypted mapper, not the LUKS
+# ciphertext. Without it the volume group forms on the ciphertext and the
+# volume then fails permanently with "lvm2-pv != luks".
+pr:14145
+
+# Deactivate an LVM volume group before closing the LUKS mapper underneath it,
+# so shutdown does not stall on "mapped device is still in use". Not upstream
+# in any form yet -- open a PR and replace this with a pr: line.
+patch:0001-lvm-deactivation-controller.patch
