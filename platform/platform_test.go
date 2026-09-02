@@ -97,7 +97,7 @@ func TestDetectOnThisHost(t *testing.T) {
 	// them in Detect, or pass nil for registryDirs, and both still name real
 	// files. Re-resolve from the same inputs and compare the ORDERED pair, so
 	// the wiring — not merely the outcome — is what is asserted.
-	wantCode, wantVars, err := resolveFirmware(registryDirs, fallbackTable, runtime.GOOS, ai.fwArch, ai.machine)
+	wantCode, wantVars, err := resolveFirmware(registryDirs, fallbackTable, runtime.GOOS, ai.fwArch, ai.machine, false)
 	if err != nil {
 		t.Fatalf("resolveFirmware failed for a host Detect just succeeded on: %v", err)
 	}

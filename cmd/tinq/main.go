@@ -1074,8 +1074,20 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		}
 	}
 
+	// SecureBoot swaps BOTH halves of the pflash pair, never one. The vars
+	// template has to be the one that belongs to the secure code image (a blank
+	// store, i.e. setup mode) or auto-enrolment cannot happen.
+	fwCode, fwVars := p.FirmwareCode, p.FirmwareVars
+	secureBoot := specSecureBoot(spec)
+	if secureBoot {
+		if p.SecureFirmwareErr != nil {
+			return 0, fmt.Errorf("spec.secureBoot is set, but no secure-boot UEFI firmware was found: %w", p.SecureFirmwareErr)
+		}
+		fwCode, fwVars = p.SecureFirmwareCode, p.SecureFirmwareVars
+	}
+
 	varsPath := filepath.Join(dir, "efivars.fd")
-	if err := ensureEFIVars(varsPath, p.FirmwareVars); err != nil {
+	if err := ensureEFIVars(varsPath, fwVars); err != nil {
 		return 0, err
 	}
 
@@ -1122,12 +1134,26 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		}
 	}
 
+	machine := p.Machine + ",accel=" + p.Accel
+	if secureBoot {
+		// smm=on is not optional for secure firmware: OVMF_CODE.secboot hangs
+		// without it. The pflash global is what makes the variable store
+		// writable ONLY from System Management Mode, which is what stops a
+		// compromised guest from rewriting db and defeating the whole point.
+		machine += ",smm=on"
+	}
+
 	args := []string{
-		"-machine", p.Machine + ",accel=" + p.Accel, "-cpu", p.CPU,
+		"-machine", machine, "-cpu", p.CPU,
 		"-smp", strconv.Itoa(cpu),
 		"-m", strconv.Itoa(mem),
-		"-drive", "if=pflash,format=raw,readonly=on,file=" + p.FirmwareCode,
-		"-drive", "if=pflash,format=raw,file=" + varsPath,
+	}
+	if secureBoot {
+		args = append(args, "-global", "driver=cfi.pflash01,property=secure,value=on")
+	}
+	args = append(args,
+		"-drive", "if=pflash,format=raw,readonly=on,file="+fwCode,
+		"-drive", "if=pflash,format=raw,file="+varsPath,
 		// BOOT ORDER IS THE WHOLE INSTALL LIFECYCLE, and it has to be explicit.
 		//
 		// Talos ships a bootable ISO: you boot it, it installs to disk, and from
@@ -1197,7 +1223,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		"-serial", "file:" + filepath.Join(dir, "serial.log"),
 		"-pidfile", filepath.Join(dir, "qemu.pid"),
 		"-daemonize",
-	}
+	)
 
 	// APPENDED, not spliced into the literal above, so the no-dataDisk argv is
 	// unchanged down to the position of every element.
@@ -1711,6 +1737,32 @@ func extraDiskSerial(i int) string {
 // a guest without SecureBoot still seals and unseals.
 func specTPM(spec map[string]interface{}) bool {
 	b, _ := spec["tpm"].(bool)
+
+	return b
+}
+
+// specSecureBoot resolves spec.secureBoot: boot secure-boot UEFI firmware with
+// a BLANK variable store, so the guest starts in setup mode.
+//
+// Off by default, and it changes the argv of every machine that sets it: secure
+// firmware, -machine smm=on, and an SMM-guarded pflash. A machine that does not
+// ask for it must emit the argv it emitted before this field existed.
+//
+// It exists because a signed UKI is not the same thing as SecureBoot being
+// ENFORCED, and only the latter reproduces what real hardware does. Two failures
+// are invisible without it. First, Talos skips kexec only when
+// efi.GetSecureBoot() is true, so with SecureBoot off it kexecs, bypasses
+// systemd-stub, and /.extra/tpm2-pcr-public-key.pem never appears -- TPM unseal
+// then fails on every reboot after the first. Second, the default TPM binding is
+// PCR 7, which measures SecureBoot state: a key sealed while SecureBoot is off
+// is permanently unsealable once it is turned on.
+//
+// Setup mode (a blank vars store) is deliberate: it is what lets sd-boot's
+// `secure-boot-enroll` install the PK/KEK/db shipped on the ISO. Enrolment
+// happens before Talos loads, so by the time any key is sealed, PCR 7 has
+// already reached its final value.
+func specSecureBoot(spec map[string]interface{}) bool {
+	b, _ := spec["secureBoot"].(bool)
 
 	return b
 }

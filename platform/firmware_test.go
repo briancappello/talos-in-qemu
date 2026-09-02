@@ -37,7 +37,7 @@ func TestMachineMatches(t *testing.T) {
 // and fixtures naming paths like /fw/OVMF_CODE.4m.fd are what make the
 // suitable() rejections readable.
 func firstSuitable(dirs []string, fwArch, machine string) (string, string, bool) {
-	if c := scanRegistry(dirs, fwArch, machine); len(c) > 0 {
+	if c := scanRegistry(dirs, fwArch, machine, false); len(c) > 0 {
 		return c[0][0], c[0][1], true
 	}
 	return "", "", false
@@ -402,7 +402,7 @@ func TestResolveFirmwarePrefersRegistry(t *testing.T) {
 	writeDesc(t, reg, "60-edk2.json", descWithPaths(regCode, regVars))
 	table := map[string][][2]string{"x86_64": {{tblCode, tblVars}}}
 
-	code, vars, err := resolveFirmware([]string{reg}, table, "linux", "x86_64", "q35")
+	code, vars, err := resolveFirmware([]string{reg}, table, "linux", "x86_64", "q35", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestResolveFirmwareFallsBackWhenRegistryEmpty(t *testing.T) {
 	vars := touch(t, dir, "edk2-aarch64-vars.fd")
 	table := map[string][][2]string{"aarch64": {{code, vars}}}
 
-	gotCode, gotVars, err := resolveFirmware([]string{t.TempDir()}, table, "darwin", "aarch64", "virt")
+	gotCode, gotVars, err := resolveFirmware([]string{t.TempDir()}, table, "darwin", "aarch64", "virt", false)
 	if err != nil {
 		t.Fatalf("fallback should succeed: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestResolveFirmwareFallsThroughWhenDescriptorPathsAreDead(t *testing.T) {
 	writeDesc(t, reg, "60-edk2.json", descWithPaths("/gone/DEAD_CODE.fd", "/gone/DEAD_VARS.fd"))
 	table := map[string][][2]string{"x86_64": {{code, vars}}}
 
-	gotCode, gotVars, err := resolveFirmware([]string{reg}, table, "linux", "x86_64", "q35")
+	gotCode, gotVars, err := resolveFirmware([]string{reg}, table, "linux", "x86_64", "q35", false)
 	if err != nil {
 		t.Fatalf("a dead descriptor must fall through to the table, not fail: %v", err)
 	}
@@ -464,7 +464,7 @@ func TestResolveFirmwareTriesTheNextDescriptorWhenTheFirstIsDead(t *testing.T) {
 	writeDesc(t, reg, "60-edk2-live.json", descWithPaths(liveCode, liveVars))
 	table := map[string][][2]string{"x86_64": {{tblCode, tblVars}}}
 
-	code, vars, err := resolveFirmware([]string{reg}, table, "linux", "x86_64", "q35")
+	code, vars, err := resolveFirmware([]string{reg}, table, "linux", "x86_64", "q35", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -483,7 +483,7 @@ func TestResolveFirmwareErrorListsPathsTried(t *testing.T) {
 	reg := t.TempDir()
 	writeDesc(t, reg, "60-edk2.json", descWithPaths("/gone/DEAD_CODE.fd", "/gone/DEAD_VARS.fd"))
 
-	_, _, err := resolveFirmware([]string{reg}, table, "linux", "x86_64", "q35")
+	_, _, err := resolveFirmware([]string{reg}, table, "linux", "x86_64", "q35", false)
 	if err == nil {
 		t.Fatal("expected an error when nothing resolves")
 	}
@@ -511,7 +511,7 @@ func TestResolveFirmwareErrorListsPathsTried(t *testing.T) {
 func TestResolveFirmwareErrorHasNoDanglingPathSection(t *testing.T) {
 	table := map[string][][2]string{"x86_64": {{"/nope/CODE.fd", "/nope/VARS.fd"}}}
 
-	_, _, err := resolveFirmware([]string{t.TempDir()}, table, "linux", "riscv64", "virt")
+	_, _, err := resolveFirmware([]string{t.TempDir()}, table, "linux", "riscv64", "virt", false)
 	if err == nil {
 		t.Fatal("expected an error for an architecture with no firmware")
 	}
@@ -542,7 +542,7 @@ func TestResolveFirmwareRejectsDirectories(t *testing.T) {
 	vars := touch(t, dir, "VARS.fd")
 	table := map[string][][2]string{"x86_64": {{code, vars}}}
 
-	if c, v, err := resolveFirmware([]string{t.TempDir()}, table, "linux", "x86_64", "q35"); err == nil {
+	if c, v, err := resolveFirmware([]string{t.TempDir()}, table, "linux", "x86_64", "q35", false); err == nil {
 		t.Errorf("a directory is not firmware; got %q/%q", c, v)
 	}
 }

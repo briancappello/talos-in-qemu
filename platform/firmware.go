@@ -67,7 +67,7 @@ func machineMatches(pattern, machine string) bool {
 	return false
 }
 
-func (d *descriptor) suitable(fwArch, machine string) bool {
+func (d *descriptor) suitable(fwArch, machine string, secureBoot bool) bool {
 	if d.Mapping.Device != "flash" || d.Mapping.Executable.Filename == "" ||
 		d.Mapping.NVRAMTemplate.Filename == "" {
 		return false
@@ -75,16 +75,31 @@ func (d *descriptor) suitable(fwArch, machine string) bool {
 	if !slices.Contains(d.InterfaceTypes, "uefi") {
 		return false
 	}
-	// Secure-boot firmware needs -machine q35,smm=on plus more. On Arch the
-	// secure descriptor sorts FIRST, so without this filter a take-the-first
-	// matcher reliably selects firmware that cannot boot as invoked.
+	// Secure-boot firmware needs -machine q35,smm=on plus a pflash marked
+	// secure. On Arch the secure descriptor sorts FIRST, so a take-the-first
+	// matcher would otherwise select firmware that cannot boot as invoked.
 	//
-	// COUPLED to how this project invokes QEMU: we pass `-machine q35` with no
-	// smm=on. If that invocation ever gains smm=on (and the matching pflash
-	// wiring), this rejection becomes wrong and must change with it.
+	// COUPLED to how this project invokes QEMU: buildQEMUArgs adds smm=on and
+	// `-global driver=cfi.pflash01,property=secure,value=on` if and only if the
+	// machine asked for secureBoot. The two must stay in step -- secure
+	// firmware without smm hangs, and smm without secure firmware is pointless.
+	if secureBoot {
+		// Demand it explicitly. A non-secure OVMF silently boots with
+		// SecureBoot permanently unavailable, which is the failure this whole
+		// mode exists to avoid, and it would surface much later as a TPM
+		// enrollment that seals against the wrong PCR 7.
+		return slices.Contains(d.Features, "secure-boot") && d.matchesTarget(fwArch, machine)
+	}
 	if slices.Contains(d.Features, "requires-smm") || slices.Contains(d.Features, "secure-boot") {
 		return false
 	}
+	return d.matchesTarget(fwArch, machine)
+}
+
+// matchesTarget reports whether the descriptor advertises this architecture and
+// machine type. Split out of suitable so the secure-boot arm can reuse it
+// without duplicating the alias handling in machineMatches.
+func (d *descriptor) matchesTarget(fwArch, machine string) bool {
 	for _, t := range d.Targets {
 		if t.Architecture != fwArch {
 			continue
@@ -112,7 +127,7 @@ func (d *descriptor) suitable(fwArch, machine string) bool {
 //
 // Within the combined set, files sort by BASENAME (lower numeric prefix wins),
 // and a file in an earlier directory masks the same basename in a later one.
-func scanRegistry(dirs []string, fwArch, machine string) [][2]string {
+func scanRegistry(dirs []string, fwArch, machine string, secureBoot bool) [][2]string {
 	seen := map[string]string{} // basename -> full path of the winning file
 	var names []string
 	for _, dir := range dirs {
@@ -143,7 +158,7 @@ func scanRegistry(dirs []string, fwArch, machine string) [][2]string {
 		if err := json.Unmarshal(b, &d); err != nil {
 			continue // a malformed descriptor must not break discovery
 		}
-		if d.suitable(fwArch, machine) {
+		if d.suitable(fwArch, machine, secureBoot) {
 			out = append(out, [2]string{d.Mapping.Executable.Filename, d.Mapping.NVRAMTemplate.Filename})
 		}
 	}
@@ -196,6 +211,27 @@ var fallbackTable = map[string][][2]string{
 	},
 }
 
+// secureFallbackTable is the secure-boot counterpart of fallbackTable, used
+// only when the descriptor registry yields nothing.
+//
+// THE VARS TEMPLATE MUST BE THE BLANK ONE, and that is the entire subtlety of
+// this table. Several distros also ship a *_VARS.secboot.fd preloaded with
+// Microsoft's PK/KEK/db. Booting from that starts the guest with SecureBoot
+// already OWNED by someone else: the firmware is not in setup mode, sd-boot's
+// `secure-boot-enroll` silently does nothing, and our UKI -- signed by our key,
+// which is not in that db -- fails to validate. A blank vars store IS setup
+// mode, which is what makes auto-enrolment work.
+//
+// Only x86_64 is listed: aarch64 QEMU has no secure-boot OVMF to pair with.
+var secureFallbackTable = map[string][][2]string{
+	"x86_64": {
+		{"/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"},
+		{"/usr/share/OVMF/OVMF_CODE_4M.secboot.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"},
+		{"/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"},
+		{"/usr/share/OVMF/OVMF_CODE.secboot.fd", "/usr/share/OVMF/OVMF_VARS.fd"},
+	},
+}
+
 // resolveFirmware finds a usable {code, nvram-template} pair: the descriptor
 // registry first, then the static table. The table takes the fallback as a
 // parameter rather than reading the package var so tests supply their own
@@ -205,9 +241,9 @@ var fallbackTable = map[string][][2]string{
 // descriptor outlives the package that installed the files it names. Both
 // sources are lists of candidate pairs filtered the same way, so a rotted
 // descriptor costs us the next descriptor rather than the whole registry.
-func resolveFirmware(dirs []string, table map[string][][2]string, goos, fwArch, machine string) (string, string, error) {
+func resolveFirmware(dirs []string, table map[string][][2]string, goos, fwArch, machine string, secureBoot bool) (string, string, error) {
 	var tried []string
-	for _, pair := range scanRegistry(dirs, fwArch, machine) {
+	for _, pair := range scanRegistry(dirs, fwArch, machine, secureBoot) {
 		if fileExists(pair[0]) && fileExists(pair[1]) {
 			return pair[0], pair[1], nil
 		}

@@ -31,6 +31,14 @@ type Platform struct {
 	CPU          string // host — only legal with a hardware accelerator
 	FirmwareCode string // read-only pflash
 	FirmwareVars string // nvram TEMPLATE, copied verbatim — never padded
+	// SecureFirmwareCode/Vars are the secure-boot pair, resolved BEST-EFFORT:
+	// a host with no secure OVMF installed is a perfectly good host for every
+	// machine that does not ask for SecureBoot, so a miss here must not fail
+	// Detect. SecureFirmwareErr carries the reason, and is surfaced only when a
+	// machine actually requests secureBoot.
+	SecureFirmwareCode string
+	SecureFirmwareVars string
+	SecureFirmwareErr  error
 	ConsoleArg   string // console=ttyS0 | console=ttyAMA0 (guest hint)
 	ImageArch    string // amd64 | arm64 (guest hint, used by the image guard)
 	// TPMDevice is the qemu device model for an emulated TPM 2.0, and it is
@@ -96,10 +104,14 @@ func Detect() (*Platform, error) {
 		return nil, accelUnavailable(runtime.GOOS, runtime.GOARCH, accel, compiled, diag, diagErr)
 	}
 
-	code, vars, err := resolveFirmware(registryDirs, fallbackTable, runtime.GOOS, ai.fwArch, ai.machine)
+	code, vars, err := resolveFirmware(registryDirs, fallbackTable, runtime.GOOS, ai.fwArch, ai.machine, false)
 	if err != nil {
 		return nil, err
 	}
+
+	// Best-effort: see the SecureFirmware* field comments. Deliberately not
+	// fatal.
+	secCode, secVars, secErr := resolveFirmware(registryDirs, secureFallbackTable, runtime.GOOS, ai.fwArch, ai.machine, true)
 
 	return &Platform{
 		OS:           runtime.GOOS,
@@ -109,6 +121,10 @@ func Detect() (*Platform, error) {
 		CPU:          "host", // only legal with a hardware accelerator, verified above
 		FirmwareCode: code,
 		FirmwareVars: vars,
+
+		SecureFirmwareCode: secCode,
+		SecureFirmwareVars: secVars,
+		SecureFirmwareErr:  secErr,
 		ConsoleArg:   ai.console,
 		ImageArch:    ai.imageArch,
 		TPMDevice:    ai.tpmDevice,
