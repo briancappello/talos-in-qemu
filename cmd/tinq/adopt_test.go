@@ -387,7 +387,7 @@ func TestAdoptRefusesAnInstallTargetNamedTwice(t *testing.T) {
 `)
 
 	// Asserted on the two VALUES the config supplied, not on the refusal's
-	// wording. This test was red at HEAD because it grepped for "named twice"
+	// wording. This test was red at HEAD because it grepped for "named more than once"
 	// while the message says "named more than once" -- the refusal was correct
 	// and the check was coupled to prose. The values are what make the message
 	// actionable, and a generic refusal cannot contain them by coincidence.

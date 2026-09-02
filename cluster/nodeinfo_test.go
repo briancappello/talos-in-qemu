@@ -237,8 +237,8 @@ func TestRequireDiskRefusesADiskNamedTwice(t *testing.T) {
 		t.Fatal("RequireDisk accepted a ref naming a disk by serial AND wwid")
 	}
 
-	if !strings.Contains(err.Error(), "named twice") {
-		t.Errorf("the refusal does not say the disk is named twice:\n%s", err)
+	if !strings.Contains(err.Error(), "named more than once") {
+		t.Errorf("the refusal does not say the disk is named more than once:\n%s", err)
 	}
 }
 

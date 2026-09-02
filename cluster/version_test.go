@@ -25,19 +25,21 @@ func TestCheckVersion(t *testing.T) {
 		// with the leading zero. Machinery parses it; the guard must too.
 		{"older minor with a leading zero", "v1.09.5", true, false},
 		// The contract is major.minor only, so a newer PATCH is not newer.
-		// Talos does not change config contracts in a patch release.
-		{"newer patch, same minor", "v1.13.99", true, false},
+		// Talos does not change config contracts in a patch release. The patch
+		// must share the GENERATOR's minor (machinery is v1.14.x here) to
+		// exercise "same minor"; a v1.13.x image would be an older minor.
+		{"newer patch, same minor", "v1.14.99", true, false},
 		// Major outranks minor: a hand-rolled `img.Major > gen.Major ||
 		// img.Minor > gen.Minor` passes every other row here and then refuses
 		// this one, which is a genuinely OLDER Talos.
 		{"older major with a higher minor", "v0.14.0", true, false},
-		{"newer minor", "v1.14.0", true, true},
+		{"newer minor", "v1.15.0", true, true},
 		{"absurdly newer minor", "v1.99.0", true, true},
 		{"newer major", "v2.0.0", true, true},
 		// A pre-release volume id reads as "" in practice, but if a version
 		// ever arrives by another route it must still be refused, not rounded
 		// down to its own minor.
-		{"pre-release of a newer minor", "v1.14.0-alpha.0", true, true},
+		{"pre-release of a newer minor", "v1.15.0-alpha.0", true, true},
 
 		// Unknown: guard disabled, never blocks.
 		{"empty means detection failed", "", false, false},
