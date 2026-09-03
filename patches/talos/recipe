@@ -20,3 +20,11 @@ pr:14145
 # so shutdown does not stall on "mapped device is still in use". Not upstream
 # in any form yet -- open a PR and replace this with a pr: line.
 patch:0001-lvm-deactivation-controller.patch
+
+# vgextend is given every desired device rather than only the ones missing from
+# the group, because the spec names PVs by kernel device (/dev/dm-0) while the
+# PV status reports the mapper alias (/dev/mapper/luks2-r-lvm0). LVM refuses the
+# whole command when any device in it is already a member, and the refusal is
+# swallowed as ErrExists -- so a volume group stops one PV short and spins
+# forever. Order-dependent, so it presents as intermittent. Not upstream.
+patch:patches/talos/0002-lvm-vgextend-only-missing-devices.patch

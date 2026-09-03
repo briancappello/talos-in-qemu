@@ -1,0 +1,201 @@
+From 98ed4deb9af5f5dc560390f51cc9c77a1c618306 Mon Sep 17 00:00:00 2001
+From: tinq <tinq@local>
+Date: Thu, 3 Sep 2026 05:52:56 -0600
+Subject: [PATCH] fix: extend a volume group with only the devices missing from
+ it
+
+A volume group whose members are encrypted is described two different ways.
+The spec names them by kernel device (/dev/dm-0) while LVMPhysicalVolumeStatus
+reports whatever LVM printed, which for an encrypted volume is the mapper alias
+(/dev/mapper/luks2-r-lvm0). They are the same device and never compare equal as
+strings, so observedPVByDevice never matches and every member looks absent.
+
+That is not a harmless false positive. devicesMissingFromVG feeds vgextend, and
+LVM refuses the whole command when any device it is given already belongs to the
+group -- so the one PV genuinely missing is never added, and the refusal comes
+back as ErrExists and is swallowed. The group sits one PV short forever, both
+the volume-group and logical-volume reconcilers spinning every ~600ms, with no
+error logged anywhere.
+
+Whether it bites depends on ORDER, which is why it looks intermittent. If every
+member is a PV before the group exists, vgcreate takes them all at once and the
+extend path is never reached. If one member's mapper opens first, the group is
+created with that member alone and the extend path is the only way to add the
+rest -- and it cannot.
+
+Observed on a two-disk RAID0 pool where dm-0 joined and dm-1 never did,
+surviving a reboot and a full wipe-and-reinstall. The same machine and config
+assembled correctly on an earlier build, purely because the mappers happened to
+open in the other order.
+
+Devices are canonicalised before comparison, through an injectable resolver so
+the aliasing can be tested without real device nodes.
+---
+ .../storage/lvm_volume_group_reconcile.go     | 45 ++++++++++++++++--
+ .../lvm_volume_group_reconcile_test.go        | 47 +++++++++++++++++++
+ 2 files changed, 88 insertions(+), 4 deletions(-)
+
+diff --git a/internal/app/machined/pkg/controllers/storage/lvm_volume_group_reconcile.go b/internal/app/machined/pkg/controllers/storage/lvm_volume_group_reconcile.go
+index 261370f..fde57e4 100644
+--- a/internal/app/machined/pkg/controllers/storage/lvm_volume_group_reconcile.go
++++ b/internal/app/machined/pkg/controllers/storage/lvm_volume_group_reconcile.go
+@@ -9,6 +9,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"os/exec"
++	"path/filepath"
+ 
+ 	"github.com/cosi-project/runtime/pkg/controller"
+ 	"github.com/cosi-project/runtime/pkg/safe"
+@@ -33,6 +34,30 @@ type LVMProvisioner interface {
+ type LVMVolumeGroupReconcileController struct {
+ 	V1Alpha1Mode machineruntime.Mode
+ 	LVM          LVMProvisioner
++	// ResolveDevice canonicalises a device path so two names for one device
++	// compare equal. nil means filepath.EvalSymlinks.
++	//
++	// REQUIRED FOR CORRECTNESS, not tidiness. A volume group spec names its
++	// members by kernel name (/dev/dm-0) while LVMPhysicalVolumeStatus reports
++	// whatever LVM printed, which for an encrypted volume is the mapper alias
++	// (/dev/mapper/luks2-r-lvm0). Comparing the two as strings never matches,
++	// so every PV looks absent from the VG -- see devicesMissingFromVG.
++	ResolveDevice func(string) string
++}
++
++// resolveDevice canonicalises a device path, falling back to the input when it
++// cannot be resolved (a device that has gone away, or a test's fake path).
++func (ctrl *LVMVolumeGroupReconcileController) resolveDevice(device string) string {
++	if ctrl.ResolveDevice != nil {
++		return ctrl.ResolveDevice(device)
++	}
++
++	resolved, err := filepath.EvalSymlinks(device)
++	if err != nil {
++		return device
++	}
++
++	return resolved
+ }
+ 
+ // Name implements controller.Controller interface.
+@@ -108,8 +133,11 @@ func (ctrl *LVMVolumeGroupReconcileController) Run(ctx context.Context, r contro
+ 		// Index observed PVs/VGs once per tick.
+ 		observedPVByDevice := map[string]*storage.LVMPhysicalVolumeStatus{}
+ 
++		// KEYED BY THE CANONICAL PATH, because the two sides disagree on how to
++		// spell the same device: the spec says /dev/dm-0 and the status says
++		// /dev/mapper/luks2-r-lvm0.
+ 		for pv := range pvStatuses.All() {
+-			observedPVByDevice[pv.TypedSpec().Device] = pv
++			observedPVByDevice[ctrl.resolveDevice(pv.TypedSpec().Device)] = pv
+ 		}
+ 
+ 		observedVGByName := map[string]*storage.LVMVolumeGroupStatus{}
+@@ -148,7 +176,7 @@ func (ctrl *LVMVolumeGroupReconcileController) reconcileVG(
+ 	}
+ 
+ 	for _, device := range spec.PhysicalVolumes {
+-		if _, ok := observedPVByDevice[device]; ok {
++		if _, ok := observedPVByDevice[ctrl.resolveDevice(device)]; ok {
+ 			continue
+ 		}
+ 
+@@ -186,7 +214,7 @@ func (ctrl *LVMVolumeGroupReconcileController) reconcileVG(
+ 		return nil
+ 	}
+ 
+-	missing := devicesMissingFromVG(spec.PhysicalVolumes, observedPVByDevice, observedVG.TypedSpec().Name)
++	missing := devicesMissingFromVG(spec.PhysicalVolumes, observedPVByDevice, observedVG.TypedSpec().Name, ctrl.resolveDevice)
+ 	if len(missing) == 0 {
+ 		return nil
+ 	}
+@@ -205,15 +233,24 @@ func (ctrl *LVMVolumeGroupReconcileController) reconcileVG(
+ }
+ 
+ // devicesMissingFromVG returns desired devices not yet in target VG.
++// devicesMissingFromVG returns the desired devices that are not yet members of
++// vgName.
++//
++// GETTING THIS WRONG IS NOT A NO-OP. Every device it returns is passed to
++// vgextend, and LVM refuses the WHOLE command if any one of them is already a
++// member -- so a single false positive stops the genuinely missing device from
++// ever being added, and the refusal is swallowed as ErrExists. That is a volume
++// group permanently stuck one PV short, hot-looping, with nothing logged.
+ func devicesMissingFromVG(
+ 	desired []string,
+ 	observedPVByDevice map[string]*storage.LVMPhysicalVolumeStatus,
+ 	vgName string,
++	resolve func(string) string,
+ ) []string {
+ 	var missing []string
+ 
+ 	for _, device := range desired {
+-		pv, ok := observedPVByDevice[device]
++		pv, ok := observedPVByDevice[resolve(device)]
+ 		if !ok {
+ 			missing = append(missing, device)
+ 
+diff --git a/internal/app/machined/pkg/controllers/storage/lvm_volume_group_reconcile_test.go b/internal/app/machined/pkg/controllers/storage/lvm_volume_group_reconcile_test.go
+index ba03424..f8aa5c7 100644
+--- a/internal/app/machined/pkg/controllers/storage/lvm_volume_group_reconcile_test.go
++++ b/internal/app/machined/pkg/controllers/storage/lvm_volume_group_reconcile_test.go
+@@ -246,9 +246,56 @@ func TestLVMVolumeGroupReconcileSuite(t *testing.T) {
+ 		AfterSetup: func(suite *ctest.DefaultSuite) {
+ 			suite.Require().NoError(suite.Runtime().RegisterController(&storagectrl.LVMVolumeGroupReconcileController{
+ 				LVM: provisioner,
++				// Stands in for filepath.EvalSymlinks, which cannot resolve a
++				// path that does not exist on the test host. It maps the mapper
++				// aliases these tests use onto the kernel names a spec carries,
++				// exactly as /dev is laid out on a machine with encrypted
++				// volumes, and leaves anything else untouched.
++				ResolveDevice: func(device string) string {
++					switch device {
++					case "/dev/mapper/luks2-r-lvm0":
++						return "/dev/dm-0"
++					case "/dev/mapper/luks2-r-lvm1":
++						return "/dev/dm-1"
++					default:
++						return device
++					}
++				},
+ 			}))
+ 		},
+ 	}
+ 
+ 	suite.Run(t, s)
+ }
++
++// A VG whose members are ENCRYPTED is described two different ways: the spec
++// names them by kernel device (/dev/dm-N) and LVMPhysicalVolumeStatus reports
++// the mapper alias (/dev/mapper/luks2-<label>). They are the same device.
++//
++// Comparing them as strings never matches, so every member looks absent from
++// the group -- and because vgextend is refused outright when ANY device it is
++// given is already a member, the one genuinely missing PV can never be added.
++// LVM's refusal comes back as ErrExists and is swallowed, so the group sits one
++// PV short forever, both reconcilers spinning, nothing logged.
++//
++// Observed on real hardware: a two-disk RAID0 pool where dm-0 joined and dm-1
++// never did, surviving reboots and a full wipe-and-reinstall.
++func (suite *LVMVolumeGroupReconcileSuite) TestExtendsOnlyTheMemberMissingWhenDevicesAreAliased() {
++	// dm-0 is already in the group; dm-1 is not. Both are reported by their
++	// mapper alias, which is what LVM prints for an encrypted volume.
++	suite.createPVStatus("dm-0", "/dev/mapper/luks2-r-lvm0", testVGName)
++	suite.createPVStatus("dm-1", "/dev/mapper/luks2-r-lvm1", "")
++	suite.createVGStatus(testVGName)
++	suite.createVGSpec("/dev/dm-0", "/dev/dm-1")
++
++	suite.eventually(func() bool {
++		return len(suite.provisioner.vgExtended(testVGName)) > 0
++	})
++
++	extended := suite.provisioner.vgExtended(testVGName)
++
++	suite.Assert().Equal([]string{"/dev/dm-1"}, extended,
++		"vgextend must be given ONLY the device that is not yet a member: LVM refuses the "+
++			"whole command if any device in it already belongs to the group, so including "+
++			"/dev/dm-0 leaves /dev/dm-1 permanently unadded")
++}
+-- 
+2.55.0
+
