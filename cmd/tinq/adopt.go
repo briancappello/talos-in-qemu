@@ -566,7 +566,12 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		// runs is a property of the cluster it belongs to, not of the substrate
 		// it runs on, and a VM built by `up` needs to pin it for exactly the
 		// same reason.
-		KubernetesVersion: str(spec["kubernetesVersion"], ""),
+		//
+		// READ FROM m, NOT FROM spec. `spec` in this function is the BAREMETAL
+		// block, so str(spec[...]) here would look for
+		// spec.baremetal.kubernetesVersion, find nothing, and silently derive a
+		// version -- the manifest would look pinned and the node would not be.
+		KubernetesVersion: driverkit.Str(m, "spec", "kubernetesVersion"),
 		VersionSource:     source,
 		Substrate:         fmt.Sprintf("baremetal, %s", str(spec["maintenanceEndpoint"], "")),
 		// nil unless spec.baremetal.joins named a cluster. See joinOptions.
