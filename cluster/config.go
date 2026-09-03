@@ -496,7 +496,7 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 	if docs, err := volumeDocuments(in); err != nil {
 		return nil, err
 	} else if len(docs) > 0 {
-		cfg, err = container.New(append(cfg.Documents(), docs...)...)
+		cfg, err = container.New(append(withoutDocuments(cfg.Documents(), docs), docs...)...)
 		if err != nil {
 			return nil, fmt.Errorf("adding the volume documents: %w", err)
 		}
@@ -851,4 +851,57 @@ func userVolume(expr string) (*block.UserVolumeConfigV1Alpha1, error) {
 	volume.FilesystemSpec = block.FilesystemSpec{FilesystemType: blockres.FilesystemTypeXFS}
 
 	return volume, nil
+}
+
+// withoutDocuments drops from `existing` every document that `incoming` is
+// about to replace, matched on the (kind, name) pair a config container treats
+// as a document's identity.
+//
+// WHY THIS IS NEEDED AT ALL: what machinery generates is a function of the
+// VERSION CONTRACT, and the contract comes from the node. Under a v1.12
+// contract no EPHEMERAL VolumeConfig is emitted, so appending one was simply
+// adding a document. Under v1.14 machinery emits its own, and the same append
+// produces `duplicate document: VolumeConfig/EPHEMERAL` -- container.New
+// refuses the pair rather than letting the later one win. The bug therefore
+// appears when a NODE is upgraded, with no change to tinq or to the manifest,
+// and it takes out every machine that sets ephemeralMaxSize.
+//
+// REPLACING rather than merging is the honest reading of the caller's intent:
+// these documents exist because the operator asked for a specific EPHEMERAL cap
+// or user volume, and a merge would leave whichever fields they did not mention
+// set to machinery's defaults for a volume they are deliberately resizing.
+func withoutDocuments(existing, incoming []coreconfig.Document) []coreconfig.Document {
+	type identity struct{ kind, name string }
+
+	replaced := make(map[identity]struct{}, len(incoming))
+
+	for _, doc := range incoming {
+		replaced[documentIdentity(doc)] = struct{}{}
+	}
+
+	kept := make([]coreconfig.Document, 0, len(existing))
+
+	for _, doc := range existing {
+		if _, ok := replaced[documentIdentity(doc)]; ok {
+			continue
+		}
+
+		kept = append(kept, doc)
+	}
+
+	return kept
+}
+
+// documentIdentity is (kind, name), with an empty name for the document types
+// that are singletons. Both halves are required: VolumeConfig/EPHEMERAL and
+// VolumeConfig/STATE are different documents, and matching on kind alone would
+// drop a volume the caller never mentioned.
+func documentIdentity(doc coreconfig.Document) (id struct{ kind, name string }) {
+	id.kind = doc.Kind()
+
+	if named, ok := doc.(coreconfig.NamedDocument); ok {
+		id.name = named.Name()
+	}
+
+	return id
 }

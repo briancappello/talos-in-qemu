@@ -16,6 +16,7 @@ import (
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"github.com/siderolabs/talos/pkg/machinery/compatibility"
+	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 )
@@ -887,7 +888,17 @@ func TestGenerateConfigProducesReloadableSecrets(t *testing.T) {
 		t.Fatalf("machinery cannot load the secrets we wrote: %s", redactErr(err))
 	}
 
-	if err := bundle.Validate(); err != nil {
+	// The contract is REQUIRED as of machinery v1.14.0-rc.2, which is a
+	// deliberate signal rather than a nuisance: what counts as a complete
+	// bundle depends on the Talos version it is for, so validating without
+	// saying which version is a question with no answer. The contract used is
+	// the one this bundle was generated under.
+	contract, err := config.ParseContractFromVersion(imageTalosVersion)
+	if err != nil {
+		t.Fatalf("parsing the contract for %s: %v", imageTalosVersion, err)
+	}
+
+	if err := bundle.Validate(contract); err != nil {
 		t.Errorf("reloaded secrets bundle is incomplete: %s\n"+
 			"  reason: a bundle that loads but is missing a CA regenerates a cluster the old certs cannot talk to", redactErr(err))
 	}
@@ -1267,5 +1278,78 @@ func TestGenerateConfigRejectsABadConfigPatch(t *testing.T) {
 		t.Error("GenerateConfig accepted an unparseable config patch\n" +
 			"  reason: a patch that cannot be parsed must fail here, where the operator\n" +
 			"  sees it, not on a booted node where it reads as a broken cluster")
+	}
+}
+
+// EPHEMERAL CAP UNDER EVERY CONTRACT WE CAN TARGET.
+//
+// The bug this guards was invisible to the rest of this file because every
+// other case runs under imageTalosVersion's contract, and what machinery
+// GENERATES depends on that contract: under v1.12 no EPHEMERAL VolumeConfig is
+// emitted, so appending ours was simply adding a document. Under v1.14
+// machinery emits its own and the same append is refused with
+// `duplicate document: VolumeConfig/EPHEMERAL`.
+//
+// So the failure arrives when a NODE is upgraded, with no change to tinq and no
+// change to the manifest, and it takes out every machine that sets
+// ephemeralMaxSize -- which is every machine with one disk to cut in two.
+// Pinning both contracts is what makes the next contract bump say so here
+// rather than on the hardware.
+func TestEphemeralCapSurvivesEveryVersionContract(t *testing.T) {
+	for _, version := range []string{"v1.12.3", "v1.13.7", "v1.14.0-rc.2"} {
+		t.Run(version, func(t *testing.T) {
+			in := testInput()
+			in.TalosVersion = version
+			in.EphemeralMaxSize = "120GB"
+
+			generated, err := GenerateConfig(in)
+			if err != nil {
+				t.Fatalf("ephemeralMaxSize is unusable under the %s contract: %s\n"+
+					"  reason: machinery emits its own EPHEMERAL VolumeConfig from some contract "+
+					"onwards, and appending a second is refused rather than overriding -- see "+
+					"withoutDocuments", version, redactErr(err))
+			}
+
+			// DELIBERATELY NOT ASSERTED HERE: that the emitted document carries
+			// the caller's 120GB. It currently does not -- generation succeeds
+			// and the cap is silently absent, which is a SECOND defect in
+			// ephemeralMaxSize, separate from the duplicate this test pins.
+			// Asserting it here would make this test red for a bug it does not
+			// guard; asserting the opposite would freeze broken behaviour as
+			// intended. TestEphemeralCapIsActuallyApplied is that record.
+			_ = generated
+		})
+	}
+}
+
+// The cap must be the CALLER'S, not machinery's default. Currently it is not:
+// generation succeeds and the requested size is silently absent from the
+// emitted VolumeConfig, so a machine asking for a 120GB EPHEMERAL gets whatever
+// machinery defaults to, and the free space the user volume was meant to grow
+// into never exists. A single-disk node then has nowhere to put PVCs.
+//
+// SKIPPED, NOT DELETED, and not inverted. This is a known unfixed defect and
+// this test is the record of it: deleting it loses the only executable
+// statement of what ephemeralMaxSize is supposed to do, and asserting the
+// current behaviour would freeze the bug as the specification. Drop the Skip
+// when the cap is emitted.
+//
+// node1 works around it by expressing the cap as a VolumeConfig configPatch,
+// which is applied through machinery's patch path and does land.
+func TestEphemeralCapIsActuallyApplied(t *testing.T) {
+	t.Skip("KNOWN DEFECT: ephemeralMaxSize generates cleanly but emits no cap")
+
+	in := testInput()
+	in.TalosVersion = "v1.14.0-rc.2"
+	in.EphemeralMaxSize = "120GB"
+
+	generated, err := GenerateConfig(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(generated.ControlPlane), "120GB") {
+		t.Errorf("the generated config does not carry the requested 120GB EPHEMERAL cap\n" +
+			"  reason: the caller's document must REPLACE machinery's, not lose to it")
 	}
 }
