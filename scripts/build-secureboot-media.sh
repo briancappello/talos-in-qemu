@@ -30,7 +30,11 @@ PATCH_DIR="$REPO_ROOT/patches/talos"
 
 TALOS_REPO="https://github.com/siderolabs/talos.git"
 
-OUT_DIR=""
+# Default so a build cannot invent a new directory each time it is run. Every
+# ISO this script has ever produced belongs in one place; leaving --out required
+# meant each invocation chose its own, and three near-identical ISOs ended up
+# scattered across $HOME under names only the shell history explained.
+OUT_DIR="$HOME/iso"
 KEYS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tinq/secureboot"
 TALOS_SRC=""
 REGISTRY="127.0.0.1:5000"
@@ -70,7 +74,7 @@ usage() {
 	cat <<EOF
 
 Options:
-  --out DIR             where the ISO is written (REQUIRED)
+  --out DIR             where the ISO is written        [$OUT_DIR]
   --keys DIR            SecureBoot signing keys   [$KEYS_DIR]
   --talos-src DIR       Talos checkout; cloned+patched if absent
                         [<repo>/.build/talos-src-<base>]
@@ -117,7 +121,7 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-[[ -n "$OUT_DIR" || "$DRY_RUN" -eq 1 ]] || { usage; die "--out is required"; }
+[[ -n "$OUT_DIR" || "$DRY_RUN" -eq 1 ]] || { usage; die "--out cannot be empty"; }
 
 # A release tag doubles as the version label; anything else (a branch, a SHA)
 # cannot, because the volume id must parse.
