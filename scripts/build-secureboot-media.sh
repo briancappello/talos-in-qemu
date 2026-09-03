@@ -36,6 +36,7 @@ TALOS_SRC=""
 REGISTRY="127.0.0.1:5000"
 NAMESPACE="talos"
 IMAGE_TAG="secureboot"
+EXTENSIONS=()
 
 # BASE is the upstream ref the build starts from: a tag, a branch, or a SHA.
 # Fetched by ref rather than `clone --branch`, which cannot take a SHA.
@@ -83,6 +84,13 @@ Options:
                         the recipe in patches/talos/recipe
   --talos-version VER   version pinned into the ISO volume id
                         [derived from --base when it is a release tag]
+  --system-extension REF
+                        OCI ref of a Talos system extension to bake into the
+                        INSTALLER (repeatable). Extensions live in the installer
+                        image, never in the boot media, so adding one does NOT
+                        invalidate an ISO already written to a USB.
+                        A kmod extension MUST match the target Talos version
+                        exactly -- it ships a module built against that kernel.
   --rebuild-imager      rebuild the imager from source (slow, ~8 min)
   --dry-run             materialise the patched checkout and stop
   -h, --help
@@ -102,6 +110,7 @@ while [[ $# -gt 0 ]]; do
 		--pr) SOURCES+=("pr:${2:?}"); shift 2 ;;
 		--patch) SOURCES+=("patch:${2:?}"); shift 2 ;;
 		--rebuild-imager) REBUILD_IMAGER=1; shift ;;
+		--system-extension) EXTENSIONS+=("${2:?}"); shift 2 ;;
 		--dry-run) DRY_RUN=1; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown argument: $1 (try --help)" ;;
@@ -379,6 +388,24 @@ secureboot_input() {
 EOF
 }
 
+# system_extensions emits the imager's systemExtensions block, or nothing.
+#
+# INSTALLER ONLY, deliberately. An extension is installed onto the disk, so it
+# belongs to the installer image; putting the same list in the ISO profile would
+# bake it into the boot media instead, changing the UKI and therefore its PCR 11
+# measurement -- which would invalidate the ISO already written to a USB and the
+# TPM policy sealed against it, to no purpose. The boot media only has to reach
+# maintenance mode.
+system_extensions() {
+	[[ ${#EXTENSIONS[@]} -eq 0 ]] && return 0
+
+	echo "  systemExtensions:"
+
+	for ref in "${EXTENSIONS[@]}"; do
+		echo "    - imageRef: $ref"
+	done
+}
+
 run_imager() {
 	podman run --rm -i --network=host --userns=keep-id \
 		-v "$KEYS_DIR:/secureboot:ro" \
@@ -397,6 +424,7 @@ secureboot: true
 version: $TALOS_VERSION
 input:
 $(secureboot_input)
+$(system_extensions)
 output:
   kind: installer
   outFormat: raw
