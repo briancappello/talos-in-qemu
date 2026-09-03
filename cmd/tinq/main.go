@@ -576,10 +576,11 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		DataDiskSerial: dataDiskSerial(spec),
 		InstallerImage: str(spec["installerImage"], ""),
 
-		TalosVersion:  platform.InspectImageVersion(image),
-		VersionSource: fmt.Sprintf("%s (ISO volume id)", filepath.Base(image)),
-		Substrate:     fmt.Sprintf("%s/%s, %s, %s", host.OS, host.ImageArch, host.Accel, host.QEMUBinary),
-		ConsoleArg:    host.ConsoleArg,
+		TalosVersion:      platform.InspectImageVersion(image),
+		KubernetesVersion: str(spec["kubernetesVersion"], ""),
+		VersionSource:     fmt.Sprintf("%s (ISO volume id)", filepath.Base(image)),
+		Substrate:         fmt.Sprintf("%s/%s, %s, %s", host.OS, host.ImageArch, host.Accel, host.QEMUBinary),
+		ConsoleArg:        host.ConsoleArg,
 		// KEXEC IS DISABLED ON macOS/arm64 ONLY. Talos kexecs straight into the
 		// kernel it just installed; under QEMU on macOS that path dies in the
 		// guest on arm64 and the node never boots what it installed. Elsewhere
@@ -1198,9 +1199,9 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		// that changed per boot would make the key unrecoverable, which is worse
 		// than not having one.
 		"-uuid", machineUUID(m.GetName()),
-		"-drive", "if=none,id=sys,format=qcow2,file=" + diskPath,
-		"-device", "virtio-blk-pci,drive=sys,serial=" + DiskSerialSystem + ",bootindex=0",
-		"-drive", "if=none,id=cd,media=cdrom,file=" + image,
+		"-drive", "if=none,id=sys,format=qcow2,file="+diskPath,
+		"-device", "virtio-blk-pci,drive=sys,serial="+DiskSerialSystem+",bootindex=0",
+		"-drive", "if=none,id=cd,media=cdrom,file="+image,
 		"-device", fmt.Sprintf("virtio-blk-pci,drive=cd,bootindex=%d", isoBootIndex),
 		"-netdev", netdev,
 		"-device", "virtio-net-pci,netdev=n0",
@@ -1220,7 +1221,7 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		// there is no node to ask.
 		"-device", "virtio-rng-pci",
 		"-display", "none",
-		"-serial", "file:" + filepath.Join(dir, "serial.log"),
+		"-serial", "file:"+filepath.Join(dir, "serial.log"),
 		"-pidfile", filepath.Join(dir, "qemu.pid"),
 		"-daemonize",
 	)

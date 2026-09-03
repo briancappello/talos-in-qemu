@@ -1353,3 +1353,53 @@ func TestEphemeralCapIsActuallyApplied(t *testing.T) {
 			"  reason: the caller's document must REPLACE machinery's, not lose to it")
 	}
 }
+
+// A PINNED Kubernetes version must be used verbatim, and an unpinned one must
+// keep deriving exactly as before.
+func TestKubernetesVersionIsPinnedWhenGivenAndDerivedWhenNot(t *testing.T) {
+	in := testInput()
+	in.TalosVersion = "v1.14.0"
+	in.KubernetesVersion = "1.36.0"
+
+	pinned, err := GenerateConfig(in)
+	if err != nil {
+		t.Fatalf("a supported pinned Kubernetes version was refused: %s", redactErr(err))
+	}
+
+	if !strings.Contains(string(pinned.ControlPlane), "kubelet:v1.36.0") {
+		t.Errorf("the pinned Kubernetes version is not in the generated config\n" +
+			"  reason: pinning exists so a machinery bump cannot change which Kubernetes " +
+			"the next node installs")
+	}
+
+	in.KubernetesVersion = ""
+
+	derived, err := GenerateConfig(in)
+	if err != nil {
+		t.Fatalf("deriving a Kubernetes version broke: %s", redactErr(err))
+	}
+
+	if strings.Contains(string(derived.ControlPlane), "kubelet:v1.36.0") {
+		t.Error("an unpinned config produced the pinned version\n" +
+			"  reason: empty must mean derive, or every existing manifest changes meaning")
+	}
+}
+
+// A pin machinery says cannot work is REFUSED, not installed. Explicit is a
+// decision, not permission to ignore the compatibility data -- the node would
+// otherwise come up with a kubelet and control plane that do not match the OS.
+func TestAnImpossibleKubernetesPinIsRefused(t *testing.T) {
+	in := testInput()
+	in.TalosVersion = "v1.14.0"
+	in.KubernetesVersion = "1.11.0"
+
+	_, err := GenerateConfig(in)
+	if err == nil {
+		t.Fatal("a Kubernetes version machinery rejects was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "1.11.0") || !strings.Contains(err.Error(), "v1.14.0") {
+		t.Errorf("the refusal names neither the pin nor the Talos version it was checked against\n"+
+			"  got: %v", err)
+	}
+}

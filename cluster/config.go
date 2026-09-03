@@ -93,6 +93,22 @@ type ConfigInput struct {
 	// substituting its own version, because this value becomes the installer
 	// image tag on the node's disk.
 	TalosVersion string
+	// KubernetesVersion pins the Kubernetes version, or "" to derive one.
+	//
+	// EXPLICIT BEATS DERIVED, and the reason is that the derived value is a
+	// function of THIS BINARY's machinery pin: kubernetesVersion() starts at
+	// machinery's DefaultKubernetesVersion and walks the minor down until the
+	// compatibility oracle accepts it. Bumping a Go module therefore changes
+	// which Kubernetes the next node installs, silently, with no manifest
+	// edit -- which is how one cluster ended up running v1.37.0-beta.0 on the
+	// node built before a machinery bump and v1.37.0-rc.1 on the node built
+	// after it.
+	//
+	// STILL CHECKED when set. An explicit version is a decision, not an
+	// override of reality: it is validated against the target Talos version by
+	// the same oracle, so a pin machinery says cannot work is refused here
+	// rather than installed and discovered on the node.
+	KubernetesVersion string
 	// ConsoleArg is the console kernel argument for the NODE, or "" for none.
 	//
 	// EMPTY IS AN ANSWER, not an unset field, and two gates below read it as
@@ -311,7 +327,7 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 		return nil, fmt.Errorf("parsing Talos version %q: %w", version, err)
 	}
 
-	k8sVersion, err := kubernetesVersion(version)
+	k8sVersion, err := resolveKubernetesVersion(version, in.KubernetesVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -904,4 +920,38 @@ func documentIdentity(doc coreconfig.Document) (id struct{ kind, name string }) 
 	}
 
 	return id
+}
+
+// resolveKubernetesVersion returns the pinned Kubernetes version when the caller
+// supplied one, and derives it otherwise.
+//
+// The pinned path is VALIDATED, not trusted. Machinery's compatibility data is
+// the only thing that knows which Kubernetes a given Talos can run, and a
+// version it rejects produces a node whose kubelet and control-plane images do
+// not match the OS underneath them -- which surfaces as pods that will not start
+// long after the install reported success.
+func resolveKubernetesVersion(talosVersion, pinned string) (string, error) {
+	if pinned == "" {
+		return kubernetesVersion(talosVersion)
+	}
+
+	target, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: talosVersion})
+	if err != nil {
+		return "", fmt.Errorf("parsing Talos version %q: %w", talosVersion, err)
+	}
+
+	k8s, err := compatibility.ParseKubernetesVersion(pinned)
+	if err != nil {
+		return "", fmt.Errorf("kubernetesVersion %q is not a Kubernetes version: %w\n\n"+
+			"  it is a bare version with no leading v, e.g. 1.37.0", pinned, err)
+	}
+
+	if err := k8s.SupportedWith(target); err != nil {
+		return "", fmt.Errorf("kubernetesVersion %q cannot run on a Talos %s node: %w\n\n"+
+			"  machinery's compatibility data is what decides this, and installing anyway\n"+
+			"  produces a kubelet and control plane that do not match the OS beneath them",
+			pinned, talosVersion, err)
+	}
+
+	return pinned, nil
 }

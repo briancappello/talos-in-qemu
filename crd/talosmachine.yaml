@@ -146,6 +146,16 @@ spec:
                     Override the installer image, which otherwise follows the
                     ISO's own version. For testing an unreleased or patched
                     Talos. Omit to keep the pinned default.
+                kubernetesVersion:
+                  type: string
+                  minLength: 1
+                  description: >-
+                    Pins the Kubernetes version, e.g. "1.37.0" (bare, no leading v).
+                    Absent means derive one from the Talos version -- which is a
+                    function of the tinq binary's machinery pin, so bumping a Go
+                    module silently changes which Kubernetes the next node installs.
+                    Pinning makes it a decision instead. A version machinery says
+                    cannot run on the target Talos is refused, not installed.
                 baremetal:
                   type: object
                   required: [maintenanceEndpoint]

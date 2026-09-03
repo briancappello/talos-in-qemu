@@ -562,8 +562,13 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 		DataDiskSerial:   dataSerial,
 		EphemeralMaxSize: ephemeralMaxSize,
 		TalosVersion:     version,
-		VersionSource:    source,
-		Substrate:        fmt.Sprintf("baremetal, %s", str(spec["maintenanceEndpoint"], "")),
+		// A TOP-LEVEL spec field, not a baremetal one: which Kubernetes a node
+		// runs is a property of the cluster it belongs to, not of the substrate
+		// it runs on, and a VM built by `up` needs to pin it for exactly the
+		// same reason.
+		KubernetesVersion: str(spec["kubernetesVersion"], ""),
+		VersionSource:     source,
+		Substrate:         fmt.Sprintf("baremetal, %s", str(spec["maintenanceEndpoint"], "")),
 		// nil unless spec.baremetal.joins named a cluster. See joinOptions.
 		Join: join,
 		// EMPTY BY DEFAULT. Real hardware has a firmware-configured console and

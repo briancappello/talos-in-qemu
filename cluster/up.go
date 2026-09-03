@@ -167,6 +167,11 @@ type UpOptions struct {
 	// patch that does not parse or apply is refused at generation, not here.
 	ConfigPatches []string
 
+	// KubernetesVersion pins the Kubernetes version, or "" to derive one from
+	// the Talos version. See ConfigInput.KubernetesVersion for why pinning it
+	// matters: derived, it is a function of this binary's machinery pin.
+	KubernetesVersion string
+
 	// Join makes this a machine that JOINS an existing cluster rather than
 	// creating one. nil is the default and means create.
 	//
@@ -655,14 +660,15 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 		// STILL THIS NODE'S ADDRESS on a join: it is the apid certificate's
 		// subject alt name and the talosconfig's endpoint, so it must name the
 		// machine a client dials, never the cluster it belongs to.
-		APIAddress:       installedAddr,
-		SecretsBundle:    secrets,
-		TalosVersion:     opts.TalosVersion,
-		ConsoleArg:       opts.ConsoleArg,
-		SystemDisk:       opts.SystemDisk,
-		DataDiskSerial:   opts.DataDiskSerial,
-		EphemeralMaxSize: opts.EphemeralMaxSize,
-		InstallerImage:   opts.InstallerImage,
+		APIAddress:        installedAddr,
+		SecretsBundle:     secrets,
+		TalosVersion:      opts.TalosVersion,
+		KubernetesVersion: opts.KubernetesVersion,
+		ConsoleArg:        opts.ConsoleArg,
+		SystemDisk:        opts.SystemDisk,
+		DataDiskSerial:    opts.DataDiskSerial,
+		EphemeralMaxSize:  opts.EphemeralMaxSize,
+		InstallerImage:    opts.InstallerImage,
 		// WHETHER kexec is disabled is the CALLER's decision, and the reason
 		// is that it is a fact about the host rather than about the node: the
 		// one substrate it applies to is QEMU on macOS/arm64. See
