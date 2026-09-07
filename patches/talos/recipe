@@ -27,4 +27,4 @@ patch:0001-lvm-deactivation-controller.patch
 # whole command when any device in it is already a member, and the refusal is
 # swallowed as ErrExists -- so a volume group stops one PV short and spins
 # forever. Order-dependent, so it presents as intermittent. Not upstream.
-patch:patches/talos/0002-lvm-vgextend-only-missing-devices.patch
+patch:0002-lvm-vgextend-only-missing-devices.patch
