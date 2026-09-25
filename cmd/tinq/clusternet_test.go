@@ -2,12 +2,14 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/coglative/talos-in-qemu/driverkit"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
@@ -325,3 +327,70 @@ func TestCreateAddsTheClusterNIC(t *testing.T) {
 func netipPrefix(s string) netip.Prefix { return netip.MustParsePrefix(s) }
 
 func netipAddr(s string) netip.Addr { return netip.MustParseAddr(s) }
+
+// fakeISO writes an image whose primary volume descriptor carries volID, which
+// is all platform.InspectImageVersion reads.
+func fakeISO(t *testing.T, path, volID string) {
+	t.Helper()
+
+	img := make([]byte, 18*2048)
+	pvd := img[16*2048:]
+	pvd[0] = 1
+	copy(pvd[1:6], "CD001")
+	copy(pvd[40:72], fmt.Sprintf("%-32s", volID))
+
+	if err := os.WriteFile(path, img, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpOptionsCarriesTheNodeIdentity(t *testing.T) {
+	g := newGoldenHost(t, "talos.iso")
+	fakeISO(t, filepath.Join(g.images, "talos.iso"), "TALOS_V1_14_1")
+
+	m := netMachine(t, "cp0", 50000, "cidr: 10.254.0.0/24\naddress: 10.254.0.11\n")
+	m.Object["spec"].(map[string]interface{})["hostname"] = "cp-zero"
+
+	opts, err := upOptions(g.h, m, driverkit.Absent, nil)
+	if err != nil {
+		t.Fatalf("upOptions: %v", err)
+	}
+
+	if opts.ClusterNetwork == nil ||
+		opts.ClusterNetwork.Address.String() != "10.254.0.11/24" ||
+		opts.ClusterNetwork.HardwareAddr != clusterMAC("cp0") {
+		t.Errorf("ClusterNetwork = %+v, want 10.254.0.11/24 on %s", opts.ClusterNetwork, clusterMAC("cp0"))
+	}
+
+	if opts.Hostname != "cp-zero" {
+		t.Errorf("Hostname = %q, want cp-zero", opts.Hostname)
+	}
+}
+
+// A v1.13 ISO cannot carry the 1.14 documents. The ISO's version is known
+// before the boot, so the refusal comes from upOptions, with nothing created.
+func TestUpOptionsRefusesNodeIdentityOnAnOldImage(t *testing.T) {
+	for _, tc := range []struct{ name, cluster, hostname, want string }{
+		{"cluster network", "cidr: 10.254.0.0/24\naddress: 10.254.0.11\n", "", "a cluster network needs Talos v1.14"},
+		{"hostname", "", "solo", "a declared hostname needs Talos v1.14"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newGoldenHost(t, "talos.iso")
+			fakeISO(t, filepath.Join(g.images, "talos.iso"), "TALOS_V1_13_7")
+
+			m := netMachine(t, "cp0", 50000, tc.cluster)
+			if tc.hostname != "" {
+				m.Object["spec"].(map[string]interface{})["hostname"] = tc.hostname
+			}
+
+			_, err := upOptions(g.h, m, driverkit.Absent, nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("upOptions = %v, want a refusal naming %q", err, tc.want)
+			}
+
+			if _, statErr := os.Stat(g.h.dir(m)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("the state directory exists after the refusal")
+			}
+		})
+	}
+}

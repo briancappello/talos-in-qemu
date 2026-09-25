@@ -13,6 +13,8 @@
   "ConsoleArg": "console=ttyS0"
   "DisableKexec": false
   "Network": null
+  "ClusterNetwork": null
+  "Hostname": ""
   "Registries": null
   "ConfigPatches": null
   "KubernetesVersion": ""

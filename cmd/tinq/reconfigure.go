@@ -93,6 +93,13 @@ func reconfigureMachine(ctx context.Context, d *hvf, path string) error {
 		if opts.APIAddress, err = cluster.APIAddressOf(opts.TalosEndpoint); err != nil {
 			return err
 		}
+
+		// The same identity upOptions gives the node. Dropped here, a
+		// reconfigure would strip the cluster link and node IP from a running
+		// member and cut it off from its peers.
+		if opts.ClusterNetwork, opts.Hostname, err = nodeIdentity(m); err != nil {
+			return err
+		}
 	}
 
 	mirrors, err := registryMirrors(m)

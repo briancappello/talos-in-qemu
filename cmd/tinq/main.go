@@ -564,6 +564,19 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		return cluster.UpOptions{}, err
 	}
 
+	clusterNet, hostname, err := nodeIdentity(m)
+	if err != nil {
+		return cluster.UpOptions{}, err
+	}
+
+	talosVersion := platform.InspectImageVersion(image)
+
+	// The ISO's version is known now, so an image too old for these fields is
+	// refused before the boot rather than at config generation after it.
+	if err := cluster.CheckNodeIdentity(talosVersion, clusterNet, hostname); err != nil {
+		return cluster.UpOptions{}, err
+	}
+
 	// The MACHINE's state dir, never the state root: the artifacts carry the
 	// identity they belong to, which is the property that makes -destroy sweep
 	// them. Written one level up they would outlive the cluster whose keys
@@ -582,7 +595,7 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		DataDiskSerial: dataDiskSerial(spec),
 		InstallerImage: str(spec["installerImage"], ""),
 
-		TalosVersion:      platform.InspectImageVersion(image),
+		TalosVersion:      talosVersion,
 		KubernetesVersion: str(spec["kubernetesVersion"], ""),
 		VersionSource:     fmt.Sprintf("%s (ISO volume id)", filepath.Base(image)),
 		Substrate:         fmt.Sprintf("%s/%s, %s, %s", host.OS, host.ImageArch, host.Accel, host.QEMUBinary),
@@ -599,6 +612,9 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		// node, and only its address differs between a guest and a machine.
 		Registries:    mirrors,
 		ConfigPatches: patches,
+
+		ClusterNetwork: clusterNet,
+		Hostname:       hostname,
 
 		Boot: func() (int, error) {
 			// The same already-running rule `apply` applies, and it is what

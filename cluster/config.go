@@ -192,6 +192,15 @@ type ConfigInput struct {
 	// client dials; whether that address came from a static block or from the
 	// endpoint the node already answers on is the caller's knowledge.
 	Network *Network
+	// ClusterNetwork is the node's address on a segment shared with the other
+	// nodes of its cluster, or nil for none. Kubernetes, etcd and Flannel use
+	// it, and the API server certificate names it. Needs Talos v1.14 or later.
+	// See ClusterNetwork.
+	ClusterNetwork *ClusterNetwork
+	// Hostname is the node's declared hostname, and therefore its Kubernetes
+	// node name, or "" to let Talos generate one as before. Needs Talos v1.14
+	// or later.
+	Hostname string
 	// Registries are image registry mirrors. Empty means the node pulls only
 	// from upstream, which is the correct default: a mirror that is not
 	// running turns every image pull into a timeout, so one is configured only
@@ -332,6 +341,10 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 		return nil, err
 	}
 
+	if err := checkNodeIdentity(in, contract); err != nil {
+		return nil, err
+	}
+
 	genOpts := []generate.Option{
 		// Without a contract every version-gated default is generated for the
 		// machinery's own version instead of the image's.
@@ -365,6 +378,16 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 	// guess about its NIC.
 	if in.Network != nil {
 		genOpts = append(genOpts, networkOption(in.Network))
+	}
+
+	// The cluster address goes into BOTH certificates (machinery routes this
+	// option to machine.certSANs and the API server's certExtraSANs): other
+	// nodes reach this API server there, while the host keeps reaching it
+	// through APIAddress. A separate option, so a node without a cluster
+	// network generates exactly what it did before.
+	if in.ClusterNetwork != nil {
+		genOpts = append(genOpts, generate.WithAdditionalSubjectAltNames(
+			[]string{in.ClusterNetwork.Address.Addr().String()}))
 	}
 
 	// THE EXISTING PKI, when there is one. Everything above describes a machine
@@ -495,10 +518,32 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 			c.MachineConfig.MachineRegistries = registriesConfig(in.Registries)
 		}
 
+		// etcd has no config document in 1.14, so its advertised subnet is
+		// still a v1alpha1 field. Without it a member advertises 10.0.2.15,
+		// which every guest holds and no peer can reach.
+		if in.ClusterNetwork != nil {
+			if c.ClusterConfig == nil {
+				c.ClusterConfig = &v1alpha1.ClusterConfig{}
+			}
+
+			if c.ClusterConfig.EtcdConfig == nil {
+				c.ClusterConfig.EtcdConfig = &v1alpha1.EtcdConfig{}
+			}
+
+			c.ClusterConfig.EtcdConfig.EtcdAdvertisedSubnets = []string{in.ClusterNetwork.Address.Masked().String()}
+		}
+
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("patching the install section: %w", err)
+	}
+
+	// Before the volume documents and the operator's patches, so a patch can
+	// still override anything this sets.
+	cfg, err = withNodeIdentity(cfg, in)
+	if err != nil {
+		return nil, err
 	}
 
 	// The two ways to get a user volume, and they are MUTUALLY EXCLUSIVE by the

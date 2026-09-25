@@ -47,6 +47,8 @@ type ReconfigureOptions struct {
 	ConsoleArg       string
 	DisableKexec     bool
 	Network          *Network
+	ClusterNetwork   *ClusterNetwork
+	Hostname         string
 	Registries       []RegistryMirror
 	ConfigPatches    []string
 }
@@ -105,6 +107,8 @@ func Reconfigure(ctx context.Context, opts ReconfigureOptions) ([]byte, error) {
 		EphemeralMaxSize: opts.EphemeralMaxSize,
 		DisableKexec:     opts.DisableKexec,
 		Network:          opts.Network,
+		ClusterNetwork:   opts.ClusterNetwork,
+		Hostname:         opts.Hostname,
 		Registries:       opts.Registries,
 		ConfigPatches:    opts.ConfigPatches,
 		SecretsBundle:    secretsBundle,

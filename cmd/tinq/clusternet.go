@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/coglative/talos-in-qemu/cluster"
 	"github.com/coglative/talos-in-qemu/driverkit"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -153,6 +154,23 @@ func specClusterNetwork(m *unstructured.Unstructured) (*clusterNetwork, error) {
 	}
 
 	return cn, nil
+}
+
+// nodeIdentity is what the machine config needs from spec.clusterNetwork and
+// spec.hostname: the node's address with the segment's prefix, the cluster
+// NIC's MAC (which create() sets on the device), and the hostname.
+func nodeIdentity(m *unstructured.Unstructured) (*cluster.ClusterNetwork, string, error) {
+	hostname := driverkit.Str(m, "spec", "hostname")
+
+	cn, err := specClusterNetwork(m)
+	if err != nil || cn == nil {
+		return nil, hostname, err
+	}
+
+	return &cluster.ClusterNetwork{
+		Address:      netip.PrefixFrom(cn.Address, cn.CIDR.Bits()),
+		HardwareAddr: clusterMAC(m.GetName()),
+	}, hostname, nil
 }
 
 // multicast is the QEMU socket-netdev endpoint of a cluster network: the group
