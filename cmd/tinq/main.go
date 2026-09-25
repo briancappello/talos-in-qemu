@@ -1177,6 +1177,12 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		}
 	}
 
+	// checkSite has already validated the block, so the error cannot recur.
+	cn, err := specClusterNetwork(m)
+	if err != nil {
+		return 0, err
+	}
+
 	machine := p.Machine + ",accel=" + p.Accel
 	if secureBoot {
 		// smm=on is not optional for secure firmware: OVMF_CODE.secboot hangs
@@ -1246,7 +1252,8 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		"-drive", "if=none,id=cd,media=cdrom,file="+image,
 		"-device", fmt.Sprintf("virtio-blk-pci,drive=cd,bootindex=%d", isoBootIndex),
 		"-netdev", netdev,
-		"-device", "virtio-net-pci,netdev=n0",
+		// A MAC of its own only on a cluster network; see userNICDevice.
+		"-device", userNICDevice(m, cn),
 		// ENTROPY, and it decides whether the bring-up works at all. Talos's
 		// /sbin/init blocks until the kernel CRNG is seeded, and a QEMU guest
 		// with no rng device has almost nothing to seed it with: no host IRQ
@@ -1300,12 +1307,6 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 
 	// The cluster NIC, APPENDED LAST like every optional device above, so a
 	// machine without spec.clusterNetwork emits exactly the argv it did before.
-	// checkSite has already validated the block, so the error cannot recur.
-	cn, err := specClusterNetwork(m)
-	if err != nil {
-		return 0, err
-	}
-
 	args = append(args, clusterNICArgs(m, cn)...)
 
 	cmd := exec.Command(p.QEMUBinary, args...)

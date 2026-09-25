@@ -35,6 +35,15 @@ type ClusterNetwork struct {
 	// HardwareAddr is the MAC of the NIC on that segment. The link is selected
 	// by it, never by name, for the same reason Network.HardwareAddr is.
 	HardwareAddr string
+	// EgressHardwareAddr is the MAC of the node's OTHER NIC, the one with the
+	// default route, which keeps DHCP. REQUIRED, and the reason is a Talos
+	// rule rather than a preference: any LinkConfig in the machine config
+	// switches off Talos's default DHCP on EVERY link (machinery's
+	// Container.RunDefaultDHCPOperators). Without an explicit DHCP document
+	// for it, the egress NIC loses its address the moment the config lands:
+	// under QEMU the host forwards die with it, and the node cannot even
+	// pull its installer.
+	EgressHardwareAddr string
 }
 
 // kubeAPIPort is kube-apiserver's port on the node itself. The in-cluster
@@ -109,9 +118,13 @@ func hostSANs(kubeEndpoint string, cn *ClusterNetwork) []string {
 	return []string{u.Hostname()}
 }
 
-// clusterLinkName is the Talos-side alias of the cluster NIC. It names the
-// link inside the machine config only; nothing outside Talos relies on it.
-const clusterLinkName = "cluster0"
+// clusterLinkName is the Talos-side alias of the cluster NIC, and
+// egressLinkName that of the NIC with the default route. They name links
+// inside the machine config only; nothing outside Talos relies on them.
+const (
+	clusterLinkName = "cluster0"
+	egressLinkName  = "egress0"
+)
 
 // errNeedsDocumentModel refuses a node identity feature on an image whose
 // Talos version predates the document model it is written in.
@@ -247,24 +260,52 @@ func withNodeIdentity(cfg config.Provider, in ConfigInput) (config.Provider, err
 	return next, nil
 }
 
-// clusterLinkDocuments aliases the cluster NIC by MAC and gives it the static
-// address. No route: egress stays on the user-mode NIC, and a default route
-// here would send it into a segment with no gateway.
+// clusterLinkDocuments aliases both NICs by MAC, gives the cluster NIC its
+// static address, and keeps DHCP on the egress NIC.
+//
+// No route on the cluster link: egress stays on the other NIC, and a default
+// route here would send it into a segment with no gateway. The DHCPv4Config is
+// NOT optional; see ClusterNetwork.EgressHardwareAddr.
 func clusterLinkDocuments(cn *ClusterNetwork) ([]coreconfig.Document, error) {
-	match, err := cel.ParseBooleanExpression(
-		fmt.Sprintf("mac(link.permanent_addr) == %q", cn.HardwareAddr), celenv.LinkLocator())
-	if err != nil {
-		return nil, fmt.Errorf("building the cluster NIC selector for %s: %w", cn.HardwareAddr, err)
+	if cn.EgressHardwareAddr == "" {
+		return nil, errors.New("a cluster network needs the MAC of the node's egress NIC\n\n" +
+			"  any LinkConfig switches off Talos's default DHCP on every link, so the egress\n" +
+			"  NIC must be named and given DHCP explicitly, or the node loses its default\n" +
+			"  route the moment the config is applied")
 	}
 
-	alias := network.NewLinkAliasConfigV1Alpha1(clusterLinkName)
-	alias.Selector.Match = match
+	clusterAlias, err := linkAlias(clusterLinkName, cn.HardwareAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	egressAlias, err := linkAlias(egressLinkName, cn.EgressHardwareAddr)
+	if err != nil {
+		return nil, err
+	}
 
 	link := network.NewLinkConfigV1Alpha1(clusterLinkName)
 	link.LinkUp = new(true)
 	link.LinkAddresses = []network.AddressConfig{{AddressAddress: cn.Address}}
 
-	return []coreconfig.Document{alias, link}, nil
+	return []coreconfig.Document{
+		clusterAlias, egressAlias, link,
+		network.NewDHCPv4ConfigV1Alpha1(egressLinkName),
+	}, nil
+}
+
+// linkAlias names the link with the given permanent MAC.
+func linkAlias(name, mac string) (*network.LinkAliasConfigV1Alpha1, error) {
+	match, err := cel.ParseBooleanExpression(
+		fmt.Sprintf("mac(link.permanent_addr) == %q", mac), celenv.LinkLocator())
+	if err != nil {
+		return nil, fmt.Errorf("building the %s selector for %s: %w", name, mac, err)
+	}
+
+	alias := network.NewLinkAliasConfigV1Alpha1(name)
+	alias.Selector.Match = match
+
+	return alias, nil
 }
 
 // missing names the absent documents, joined with "or".

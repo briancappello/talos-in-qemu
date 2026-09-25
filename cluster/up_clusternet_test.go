@@ -34,8 +34,9 @@ func kubeconfigFor(t *testing.T, server string) []byte {
 
 func testClusterNetwork() *ClusterNetwork {
 	return &ClusterNetwork{
-		Address:      netip.MustParsePrefix("10.254.0.11/24"),
-		HardwareAddr: "52:54:00:27:92:95",
+		Address:            netip.MustParsePrefix("10.254.0.11/24"),
+		HardwareAddr:       "52:54:00:27:92:95",
+		EgressHardwareAddr: "52:54:00:0e:0e:0e",
 	}
 }
 

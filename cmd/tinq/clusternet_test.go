@@ -268,6 +268,10 @@ func TestClusterNetworkDerivationsArePinned(t *testing.T) {
 		t.Errorf("clusterMAC(cp0) = %s, want 52:54:00:27:92:95", got)
 	}
 
+	if got := egressMAC("cp0"); got != "52:54:00:41:e1:8e" || got == clusterMAC("cp0") {
+		t.Errorf("egressMAC(cp0) = %s, want 52:54:00:41:e1:8e, distinct from the cluster NIC", got)
+	}
+
 	otherSite, _ := cn.multicast("other")
 	otherName, _ := (&clusterNetwork{Name: "storage"}).multicast("homelab")
 
@@ -313,6 +317,14 @@ func TestCreateAddsTheClusterNIC(t *testing.T) {
 
 	base := strings.Split(plain.scrub(strings.Join(plain.argv(), "\n")), "\n")
 	got := strings.Split(g.scrub(strings.Join(g.argv(), "\n")), "\n")
+
+	// The user-mode NIC gains an explicit MAC, in place, so the node's
+	// config can keep DHCP on it. Nothing else in the base argv moves.
+	for i, a := range base {
+		if a == "virtio-net-pci,netdev=n0" {
+			base[i] = a + ",mac=" + egressMAC("cp0")
+		}
+	}
 
 	group, port := (&clusterNetwork{Name: "cluster"}).multicast("s")
 	want := append(base,

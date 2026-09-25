@@ -19,8 +19,9 @@ func networkedInput() ConfigInput {
 	in.TalosVersion = "v1.14.1"
 	in.Endpoint = "https://10.254.0.11:6443"
 	in.ClusterNetwork = &ClusterNetwork{
-		Address:      netip.MustParsePrefix("10.254.0.11/24"),
-		HardwareAddr: "52:54:00:27:92:95",
+		Address:            netip.MustParsePrefix("10.254.0.11/24"),
+		HardwareAddr:       "52:54:00:27:92:95",
+		EgressHardwareAddr: "52:54:00:0e:0e:0e",
 	}
 
 	return in
@@ -60,14 +61,15 @@ func docOf[T coreconfig.Document](t *testing.T, docs []coreconfig.Document) []T 
 func TestClusterNetworkRendersTheLinkByMAC(t *testing.T) {
 	docs := loaded(t, networkedInput())
 
-	aliases := docOf[*network.LinkAliasConfigV1Alpha1](t, docs)
-	if len(aliases) != 1 || aliases[0].MetaName != clusterLinkName {
-		t.Fatalf("want one LinkAliasConfig %q, got %d", clusterLinkName, len(aliases))
+	aliases := map[string]string{}
+	for _, a := range docOf[*network.LinkAliasConfigV1Alpha1](t, docs) {
+		aliases[a.MetaName] = a.Selector.Match.String()
 	}
 
-	if got := aliases[0].Selector.Match.String(); !strings.Contains(got, `"52:54:00:27:92:95"`) ||
-		!strings.Contains(got, "link.permanent_addr") {
-		t.Errorf("the alias selects %q, want the cluster NIC's permanent MAC", got)
+	for name, mac := range map[string]string{clusterLinkName: "52:54:00:27:92:95", egressLinkName: "52:54:00:0e:0e:0e"} {
+		if got := aliases[name]; !strings.Contains(got, `"`+mac+`"`) || !strings.Contains(got, "link.permanent_addr") {
+			t.Errorf("alias %s selects %q, want the permanent MAC %s", name, got, mac)
+		}
 	}
 
 	links := docOf[*network.LinkConfigV1Alpha1](t, docs)
@@ -203,5 +205,26 @@ func TestNodeIdentityNeedsTalos114(t *testing.T) {
 				t.Fatalf("GenerateConfig on v1.13.7 = %v, want a refusal naming %q", redactErr(err), tc.want)
 			}
 		})
+	}
+}
+
+// THE RULE THIS PINS: any LinkConfig switches off Talos's default DHCP on every
+// link (machinery's Container.RunDefaultDHCPOperators). Without an explicit
+// DHCPv4Config the egress NIC loses its address when the config lands, and the
+// node can neither be reached through its forwards nor pull its installer.
+// Observed live before this document existed.
+func TestClusterNetworkKeepsDHCPOnTheEgressNIC(t *testing.T) {
+	docs := loaded(t, networkedInput())
+
+	dhcp := docOf[*network.DHCPv4ConfigV1Alpha1](t, docs)
+	if len(dhcp) != 1 || dhcp[0].MetaName != egressLinkName {
+		t.Fatalf("want one DHCPv4Config for %s, got %d", egressLinkName, len(dhcp))
+	}
+
+	in := networkedInput()
+	in.ClusterNetwork.EgressHardwareAddr = ""
+
+	if _, err := GenerateConfig(in); err == nil || !strings.Contains(err.Error(), "egress NIC") {
+		t.Errorf("a cluster network without the egress MAC = %v, want a refusal", redactErr(err))
 	}
 }

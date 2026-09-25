@@ -168,8 +168,9 @@ func nodeIdentity(m *unstructured.Unstructured) (*cluster.ClusterNetwork, string
 	}
 
 	return &cluster.ClusterNetwork{
-		Address:      netip.PrefixFrom(cn.Address, cn.CIDR.Bits()),
-		HardwareAddr: clusterMAC(m.GetName()),
+		Address:            netip.PrefixFrom(cn.Address, cn.CIDR.Bits()),
+		HardwareAddr:       clusterMAC(m.GetName()),
+		EgressHardwareAddr: egressMAC(m.GetName()),
 	}, hostname, nil
 }
 
@@ -208,6 +209,26 @@ func clusterMAC(name string) string {
 	sum := sha256.Sum256([]byte("tinq-cluster-mac:" + name))
 
 	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", sum[0], sum[1], sum[2])
+}
+
+// egressMAC derives the MAC of the user-mode NIC for a machine on a cluster
+// network. Set explicitly, rather than left to QEMU's default, because the
+// node's config must name that NIC to keep DHCP on it: any LinkConfig
+// switches off Talos's default DHCP on every link. A machine without a cluster
+// network keeps QEMU's default and its argv is unchanged.
+func egressMAC(name string) string {
+	sum := sha256.Sum256([]byte("tinq-egress-mac:" + name))
+
+	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", sum[0], sum[1], sum[2])
+}
+
+// userNICDevice is the -device argument of the user-mode NIC.
+func userNICDevice(m *unstructured.Unstructured, cn *clusterNetwork) string {
+	if cn == nil {
+		return "virtio-net-pci,netdev=n0"
+	}
+
+	return "virtio-net-pci,netdev=n0,mac=" + egressMAC(m.GetName())
 }
 
 // clusterNICArgs is the second NIC for a machine on a cluster network, or nil.
