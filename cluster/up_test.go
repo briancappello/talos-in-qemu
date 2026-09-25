@@ -2088,3 +2088,18 @@ func TestWithoutJoinTheBringUpStillBootstrapsAndMintsAKubeconfig(t *testing.T) {
 			"  reason: it must mint its own, or every cluster shares one PKI")
 	}
 }
+
+// Step 6 names the installer the config will actually carry. It announced the
+// default ghcr.io pin even when spec.installerImage replaced it.
+func TestStep6NamesTheInstallerOverride(t *testing.T) {
+	f := newFixture(t)
+	f.opts.InstallerImage = "factory.talos.dev/installer/abc:v1.14.1"
+
+	out := f.mustRun(t)
+
+	wants(t, out, "installer: factory.talos.dev/installer/abc:v1.14.1 (spec.installerImage)")
+
+	if strings.Contains(out, "ghcr.io/siderolabs/installer") {
+		t.Errorf("step 6 still names the default installer beside an override:\n%s", redact(out))
+	}
+}

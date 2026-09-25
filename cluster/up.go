@@ -747,9 +747,17 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 	// unidentified image and returns, so this line cannot print
 	// "installer: ghcr.io/siderolabs/installer: (pinned to YOUR image)" —
 	// a claim about a tag that is not there.
-	p.detail("installer: ghcr.io/siderolabs/installer:%s (pinned to YOUR image)", opts.TalosVersion)
-	p.detail("  left unset Talos substitutes THIS binary's version, and a fresh install")
-	p.detail("  silently becomes a cross-version upgrade")
+	//
+	// The OVERRIDE when there is one: GenerateConfig writes InstallerImage
+	// into the config, and announcing the default beside it described an
+	// image the node was never going to pull.
+	if opts.InstallerImage != "" {
+		p.detail("installer: %s (spec.installerImage)", opts.InstallerImage)
+	} else {
+		p.detail("installer: ghcr.io/siderolabs/installer:%s (pinned to YOUR image)", opts.TalosVersion)
+		p.detail("  left unset Talos substitutes THIS binary's version, and a fresh install")
+		p.detail("  silently becomes a cross-version upgrade")
+	}
 	// GATED, because "" is a real answer and adopt is the caller that gives it.
 	// Ungated this announced a BLANK value and credited it to "this host" — on
 	// a machine that is not this host, and with nothing of the sort in the
