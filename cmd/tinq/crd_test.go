@@ -72,8 +72,14 @@ func TestCRDGuardsWhatTheGoCodeAssumes(t *testing.T) {
 			names: []string{
 				"has(self.hostForwards)", "has(self.image)", "has(self.cpu)",
 				"has(self.memory)", "has(self.disk)", "has(self.dataDisk)",
+				"has(self.clusterNetwork)", "has(self.joins)", "has(self.hostname)",
 			},
 			why: "each field it stops naming becomes accepted beside spec.baremetal and then silently ignored",
+		},
+		{
+			id:    "!has(self.joins) ||",
+			names: []string{"has(self.clusterNetwork)"},
+			why:   "a joiner with no cluster network cannot reach its owner, and fails as an etcd timeout",
 		},
 	}
 
@@ -182,6 +188,36 @@ func TestCRDGuardsWhatTheGoCodeAssumes(t *testing.T) {
 	if got := fmt.Sprint(crdMap(t, regProps["endpoint"], "…registries.endpoint")["pattern"]); got != "^https?://" {
 		t.Errorf("spec.registries.items.endpoint pattern is %s, want ^https?:// — an endpoint "+
 			"with no scheme is accepted here and fails at image pull, hours later", got)
+	}
+
+	// The multi-node VM fields. cidr is REQUIRED with no default: every machine
+	// on a network must agree on it, and a default would turn a disagreement
+	// into a silent fallback.
+	cn := crdMap(t, crdDig(t, specSchema, "properties", "clusterNetwork"), "spec.clusterNetwork")
+
+	if got, want := crdStrings(t, cn["required"], "spec.clusterNetwork.required"),
+		[]string{"cidr", "address"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("spec.clusterNetwork.required is %v, want %v — there is no default CIDR", got, want)
+	}
+
+	cnProps := crdMap(t, cn["properties"], "spec.clusterNetwork.properties")
+
+	for _, f := range []string{"name", "cidr", "address", "group", "port"} {
+		if _, ok := cnProps[f]; !ok {
+			t.Errorf("spec.clusterNetwork.%s is missing from the schema, but main.go reads it", f)
+		}
+	}
+
+	for _, f := range []string{"joins", "hostname"} {
+		if _, ok := crdMap(t, specSchema["properties"], "spec.properties")[f]; !ok {
+			t.Errorf("spec.%s is missing from the schema, but main.go reads it", f)
+		}
+	}
+
+	// `joins: ""` would pass key presence and read as "no join", the opposite
+	// of what writing the field says.
+	if got := fmt.Sprint(crdMap(t, crdDig(t, specSchema, "properties", "joins"), "spec.joins")["minLength"]); got != "1" {
+		t.Errorf("spec.joins minLength is %s, want 1", got)
 	}
 }
 

@@ -76,7 +76,7 @@ spec:
                     a TalosMachine is either hardware (spec.baremetal) or a VM to build
                     (image, cpu, memory, disk). Relaxing `required` is what allows the
                     first; this rule is what stops it also allowing a VM with no disk.
-                - rule: "!(has(self.baremetal) && (has(self.hostForwards) || has(self.image) || has(self.cpu) || has(self.memory) || has(self.disk) || has(self.dataDisk)))"
+                - rule: "!(has(self.baremetal) && (has(self.hostForwards) || has(self.image) || has(self.cpu) || has(self.memory) || has(self.disk) || has(self.dataDisk) || has(self.clusterNetwork) || has(self.joins) || has(self.hostname)))"
                   message: >-
                     image, cpu, memory, disk, dataDisk and hostForwards all describe a guest
                     to BUILD, and a machine that already exists is not built: nothing here
@@ -88,7 +88,14 @@ spec:
                     fields is then dead text. The price is paid on migration: turning a VM
                     manifest into a hardware one means DELETING these fields, not merely
                     adding spec.baremetal. That is the trade — one explicit edit, over a
-                    silent discard that never announces itself.
+                    silent discard that never announces itself. clusterNetwork, joins
+                    and hostname are VM fields too; hardware joins with
+                    spec.baremetal.joins.
+                - rule: "!has(self.joins) || has(self.clusterNetwork)"
+                  message: >-
+                    spec.joins needs spec.clusterNetwork. Without the shared segment the
+                    joiner cannot reach its owner, and the failure would be an etcd join
+                    timeout minutes after the boot.
               properties:
                 site:
                   type: string
@@ -156,6 +163,71 @@ spec:
                     module silently changes which Kubernetes the next node installs.
                     Pinning makes it a decision instead. A version machinery says
                     cannot run on the target Talos is refused, not installed.
+                clusterNetwork:
+                  type: object
+                  required: [cidr, address]
+                  description: >-
+                    Attaches this VM to an L2 segment shared by the VMs of its site
+                    that name the same network, so several VMs can form one Talos
+                    cluster. It is a second NIC on a QEMU multicast socket bound to
+                    127.0.0.1: no root, no bridge, and nothing leaves the host. The
+                    first NIC keeps its user-mode egress and host forwards.
+                    Kubernetes, etcd and Flannel use this address. Needs Talos v1.14
+                    or later. Absent means a single VM exactly as before.
+                  properties:
+                    name:
+                      type: string
+                      minLength: 1
+                      pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                      description: >-
+                        The segment's name within the site. Default "cluster". The
+                        multicast group and port are derived from site and name, so
+                        two sites on one host never share a segment by accident.
+                    cidr:
+                      type: string
+                      # REQUIRED, with no default: every machine on the network must
+                      # declare the same one, and tinq refuses a disagreement.
+                      pattern: '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$'
+                      description: >-
+                        The segment, e.g. 10.254.0.0/24. Every machine on the network
+                        declares the same CIDR. It must not overlap 10.0.2.0/24 (the
+                        user-mode network), the pod CIDR or the service CIDR.
+                    address:
+                      type: string
+                      pattern: '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+                      description: >-
+                        This machine's address on the segment, with no prefix, e.g.
+                        10.254.0.11. It becomes the node's InternalIP and etcd peer
+                        address. Unique within the site's network.
+                    group:
+                      type: string
+                      pattern: '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+                      description: >-
+                        Override of the derived multicast group. Must be in
+                        239.0.0.0/8. Omit to derive it from site and name.
+                    port:
+                      type: integer
+                      minimum: 1024
+                      maximum: 65535
+                      description: >-
+                        Override of the derived multicast UDP port. Omit to derive it.
+                joins:
+                  type: string
+                  minLength: 1
+                  description: >-
+                    The metadata.name of a VM on the same site and cluster network
+                    whose cluster this VM JOINS as a control-plane member. The owner's
+                    state directory supplies the secrets bundle, the in-cluster
+                    endpoint and the kubeconfig; a joiner never bootstraps etcd.
+                    Requires clusterNetwork. Hardware joins with spec.baremetal.joins.
+                hostname:
+                  type: string
+                  maxLength: 63
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                  description: >-
+                    The node's hostname, and therefore its Kubernetes node name. It
+                    is the same after destroy and up. Absent means Talos generates
+                    one, as before.
                 baremetal:
                   type: object
                   required: [maintenanceEndpoint]
