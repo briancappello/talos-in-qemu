@@ -761,6 +761,44 @@ without a registry to consult — the same property that makes cloud labels and
 tags work. `Destroy` takes the whole unit: the process and the state directory,
 idempotently.
 
+### Nothing supervises a running machine — stop it yourself
+
+`up` and `apply` start qemu with `-daemonize`, so it **reparents to init** (on a
+Linux desktop, `systemd --user`). It is not a child of your shell, and closing
+the terminal, ending the SSH session, or killing the agent that ran it does not
+stop it. A machine brought up for a ten-minute experiment keeps its CPU, its
+RAM and its disk image until something explicitly takes it down. The vTPM is a
+second orphan beside it: `swtpm` is not qemu's child either, which is why
+`destroy` reaps it from `swtpm.pid` before signalling qemu.
+
+That is the intended behaviour — a VM that died with its terminal would be
+useless for the controller path — but it means **the operator owns the
+lifetime**. End every session on a verb:
+
+```sh
+tinq stop    machine.yaml    # keeps the disks and the installed OS
+tinq destroy machine.yaml    # takes the process and the whole state dir
+```
+
+There is no `tinq list`, so a machine forgotten this way is invisible until you
+go looking. The state root is the registry — every machine names its own
+directory in its argv, which is the same token `ProcessMatches` verifies before
+it signals anything:
+
+```sh
+pgrep -af "qemu-system.*${HOME}/.hvf/"      # strays, with the state dir in view
+du -sh ~/.hvf/*/*/                          # what they cost on disk
+```
+
+A **stopped** machine keeps its disks on purpose — that is the whole difference
+between `stop` and `destroy` — so `~/.hvf` accumulates multi-gigabyte images for
+machines nobody is running. Sweep the ones you are done with; `stop` is not
+cleanup.
+
+If you want a machine to survive reboots, put it under a supervisor that knows
+it exists — a `--user` systemd unit, or `tinq controller` against a cluster that
+holds the desired state. Do not rely on `-daemonize` as a substitute for either.
+
 ## Status
 
 Working and exercised:
