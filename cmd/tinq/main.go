@@ -558,6 +558,12 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		return cluster.UpOptions{}, err
 	}
 
+	// Refused here as well as in create(), which Boot reaches only after the
+	// transcript's first steps: the collision is provable from files now.
+	if err := d.checkSite(m); err != nil {
+		return cluster.UpOptions{}, err
+	}
+
 	// The MACHINE's state dir, never the state root: the artifacts carry the
 	// identity they belong to, which is the property that makes -destroy sweep
 	// them. Written one level up they would outlive the cluster whose keys
@@ -1008,7 +1014,19 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 		return 0, err
 	}
 
+	// Collisions with the site's other machines are provable from files, so
+	// they are refused before this machine's state directory exists.
+	if err := h.checkSite(m); err != nil {
+		return 0, err
+	}
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, err
+	}
+
+	// The record the NEXT machine's checkSite reads. Written on every create,
+	// so a machine file edited between stop and up is what the site sees.
+	if err := writeMachineRecord(dir, m); err != nil {
 		return 0, err
 	}
 

@@ -14,8 +14,8 @@
 ## 2. Schema And Validation
 
 - [x] 2.1 Add `spec.clusterNetwork` (required `cidr` and `address`, optional `name` defaulting to `cluster`, optional `group`, `port`), `spec.joins` and `spec.hostname` to `crd/talosmachine.yaml`. Verify with the CRD schema tests (`cmd/tinq/crd_test.go`).
-- [ ] 2.2 Implement the refusals from the `vm-cluster-network` spec (address outside the CIDR, overlaps, duplicate address, CIDR disagreement) as file-only checks that run before any state directory exists. Verify with one unit test per refusal, and assert that no state directory was created.
-- [ ] 2.3 Implement host-forward collision detection across the machines of a site. Verify with a unit test naming the port and both machines.
+- [x] 2.2 Implement the refusals from the `vm-cluster-network` spec (address outside the CIDR, overlaps, duplicate address, CIDR disagreement) as file-only checks that run before any state directory exists. Verify with one unit test per refusal, and assert that no state directory was created.
+- [x] 2.3 Implement host-forward collision detection across the machines of a site. Verify with a unit test naming the port and both machines.
 
 ## 3. The Cluster NIC
 

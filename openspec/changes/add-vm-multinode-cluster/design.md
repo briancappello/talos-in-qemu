@@ -68,6 +68,10 @@ tinq validates these before it creates anything, following its "refused before t
 - the CIDR does not overlap `10.0.2.0/24` (SLIRP), the pod CIDR or the service CIDR;
 - no other machine in the same site's state root already claims the address.
 
+**The machine record (added in task 2.2).** A state directory held no spec, so "another machine of the site" could not be read from it. `create` now writes `<stateDir>/machine.yaml`, a copy of the machine object, right after it creates the directory. The site checks read `<stateRoot>/<site>/*/machine.yaml`, skipping the machine's own directory and its own name. The address, CIDR and host-forward checks use it, and so do the join resolver (D5) and the owner-with-joiners refusal (D7). The record lives and dies with the state directory, so a destroyed machine stops claiming anything. A stopped machine keeps its claim. A VM created before this change has no record and is invisible to the checks. This is acceptable, because such a VM has no cluster network.
+
+Additional refusals, from the same file-only pass: a CIDR with host bits set, a prefix longer than /30, the network address or the broadcast address as `address`, a `group` outside `239.0.0.0/8`, and a `port` outside 1024–65535. Two forwards collide when protocol and port match and the addresses are equal, or when either address is `0.0.0.0`.
+
 The node's link on that NIC gets the static address, selected by the derived MAC. It must use the Talos 1.14 network documents that machinery accepts (for example link and address config documents), **not** `.machine.network.interfaces`. See the conflict validator behavior in Context. The implementer confirms the exact document kinds against machinery v1.14.0 in the first task.
 
 No default route is added on the cluster NIC. Egress stays on the user-mode NIC.
