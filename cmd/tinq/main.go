@@ -577,6 +577,13 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		return cluster.UpOptions{}, err
 	}
 
+	// nil unless spec.joins names a cluster. Refused here, from files, before
+	// the boot: a join that cannot work must not cost a VM to find out.
+	join, err := vmJoinOptions(d, m)
+	if err != nil {
+		return cluster.UpOptions{}, err
+	}
+
 	// The MACHINE's state dir, never the state root: the artifacts carry the
 	// identity they belong to, which is the property that makes -destroy sweep
 	// them. Written one level up they would outlive the cluster whose keys
@@ -615,6 +622,7 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 
 		ClusterNetwork: clusterNet,
 		Hostname:       hostname,
+		Join:           join,
 
 		Boot: func() (int, error) {
 			// The same already-running rule `apply` applies, and it is what

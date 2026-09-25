@@ -26,9 +26,10 @@
 
 ## 4. Endpoint And Join
 
-- [ ] 4.1 For a networked owner, set the in-cluster endpoint to the owner's cluster address, add both addresses to the certificate SANs, keep the host forward in the kubeconfig, and write the in-cluster endpoint artifact. Verify with config tests, and with a live check that `kubectl` works from the host.
-- [ ] 4.2 Factor the join resolver out of `adopt.go` `joinOptions` so that `spec.baremetal.joins` and `spec.joins` share it. For VMs it reads the in-cluster endpoint artifact, never the kubeconfig server. Verify that the existing `adopt_test.go` suite still passes, and add a test that a VM joiner never gets `127.0.0.1` as its endpoint.
-- [ ] 4.3 Implement the join refusals (self, missing owner secrets or endpoint, site or network mismatch, no cluster network). Verify with one unit test per refusal.
+- [x] 4.1 For a networked owner, set the in-cluster endpoint to the owner's cluster address, add both addresses to the certificate SANs, keep the host forward in the kubeconfig, and write the in-cluster endpoint artifact. Verify with config tests, and with a live check that `kubectl` works from the host.
+  - Unit part done. **Live check open** (runs with 6.1).
+- [x] 4.2 Factor the join resolver out of `adopt.go` `joinOptions` so that `spec.baremetal.joins` and `spec.joins` share it. For VMs it reads the in-cluster endpoint artifact, never the kubeconfig server. Verify that the existing `adopt_test.go` suite still passes, and add a test that a VM joiner never gets `127.0.0.1` as its endpoint.
+- [x] 4.3 Implement the join refusals (self, missing owner secrets or endpoint, site or network mismatch, no cluster network). Verify with one unit test per refusal.
 - [ ] 4.4 Implement the segment connectivity check before a joiner's config is applied. Verify it by blocking multicast on `lo` in a test environment, or with an injectable check in unit tests plus one manual live run, recorded in the change.
 
 ## 5. Hostname And Lifecycle

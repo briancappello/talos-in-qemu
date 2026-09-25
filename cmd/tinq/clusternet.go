@@ -246,11 +246,17 @@ func writeMachineRecord(dir string, m *unstructured.Unstructured) error {
 	return os.WriteFile(filepath.Join(dir, machineRecordName), b, 0o644)
 }
 
+// siteMachine is a recorded machine and the state directory it lives in.
+type siteMachine struct {
+	*unstructured.Unstructured
+	Dir string
+}
+
 // siteMachines returns the recorded machines of site under root, excluding the
 // state directory self. A directory without a record (a VM created before
 // records existed) is skipped: it cannot claim an address it never declared.
 // The result is sorted by name so every message lists machines in one order.
-func siteMachines(root, site, self string) ([]*unstructured.Unstructured, error) {
+func siteMachines(root, site, self string) ([]siteMachine, error) {
 	entries, err := os.ReadDir(filepath.Join(root, site))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -258,7 +264,7 @@ func siteMachines(root, site, self string) ([]*unstructured.Unstructured, error)
 		return nil, err
 	}
 
-	var out []*unstructured.Unstructured
+	var out []siteMachine
 
 	for _, e := range entries {
 		dir := filepath.Join(root, site, e.Name())
@@ -278,7 +284,7 @@ func siteMachines(root, site, self string) ([]*unstructured.Unstructured, error)
 			return nil, fmt.Errorf("reading %s: %w", filepath.Join(dir, machineRecordName), err)
 		}
 
-		out = append(out, &unstructured.Unstructured{Object: obj})
+		out = append(out, siteMachine{Unstructured: &unstructured.Unstructured{Object: obj}, Dir: dir})
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].GetName() < out[j].GetName() })
@@ -309,7 +315,7 @@ func (h *hvf) checkSite(m *unstructured.Unstructured) error {
 			continue
 		}
 
-		if err := checkForwardCollisions(m, o); err != nil {
+		if err := checkForwardCollisions(m, o.Unstructured); err != nil {
 			return err
 		}
 
@@ -317,7 +323,7 @@ func (h *hvf) checkSite(m *unstructured.Unstructured) error {
 			continue
 		}
 
-		ocn, err := specClusterNetwork(o)
+		ocn, err := specClusterNetwork(o.Unstructured)
 		if err != nil || ocn == nil || ocn.Name != cn.Name {
 			continue
 		}

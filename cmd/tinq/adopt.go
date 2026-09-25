@@ -612,16 +612,19 @@ func adoptMachine(ctx context.Context, d *hvf, path string) error {
 // dialled — the same rule the endpoint and network checks above follow, and for
 // the same reason: reaching one of these after the maintenance wait costs ten
 // minutes for a verdict the manifest already contained.
+//
+// The artifacts are read by joinArtifacts, which the VM path shares; see
+// join.go for the one way the two substrates differ.
 func joinOptions(h *hvf, m *unstructured.Unstructured) (*cluster.JoinOptions, error) {
+	const field = "spec.baremetal.joins"
+
 	target := str(baremetalFields(m)["joins"], "")
 	if target == "" {
 		return nil, nil
 	}
 
 	if target == m.GetName() {
-		return nil, fmt.Errorf("spec.baremetal.joins names %q, which is this machine\n\n"+
-			"  a machine cannot join the cluster it is creating; drop the field to create one",
-			target)
+		return nil, errJoinsItself(field, target)
 	}
 
 	// The SAME derivation cmd/tinq uses for this machine's own directory, so a
@@ -632,32 +635,5 @@ func joinOptions(h *hvf, m *unstructured.Unstructured) (*cluster.JoinOptions, er
 	dir := filepath.Join(h.stateRoot, driverkit.Str(m, "spec", "site"),
 		fmt.Sprintf("bootstrap-%s-%s", m.GetNamespace(), target))
 
-	secrets, err := os.ReadFile(filepath.Join(dir, "secrets.yaml"))
-	if err != nil {
-		return nil, fmt.Errorf("spec.baremetal.joins names %q, but its cluster secrets are not "+
-			"readable at %s: %w\n\n"+
-			"  that file is the cluster: its CAs and machine token are what make this node's\n"+
-			"  certificates trusted by its peers. Without it a join is not possible, and\n"+
-			"  generating fresh secrets would silently build a SECOND cluster instead.\n\n"+
-			"  bring %s up first, or restore its state directory", target, dir, err, target)
-	}
-
-	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
-	if err != nil {
-		return nil, fmt.Errorf("spec.baremetal.joins names %q, but its kubeconfig is not "+
-			"readable at %s: %w\n\n"+
-			"  it is where the cluster's API endpoint and this run's readiness check come from",
-			target, dir, err)
-	}
-
-	endpoint, err := cluster.EndpointFromKubeconfig(kubeconfig)
-	if err != nil {
-		return nil, fmt.Errorf("reading the API endpoint from %s's kubeconfig: %w", target, err)
-	}
-
-	return &cluster.JoinOptions{
-		SecretsBundle:   secrets,
-		ClusterEndpoint: endpoint,
-		Kubeconfig:      kubeconfig,
-	}, nil
+	return joinArtifacts(field, target, dir, false)
 }

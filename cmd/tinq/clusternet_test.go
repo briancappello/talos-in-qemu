@@ -187,7 +187,7 @@ func TestCreateWritesTheMachineRecord(t *testing.T) {
 		t.Fatalf("siteMachines = %v, want the record create() wrote for cp0", others)
 	}
 
-	cn, err := specClusterNetwork(others[0])
+	cn, err := specClusterNetwork(others[0].Unstructured)
 	if err != nil || cn == nil || cn.Address.String() != "10.254.0.11" {
 		t.Fatalf("the record does not carry the cluster network: %+v, %v", cn, err)
 	}
