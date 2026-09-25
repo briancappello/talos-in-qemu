@@ -19,8 +19,9 @@
 
 ## 3. The Cluster NIC
 
-- [ ] 3.1 Derive the multicast group and port from site and network name, and the MAC from the machine name. Verify with tests that pin the values for fixed inputs and show that different sites and names differ.
+- [x] 3.1 Derive the multicast group and port from site and network name, and the MAC from the machine name. Verify with tests that pin the values for fixed inputs and show that different sites and names differ.
 - [ ] 3.2 Add the second `-netdev socket,mcast=...,localaddr=127.0.0.1` NIC to the QEMU arguments when `clusterNetwork` is set. Verify with a `main_test.go` argument test. Verify on Linux with two VMs in maintenance mode that one can reach the other's address.
+  - Unit part done (`TestCreateAddsTheClusterNIC`). **Live part open:** in maintenance mode the cluster NIC has no address and the maintenance API has no ping, so the live check runs once 3.3 applies the static address.
 - [ ] 3.3 Render the static address, the node IP, the etcd subnet and the CNI interface pinning from task 1.1. Verify with config-generation tests.
 
 ## 4. Endpoint And Join

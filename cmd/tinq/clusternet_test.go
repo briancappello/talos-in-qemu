@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -248,3 +249,79 @@ func TestCheckSiteIgnoresTheMachineItself(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The derivations are PINNED. A refactor that changes them moves every
+// segment and every NIC: running VMs land on a new group and cannot hear the
+// ones started before, and the link selector in each node's config names a MAC
+// the NIC no longer has.
+func TestClusterNetworkDerivationsArePinned(t *testing.T) {
+	cn := &clusterNetwork{Name: "cluster"}
+
+	group, port := cn.multicast("homelab")
+	if group.String() != "239.255.72.12" || port != 26707 {
+		t.Errorf("multicast(homelab/cluster) = %s:%d, want 239.255.72.12:26707", group, port)
+	}
+
+	if got := clusterMAC("cp0"); got != "52:54:00:27:92:95" {
+		t.Errorf("clusterMAC(cp0) = %s, want 52:54:00:27:92:95", got)
+	}
+
+	otherSite, _ := cn.multicast("other")
+	otherName, _ := (&clusterNetwork{Name: "storage"}).multicast("homelab")
+
+	if otherSite == group || otherName == group {
+		t.Errorf("different sites or names share group %s — two segments would merge", group)
+	}
+
+	if clusterMAC("cp1") == clusterMAC("cp0") {
+		t.Error("two machine names derive the same MAC")
+	}
+
+	if !netipPrefix("239.255.0.0/16").Contains(group) || port < 20000 || port > 29999 {
+		t.Errorf("derived %s:%d is outside 239.255.0.0/16 or 20000-29999", group, port)
+	}
+}
+
+func TestClusterNetworkOverridesWin(t *testing.T) {
+	cn := &clusterNetwork{Name: "cluster", Group: netipAddr("239.1.2.3"), Port: 31000}
+
+	if group, port := cn.multicast("homelab"); group.String() != "239.1.2.3" || port != 31000 {
+		t.Errorf("overrides ignored: got %s:%d", group, port)
+	}
+}
+
+// The cluster NIC is APPENDED: the argv of a machine with a cluster network is
+// the plain argv plus exactly these four elements, at the end.
+func TestCreateAddsTheClusterNIC(t *testing.T) {
+	requireQEMUImg(t)
+
+	plain := newGoldenHost(t, "talos.iso")
+	pm := netMachine(t, "cp0", 50000, "")
+
+	if _, err := plain.h.create(pm, plain.h.dir(pm)); err != nil {
+		t.Fatal(err)
+	}
+
+	g := newGoldenHost(t, "talos.iso")
+	m := netMachine(t, "cp0", 50000, "cidr: 10.254.0.0/24\naddress: 10.254.0.11\n")
+
+	if _, err := g.h.create(m, g.h.dir(m)); err != nil {
+		t.Fatal(err)
+	}
+
+	base := strings.Split(plain.scrub(strings.Join(plain.argv(), "\n")), "\n")
+	got := strings.Split(g.scrub(strings.Join(g.argv(), "\n")), "\n")
+
+	group, port := (&clusterNetwork{Name: "cluster"}).multicast("s")
+	want := append(base,
+		"-netdev", "socket,id=n1,mcast="+group.String()+":"+itoa(port)+",localaddr=127.0.0.1",
+		"-device", "virtio-net-pci,netdev=n1,mac="+clusterMAC("cp0"))
+
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("argv with a cluster network:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func netipPrefix(s string) netip.Prefix { return netip.MustParsePrefix(s) }
+
+func netipAddr(s string) netip.Addr { return netip.MustParseAddr(s) }

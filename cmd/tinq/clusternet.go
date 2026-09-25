@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -151,6 +153,62 @@ func specClusterNetwork(m *unstructured.Unstructured) (*clusterNetwork, error) {
 	}
 
 	return cn, nil
+}
+
+// multicast is the QEMU socket-netdev endpoint of a cluster network: the group
+// and UDP port every VM on the segment joins.
+//
+// DERIVED from site and network name, so every machine of one segment computes
+// the same pair without coordinating, and two sites on one host land on
+// different segments by construction rather than by care. The overrides exist
+// for the rare hash collision and for a host that filters a range.
+//
+// The group stays inside 239.255.0.0/16 (organization-local scope) and avoids
+// .0 and .255 in the last octet. The port is in 20000-29999.
+func (cn *clusterNetwork) multicast(site string) (netip.Addr, int) {
+	sum := sha256.Sum256([]byte("tinq-cluster-network:" + site + "/" + cn.Name))
+
+	group := netip.AddrFrom4([4]byte{239, 255, sum[0], 1 + sum[1]%254})
+	port := 20000 + int(binary.BigEndian.Uint16(sum[2:4]))%10000
+
+	if cn.Group.IsValid() {
+		group = cn.Group
+	}
+
+	if cn.Port != 0 {
+		port = cn.Port
+	}
+
+	return group, port
+}
+
+// clusterMAC derives the cluster NIC's MAC from the machine name, the way
+// machineUUID derives the SMBIOS UUID: stable across destroy and up, so the
+// node's link configuration can select the NIC by it. 52:54:00 is QEMU's
+// locally administered prefix.
+func clusterMAC(name string) string {
+	sum := sha256.Sum256([]byte("tinq-cluster-mac:" + name))
+
+	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", sum[0], sum[1], sum[2])
+}
+
+// clusterNICArgs is the second NIC for a machine on a cluster network, or nil.
+//
+// localaddr=127.0.0.1 keeps the multicast on loopback: nothing leaves the host,
+// and no root or CAP_NET_ADMIN is needed. Any local process can join the group
+// and read or inject frames, which is acceptable on a single-user development
+// host and documented in the README.
+func clusterNICArgs(m *unstructured.Unstructured, cn *clusterNetwork) []string {
+	if cn == nil {
+		return nil
+	}
+
+	group, port := cn.multicast(driverkit.Str(m, "spec", "site"))
+
+	return []string{
+		"-netdev", fmt.Sprintf("socket,id=n1,mcast=%s:%d,localaddr=127.0.0.1", group, port),
+		"-device", "virtio-net-pci,netdev=n1,mac=" + clusterMAC(m.GetName()),
+	}
 }
 
 // machineRecordName is the copy of the machine file tinq keeps in each VM's

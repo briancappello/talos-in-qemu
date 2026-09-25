@@ -1274,6 +1274,16 @@ func (h *hvf) create(m *unstructured.Unstructured, dir string) (int, error) {
 			"-device", p.TPMDevice+",tpmdev=tpm0")
 	}
 
+	// The cluster NIC, APPENDED LAST like every optional device above, so a
+	// machine without spec.clusterNetwork emits exactly the argv it did before.
+	// checkSite has already validated the block, so the error cannot recur.
+	cn, err := specClusterNetwork(m)
+	if err != nil {
+		return 0, err
+	}
+
+	args = append(args, clusterNICArgs(m, cn)...)
+
 	cmd := exec.Command(p.QEMUBinary, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return 0, fmt.Errorf("qemu: %v: %s", err, strings.TrimSpace(string(out)))
