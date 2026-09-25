@@ -1,0 +1,30 @@
+---
+apiVersion: v1alpha1
+kind: RawVolumeConfig
+name: lvm
+encryption:
+  provider: luks2
+  keys:
+    - slot: 0
+      static:
+        passphrase: phase2b-test-passphrase
+provisioning:
+  diskSelector:
+    match: '!system_disk && disk.size > 5u * GiB && disk.size < 15u * GiB'
+  minSize: 8GiB
+  maxSize: 8GiB
+---
+apiVersion: v1alpha1
+kind: LVMVolumeGroupConfig
+name: vg-pool
+provisioning:
+  volumeSelector:
+    match: volume.partition_label.startsWith("r-lvm")
+---
+apiVersion: v1alpha1
+kind: LVMLogicalVolumeConfig
+name: lv-data
+type: linear
+provisioning:
+  volumeGroup: vg-pool
+  maxSize: 4GiB

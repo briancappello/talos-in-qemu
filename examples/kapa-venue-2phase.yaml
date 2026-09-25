@@ -1,0 +1,53 @@
+# Phase 2b TWO-PHASE: stock ISO must NOT see the RawVolume/LVM docs (it lacks #14145).
+#
+# Models kapa-1's two 1TB disks as two 20Gi virtio spindles. The md RAID1 array
+# ("boot", metadata 1.0 so firmware boots either leg) becomes the install target
+# via UnattendedInstallConfig; tinq drops its own machine.install when it sees
+# that document. Proves the PR#5 plumbing (extraDisks, tpm, machineUUID,
+# install-by-array) + the mirror boots to a Ready single-node cluster.
+apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata:
+  name: kapa-venue
+  namespace: default
+spec:
+  site: venue
+  role: talos-cp
+  image: /tmp/opencode/talos-src/_out/rc2-stock-amd64.iso
+  cpu: 4
+  memory: 4Gi
+  disk: 20Gi            # talos-system  — mirror member 1
+  extraDisks:
+    - 20Gi             # talos-extra-0 — mirror member 2
+    - 10Gi             # talos-extra-1 — DEDICATED encrypted-LVM data disk (2b isolation test)
+  tpm: true            # vTPM (swtpm) — needed later for TPM-sealed LUKS
+  hostForwards:
+    - hostPort: 50000
+      guestPort: 50000
+    - hostPort: 6443
+      guestPort: 6443
+  # NOTE: spec.installerImage is IGNORED once UnattendedInstallConfig is present
+  # (tinq drops machine.install). The patched installer goes in the patch's own
+  # installer.image below.
+  registries:
+    - host: 10.0.2.2:5000
+      endpoint: http://10.0.2.2:5000
+  configPatches:
+    - |
+      apiVersion: v1alpha1
+      kind: RAIDArrayConfig
+      name: boot
+      level: raid1
+      metadata: "1.0"
+      provisioning:
+        volumeSelector:
+          match: disk.transport == "virtio" && disk.size >= 18u * GiB
+    - |
+      apiVersion: v1alpha1
+      kind: UnattendedInstallConfig
+      installer:
+        image: 10.0.2.2:5000/talos/installer:lvmfix
+      provisioning:
+        wipe: true
+        diskSelector:
+          match: '"/dev/disk/by-id/md-name-talos:boot" in disk.symlinks'

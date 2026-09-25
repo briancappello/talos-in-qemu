@@ -1,0 +1,92 @@
+# Phase 2b SECUREBOOT: patched UKI ISO (has #14145) + secureboot installer + TPM-sealed LUKS.
+#
+# Models kapa-1's two 1TB disks as two 20Gi virtio spindles. The md RAID1 array
+# ("boot", metadata 1.0 so firmware boots either leg) becomes the install target
+# via UnattendedInstallConfig; tinq drops its own machine.install when it sees
+# that document. Proves the PR#5 plumbing (extraDisks, tpm, machineUUID,
+# install-by-array) + the mirror boots to a Ready single-node cluster.
+apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata:
+  name: kapa-venue
+  namespace: default
+spec:
+  site: venue
+  role: talos-cp
+  image: /tmp/opencode/talos-src/_out/metal-amd64-secureboot.iso
+  cpu: 4
+  memory: 4Gi
+  disk: 20Gi            # talos-system  — mirror member 1
+  extraDisks:
+    - 20Gi             # talos-extra-0 — mirror member 2
+    - 10Gi             # talos-extra-1 — DEDICATED encrypted-LVM data disk (2b isolation test)
+  tpm: true            # vTPM (swtpm) — required for TPM-sealed LUKS
+  secureBoot: true     # secure OVMF + smm=on + SMM-guarded pflash; blank vars store = setup mode
+  hostForwards:
+    - hostPort: 50000
+      guestPort: 50000
+    - hostPort: 6443
+      guestPort: 6443
+  # NOTE: spec.installerImage is IGNORED once UnattendedInstallConfig is present
+  # (tinq drops machine.install). The patched installer goes in the patch's own
+  # installer.image below.
+  registries:
+    - host: 10.0.2.2:5000
+      endpoint: http://10.0.2.2:5000
+  configPatches:
+    - |
+      apiVersion: v1alpha1
+      kind: RAIDArrayConfig
+      name: boot
+      level: raid1
+      metadata: "1.0"
+      provisioning:
+        volumeSelector:
+          match: disk.transport == "virtio" && disk.size >= 18u * GiB
+    - |
+      apiVersion: v1alpha1
+      kind: UnattendedInstallConfig
+      installer:
+        image: 10.0.2.2:5000/talos/installer:lvmfix4-secureboot
+      provisioning:
+        wipe: true
+        diskSelector:
+          match: '"/dev/disk/by-id/md-name-talos:boot" in disk.symlinks'
+    # --- Phase 2b (isolation): encrypted RawVolume -> LVM on a DEDICATED disk ---
+    # TPM-sealed LUKS raw partition on the 10Gi dedicated disk (talos-extra-1).
+    # Named "lvm" -> partition label "r-lvm" (RawVolumePrefix).
+    - |
+      apiVersion: v1alpha1
+      kind: RawVolumeConfig
+      name: lvm
+      encryption:
+        provider: luks2
+        keys:
+          - slot: 0
+            tpm:
+              # Fail loudly if SecureBoot is not actually ON at enrolment.
+              # Default PCR binding is PCR 7 (SecureBoot state), so a key
+              # sealed while it is off becomes unsealable once it is on.
+              checkSecurebootStatusOnEnroll: true
+      provisioning:
+        diskSelector:
+          match: '!system_disk && disk.size > 5u * GiB && disk.size < 15u * GiB'
+        minSize: 8GiB
+        maxSize: 8GiB
+    # LVM VG over the DECRYPTED device. Without #14145 the PV would be attempted
+    # on the LUKS ciphertext partition and the VG would never form.
+    - |
+      apiVersion: v1alpha1
+      kind: LVMVolumeGroupConfig
+      name: vg-pool
+      provisioning:
+        volumeSelector:
+          match: volume.partition_label.startsWith("r-lvm")
+    - |
+      apiVersion: v1alpha1
+      kind: LVMLogicalVolumeConfig
+      name: lv-data
+      type: linear
+      provisioning:
+        volumeGroup: vg-pool
+        maxSize: 4GiB

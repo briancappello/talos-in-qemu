@@ -1,0 +1,109 @@
+# RAID0 data-pool venue: models 2x 1TB as 2x 20Gi.
+#
+# NO RAIDArrayConfig. Mirroring the ESP buys nothing once the data pool is
+# RAID0 -- either drive failing loses the pool anyway -- so the md layer is
+# dropped entirely. That also removes the need for an upstream Talos patch,
+# since RAIDArrayConfig only supports raid1 while LVMLogicalVolumeConfig
+# already supports raid0.
+#
+# Layout:
+#   drive 1 (talos-system): EFI + META + STATE + EPHEMERAL(capped) + r-lvm0(grow)
+#   drive 2 (talos-extra-0): r-lvm1 (grow, whole disk)
+#   both LUKS/TPM -> vg-pool -> lv-data (raid0, 2 stripes)
+apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata:
+  name: kapa-venue
+  namespace: default
+spec:
+  site: venue
+  role: talos-cp
+  image: /tmp/opencode/talos-src/_out/metal-amd64-secureboot.iso
+  cpu: 4
+  memory: 4Gi
+  disk: 20Gi            # drive 1 — system + PV0
+  extraDisks:
+    - 20Gi              # drive 2 — PV1
+  tpm: true             # vTPM (swtpm) — TPM-sealed LUKS
+  secureBoot: true      # secure OVMF + smm=on; blank vars store = setup mode
+  hostForwards:
+    - hostPort: 50000
+      guestPort: 50000
+    - hostPort: 6443
+      guestPort: 6443
+  registries:
+    - host: 10.0.2.2:5000
+      endpoint: http://10.0.2.2:5000
+  configPatches:
+    # Install to drive 1 BY SERIAL. Both drives are the same size, so a size
+    # matcher is a coin flip between the OS target and the data drive.
+    - |
+      apiVersion: v1alpha1
+      kind: UnattendedInstallConfig
+      installer:
+        image: 10.0.2.2:5000/talos/installer:lvmfix4-secureboot
+      provisioning:
+        wipe: true
+        diskSelector:
+          match: disk.serial == "talos-system"
+    # Cap EPHEMERAL so the remainder of drive 1 is free for PV0.
+    # EVERY GiB HERE COSTS 2 GiB OF STRIPE: the striped LV is 2 x min(PV), and
+    # this is what shrinks the smaller PV.
+    - |
+      apiVersion: v1alpha1
+      kind: VolumeConfig
+      name: EPHEMERAL
+      provisioning:
+        maxSize: 4GiB
+    # PV0 — leftover of the system disk.
+    - |
+      apiVersion: v1alpha1
+      kind: RawVolumeConfig
+      name: lvm0
+      encryption:
+        provider: luks2
+        keys:
+          - slot: 0
+            tpm:
+              checkSecurebootStatusOnEnroll: true
+      provisioning:
+        diskSelector:
+          match: system_disk
+        # maxSize deliberately UNSET: "if not specified the volume can grow to
+        # the size of the disk". A size bound is still required, so minSize is
+        # the floor, not the target.
+        minSize: 1GiB
+    # PV1 — all of drive 2.
+    - |
+      apiVersion: v1alpha1
+      kind: RawVolumeConfig
+      name: lvm1
+      encryption:
+        provider: luks2
+        keys:
+          - slot: 0
+            tpm:
+              checkSecurebootStatusOnEnroll: true
+      provisioning:
+        diskSelector:
+          match: disk.serial == "talos-extra-0"
+        minSize: 1GiB
+    # r-lvm0 and r-lvm1 both match the existing prefix selector unchanged.
+    - |
+      apiVersion: v1alpha1
+      kind: LVMVolumeGroupConfig
+      name: vg-pool
+      provisioning:
+        volumeSelector:
+          match: volume.partition_label.startsWith("r-lvm")
+    # Striped across both PVs. Explicit size: a striped LV cannot take
+    # 100%VG across unequal PVs, since striping needs equal extents per leg.
+    - |
+      apiVersion: v1alpha1
+      kind: LVMLogicalVolumeConfig
+      name: lv-data
+      type: raid0
+      stripes: 2
+      provisioning:
+        volumeGroup: vg-pool
+        maxSize: 24GiB
