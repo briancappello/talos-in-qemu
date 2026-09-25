@@ -213,3 +213,51 @@ With the default pin, **no v1.14 image can install**, multi-node or not. The exa
 ### F3. The transcript named the default installer even when `installerImage` overrode it (fixed, Tier 3)
 
 Step 6 printed `installer: ghcr.io/siderolabs/installer:v1.14.1 (pinned to YOUR image)` while the config used the factory image. Fixed in `5d8427a`, pinned by `TestStep6NamesTheInstallerOverride`.
+
+## 7.2 Consumer Contract (homelab repository)
+
+Each item is a field name, a path or a command that the consumer can use as written.
+
+### Fields on `TalosMachine.spec` (VMs only)
+
+| Field | Required | Meaning |
+|---|---|---|
+| `clusterNetwork.cidr` | yes, with `clusterNetwork` | The segment, for example `10.254.0.0/24`. The same on every VM of the network. No default. |
+| `clusterNetwork.address` | yes, with `clusterNetwork` | This VM's address, with no prefix, for example `10.254.0.11`. |
+| `clusterNetwork.name` | no | The segment name within the site. Default `cluster`. |
+| `clusterNetwork.group`, `clusterNetwork.port` | no | Overrides of the derived multicast group (in `239.0.0.0/8`) and port. |
+| `joins` | no | `metadata.name` of the owner VM. Requires `clusterNetwork`. |
+| `hostname` | no | The Kubernetes node name. The same after `destroy` and `up`. |
+| `installerImage` | in practice, for Talos v1.14 (not enforced) | `factory.talos.dev/installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.14.1` (F2). |
+
+The CRD refuses `clusterNetwork`, `joins` and `hostname` beside `spec.baremetal`. The cluster network needs a Talos v1.14 or later ISO.
+
+### Files in the state directory
+
+The state directory is `<stateRoot>/<site>/<uid>/`. For a file-driven machine, `<uid>` is `bootstrap-<namespace>-<name>`. The default state root is `~/.hvf`.
+
+| File | Contents |
+|---|---|
+| `kubeconfig` | The cluster's admin kubeconfig. Its server is the owner's host forward, for example `https://127.0.0.1:6453`. Every member holds the same file. |
+| `cluster-endpoint` | The in-cluster API endpoint, for example `https://10.254.0.11:6443`. Only other VMs can reach it. It is not for the host. |
+| `talosconfig` | This node's Talos client configuration. Its endpoint is this node's own host forward. |
+| `machine.yaml` | The machine record that the site checks read. Do not edit it. |
+
+### Order of operations
+
+```sh
+tinq up <owner.yaml>                      # first, and alone
+tinq up <joiner.yaml>                     # then each joiner, one at a time
+tinq stop <any.yaml>                      # any member
+tinq up <owner.yaml>; tinq up <joiner.yaml> ...   # restart: owner first
+tinq destroy <joiner.yaml>                # leaves etcd first
+tinq destroy --with-joiners <owner.yaml>  # the whole cluster
+```
+
+A joiner's `up` refuses while the owner is down. Run one `up` or `destroy` at a time per site.
+
+### Required changes in the homelab repository
+
+- `homelab/cluster_context.py` must accept `spec.joins` for VM profiles. Today it refuses the field.
+- `topology.yml` and `environments/vm.yml` must declare the VM nodes, each with `clusterNetwork.address`, `hostname` and its own `hostForwards` ports.
+- For a two-node VM profile, do not expect fault tolerance. Use three nodes for the P4 and P7 rehearsals.

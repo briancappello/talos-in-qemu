@@ -50,8 +50,8 @@ Record the commands and sanitized results in `openspec/changes/add-vm-multinode-
 
 ## 7. Documentation And Hand-Back
 
-- [ ] 7.1 Add two- and three-node examples under `examples/`, and a README section covering the cluster network, the loopback multicast requirement and its check, the two-member quorum warning, and the lifecycle rules. Verify the examples with the same file validation `up` runs.
-- [ ] 7.2 Write the consumer contract into `evidence.md`, for the homelab repository. Verify that each item is a field name or command a consumer can use as written:
+- [x] 7.1 Add two- and three-node examples under `examples/`, and a README section covering the cluster network, the loopback multicast requirement and its check, the two-member quorum warning, and the lifecycle rules. Verify the examples with the same file validation `up` runs.
+- [x] 7.2 Write the consumer contract into `evidence.md`, for the homelab repository. Verify that each item is a field name or command a consumer can use as written:
   - the new fields;
   - where the in-cluster endpoint and kubeconfig live;
   - the order of `up` for owner and joiners;

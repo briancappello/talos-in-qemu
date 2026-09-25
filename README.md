@@ -556,6 +556,116 @@ leaving you to find out:
 machine's state directory, and `destroy` takes the whole state directory. This
 is a local development cluster, not a place to keep anything.
 
+## Several VMs, one cluster
+
+Two or three VMs on one Linux host can form one Talos cluster. Each node is a
+control-plane member. The examples are in `examples/multinode/`.
+
+Each VM has one user-mode NIC, and each NIC sits behind its own NAT at
+`10.0.2.15`. Two VMs cannot reach each other there. A VM with
+`spec.clusterNetwork` gets a second NIC on a shared L2 segment:
+
+- The segment is a QEMU multicast socket bound to `127.0.0.1`. It needs no
+  root and no bridge, and its traffic does not leave the host.
+- The multicast group and port come from `site` and the network name. Two
+  sites on one host get different segments.
+- Each VM declares a static address on the segment. Kubernetes (`InternalIP`),
+  etcd (peer URLs) and Flannel use that address.
+- The first NIC keeps DHCP, egress and the host forwards.
+
+```yaml
+spec:
+  site: multinode
+  image: talos-v1.14.1-amd64.iso     # the cluster network needs Talos v1.14 or later
+  hostname: cp1                      # optional: the Kubernetes node name
+  joins: cp0                         # only on the second and third VM
+  clusterNetwork:
+    cidr: 10.254.0.0/24              # required, and the same on every VM
+    address: 10.254.0.12             # this VM
+  hostForwards:                      # its own host ports, different on every VM
+    - {hostPort: 50011, guestPort: 50000}
+    - {hostPort: 6454,  guestPort: 6443}
+```
+
+The first VM owns the cluster. A VM with `spec.joins` takes the owner's secrets
+bundle, its in-cluster endpoint and its kubeconfig from the owner's state
+directory. It never creates secrets of its own, and it never bootstraps etcd.
+
+**Two members give no fault tolerance.** etcd needs a majority, and one of two
+is not a majority. Use two nodes for scheduling and isolation tests. Use three
+nodes to test the loss of a node.
+
+**The Talos v1.14 installer.** `ghcr.io/siderolabs/installer` has no v1.14
+tags, so the default installer cannot install a v1.14 image. The examples set
+`installerImage` to the Image Factory installer with no extensions.
+
+### Bring a cluster up
+
+1. Make sure that loopback carries multicast. The list must not be empty:
+
+   ```sh
+   ip maddr show lo
+   ```
+
+2. Bring up the owner:
+
+   ```sh
+   tinq up examples/multinode/cp0.yaml
+   ```
+
+3. Bring up each joiner, one at a time:
+
+   ```sh
+   tinq up examples/multinode/cp1.yaml
+   tinq up examples/multinode/cp2.yaml
+   ```
+
+4. Use the kubeconfig of any member. All members share one kubeconfig, and its
+   server is the owner's host forward:
+
+   ```sh
+   export KUBECONFIG=~/.hvf/multinode/bootstrap-default-cp0/kubeconfig
+   kubectl get nodes -o wide
+   ```
+
+Before a joiner boots, `up` makes sure that:
+
+- The owner's VM runs and its Kubernetes API answers.
+- The segment carries frames. `tinq` sends an ARP request for the owner's
+  address on the multicast group, and the owner must reply.
+- The running VMs of the site, plus the joiner, declare no more than 85% of
+  the host memory.
+
+`up` refuses before anything is created if one of these is false. The error
+message names the cause, so a joiner does not wait out an etcd timeout.
+
+`up` also refuses these machine files before it creates anything: an address
+outside the CIDR, a CIDR that overlaps `10.0.2.0/24` or the pod or service
+CIDR, two VMs with one address, two VMs with different CIDRs on one network,
+and two VMs of a site with the same host port.
+
+### Stop, start and destroy
+
+- **`stop`** works on any member. If you stop one of two members, the control
+  plane stops. If you stop one of three, the cluster keeps quorum.
+- **`up`** on a stopped cluster: start the owner first, then each joiner. A
+  joiner refuses to start while its owner is down.
+- **`destroy` on a joiner** removes its etcd member and its Kubernetes node
+  first, then destroys the VM. A running joiner leaves etcd by itself. A
+  stopped joiner is removed through a member that runs. If this is not
+  possible, `destroy` refuses. `--force` destroys the VM anyway. Then remove
+  the member by hand with `talosctl etcd remove-member`.
+- **`destroy` on the owner** refuses while joiners exist.
+  `destroy --with-joiners` destroys each joiner first, then the owner.
+  `--force` destroys the owner alone, and the joiners become orphans.
+
+Run one `up` or `destroy` at a time per site. The checks read the state
+directories of the site, and two runs at the same time can both pass.
+
+**Security.** Any local process can join the multicast group, and it can read
+or inject frames on the segment. This is acceptable on a single-user
+development host. Do not use the cluster network on a shared host.
+
 ## `adopt` — a node TinQ did not create
 
 *Verified against a QEMU node published on a LAN address. **Not yet run on
@@ -817,8 +927,15 @@ Working and exercised:
   `kubectl` reaching it. Both disk refusals fired; a PVC bound onto the
   serial-selected data disk (`/dev/vdc1`). This rehearses everything hardware
   needs except a real NIC and disk serials TinQ did not choose
+- **Several VMs, one cluster** on Linux/KVM with Talos v1.14.1: two and three
+  control-plane members, cross-node pod traffic, quorum after the loss of the
+  owner, and `destroy` of members down to one. The commands and results are in
+  `openspec/changes/add-vm-multinode-cluster/evidence.md`
 
 Not yet exercised:
+
+- **Several VMs, one cluster, on macOS.** QEMU's multicast socket on `lo0` has
+  not been run there
 
 - **`adopt` against physical hardware.** Nothing in this branch has met a
   machine that is not a VM. The rehearsal above is deliberately as close as a

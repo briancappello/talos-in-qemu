@@ -406,3 +406,28 @@ func TestUpOptionsRefusesNodeIdentityOnAnOldImage(t *testing.T) {
 		})
 	}
 }
+
+// The shipped examples pass the same file checks `up` runs, as one site: each
+// machine is recorded as the previous one would be, so a collision between
+// them (an address, a host port, a CIDR) fails here.
+func TestMultinodeExamplesPassTheSiteChecks(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir()}
+
+	for _, name := range []string{"cp0", "cp1", "cp2"} {
+		m, err := readMachine(filepath.Join("..", "..", "examples", "multinode", name+".yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := h.checkSite(m); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+
+		cn, hostname, err := nodeIdentity(m)
+		if err != nil || cn == nil || hostname != name {
+			t.Fatalf("%s: identity = %+v, %q, %v", name, cn, hostname, err)
+		}
+
+		seed(t, h, m)
+	}
+}
