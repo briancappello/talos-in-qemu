@@ -34,10 +34,10 @@
 
 ## 5. Hostname And Lifecycle
 
-- [ ] 5.1 Render `spec.hostname`. Verify live that the Kubernetes node name matches, and that it survives `destroy` and `up`.
+- [x] 5.1 Render `spec.hostname`. Verify live that the Kubernetes node name matches, and that it survives `destroy` and `up`.
 - [x] 5.2 `up` on a joiner refuses while the owner is not Running with an answering API. Verify with a unit test using a fake owner state.
 - [x] 5.3 `destroy` on a joiner removes the etcd member before destroying the VM. `destroy` on an owner refuses while joiners exist, unless the explicit flag is given. Verify both with unit tests, and live with a two-node cluster: etcd shows one member afterwards and API writes succeed.
-- [ ] 5.4 Add the host memory check before a joiner boots. Verify with a unit test using an injected `MemTotal`.
+- [x] 5.4 Add the host memory check before a joiner boots. Verify with a unit test using an injected `MemTotal`.
 
 ## 6. Live Acceptance On Linux
 

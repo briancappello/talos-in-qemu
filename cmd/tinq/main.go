@@ -74,6 +74,9 @@ type hvf struct {
 	// members are the etcd and Kubernetes calls destroy makes on a cluster of
 	// several VMs. nil means the real ones (see lifecycle.go).
 	members *memberOps
+	// memTotal is the host's memory in MiB. nil means the real reading (see
+	// capacity.go).
+	memTotal func() (int, error)
 }
 
 func main() {

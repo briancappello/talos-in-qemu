@@ -264,6 +264,61 @@ spec:
 func healthyOwner(h *hvf) {
 	h.ownerUp = func(siteMachine, []byte) error { return nil }
 	h.probeSegment = func(netip.Addr, int, netip.Addr) error { return nil }
+	h.memTotal = func() (int, error) { return 64 << 10, nil }
+}
+
+// 5.4: the site's RUNNING VMs plus the joiner, against 85% of host memory.
+// Stopped VMs hold no RAM and are not counted.
+func TestVMJoinerRefusesToOvercommitTheHost(t *testing.T) {
+	g := newGoldenHost(t, "talos.iso")
+	healthyOwner(g.h)
+	g.h.memTotal = func() (int, error) { return 4096, nil } // limit 3481 MiB
+
+	owner := netMachine(t, "cp0", 50000, ownerNet) // 2Gi, running
+	seedOwner(t, g.h, owner, allArtifacts)
+	member(t, g.h, owner, true)
+
+	stopped := netMachine(t, "cp9", 50009, "cidr: 10.254.0.0/24\naddress: 10.254.0.19\n") // 2Gi, stopped
+	member(t, g.h, stopped, false)
+
+	m := joiner(t, g, joinerNet) // 2Gi: 2048 + 2048 = 4096 > 3481
+
+	_, err := upOptions(g.h, m, driverkit.Absent, nil)
+	if err == nil {
+		t.Fatal("a joiner that overcommits the host was accepted")
+	}
+
+	for _, want := range []string{"4096 MiB", "3481 MiB", "85%", "cp0", "cp1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not print %q:\n%v", want, err)
+		}
+	}
+
+	if strings.Contains(err.Error(), "cp9") {
+		t.Errorf("a stopped VM was counted:\n%v", err)
+	}
+
+	if _, statErr := os.Stat(g.h.dir(m)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Error("the joiner's state directory exists after the refusal")
+	}
+
+	// With room for it, the same joiner is accepted.
+	g.h.memTotal = func() (int, error) { return 8192, nil }
+
+	if _, err := upOptions(g.h, m, driverkit.Absent, nil); err != nil {
+		t.Errorf("a joiner that fits was refused: %v", err)
+	}
+}
+
+func TestHostMemTotalReadsThisHost(t *testing.T) {
+	mb, err := hostMemTotalMB()
+	if err != nil {
+		t.Skip(err)
+	}
+
+	if mb < 256 {
+		t.Errorf("hostMemTotalMB = %d MiB, implausibly small", mb)
+	}
 }
 
 // 5.2: a joiner does not start before its owner. The owner being RECORDED is

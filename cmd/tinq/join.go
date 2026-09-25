@@ -161,6 +161,12 @@ func vmJoinOptions(h *hvf, m *unstructured.Unstructured) (*cluster.JoinOptions, 
 		return nil, fmt.Errorf("cluster network %q: %w", cn.Name, err)
 	}
 
+	// Last, because it is the one refusal an operator answers by changing
+	// THIS machine's file rather than by starting another.
+	if err := h.checkCapacity(m); err != nil {
+		return nil, err
+	}
+
 	return join, nil
 }
 
