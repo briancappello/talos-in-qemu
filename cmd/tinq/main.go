@@ -71,6 +71,9 @@ type hvf struct {
 	// substitute them because the real ones need a running VM.
 	ownerUp      func(owner siteMachine, kubeconfig []byte) error
 	probeSegment func(group netip.Addr, port int, target netip.Addr) error
+	// members are the etcd and Kubernetes calls destroy makes on a cluster of
+	// several VMs. nil means the real ones (see lifecycle.go).
+	members *memberOps
 }
 
 func main() {
@@ -187,9 +190,27 @@ func newRootCmd() *cobra.Command {
 			"Idempotent — already-gone is success, and a merely stopped machine is\n" +
 			"destroyed too, since it still has disks to sweep. Works with no usable\n" +
 			"accelerator and no reachable node: teardown must not require a live\n" +
-			"hypervisor.",
+			"hypervisor.\n\n" +
+			"On a cluster of several VMs: a machine with spec.joins leaves etcd before\n" +
+			"it is destroyed, so the cluster keeps its quorum. The machine other VMs\n" +
+			"joined is refused while they exist; --with-joiners destroys them first.\n" +
+			"--force destroys regardless, orphaning joiners or leaving a member in etcd.",
 		Args: cobra.ExactArgs(1),
-		RunE: runVerb("destroy"),
+	}
+
+	var destroyOpts destroyOptions
+
+	destroy.Flags().BoolVar(&destroyOpts.withJoiners, "with-joiners", false,
+		"also destroy the machines that joined this one, each leaving etcd first")
+	destroy.Flags().BoolVar(&destroyOpts.force, "force", false,
+		"destroy even if joiners are orphaned or the etcd member cannot be removed")
+	destroy.RunE = func(cmd *cobra.Command, args []string) error {
+		d, err := newDriver()
+		if err != nil {
+			return err
+		}
+
+		return destroyMachine(cmd.Context(), d, args[0], destroyOpts)
 	}
 
 	up := &cobra.Command{
