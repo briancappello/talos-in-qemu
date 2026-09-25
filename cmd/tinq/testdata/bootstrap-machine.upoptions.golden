@@ -1,0 +1,20 @@
+{
+  "ClusterName": "clvc-cp0"
+  "StateDir": "<STATE_ROOT>/clvc-local/bootstrap-default-clvc-cp0"
+  "TalosEndpoint": "127.0.0.1:50000"
+  "KubeEndpoint": "https://127.0.0.1:6443"
+  "SystemDisk": {"Serial":"talos-system","WWID":"","DevPath":""}
+  "DataDiskSerial": "talos-data"
+  "EphemeralMaxSize": ""
+  "InstallerImage": ""
+  "TalosVersion": ""
+  "VersionSource": "talos-v1.13.7-amd64.iso (ISO volume id)"
+  "Substrate": "linux/amd64, kvm, <FIRMWARE>/fake-qemu"
+  "ConsoleArg": "console=ttyS0"
+  "DisableKexec": false
+  "Network": null
+  "Registries": null
+  "ConfigPatches": null
+  "KubernetesVersion": ""
+  "Join": null
+}
