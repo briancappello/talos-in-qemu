@@ -582,6 +582,15 @@ func Up(ctx context.Context, opts UpOptions) error {
 		return fail(err)
 	}
 
+	// Talos renders the kubeconfig against the CONTROL-PLANE endpoint, which on
+	// a cluster network is an address only other guests can reach. The host's
+	// way in is its forward, and the certificate names both (hostSANs).
+	if opts.ClusterNetwork != nil {
+		if kubeconfig, err = KubeconfigWithServer(kubeconfig, opts.KubeEndpoint); err != nil {
+			return fail(err)
+		}
+	}
+
 	if err := writeArtifacts(opts.StateDir, map[string][]byte{"kubeconfig": kubeconfig}); err != nil {
 		return fail(err)
 	}
@@ -649,15 +658,22 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 	// that IS the cluster and wrong for every node added after it: a joining
 	// node pointed at itself looks for a control plane that will not exist
 	// until it has already joined one.
-	endpoint := opts.KubeEndpoint
-	// The existing PKI, when there is one. Empty for a create, and
-	// GenerateConfig mints a fresh bundle exactly as before.
-	var secrets []byte
+	//
+	// And on a cluster network, the node's CLUSTER address rather than the
+	// host forward: see controlPlaneEndpoint.
+	var (
+		joinEndpoint string
+		// The existing PKI, when there is one. Empty for a create, and
+		// GenerateConfig mints a fresh bundle exactly as before.
+		secrets []byte
+	)
 
 	if opts.Join != nil {
-		endpoint = opts.Join.ClusterEndpoint
+		joinEndpoint = opts.Join.ClusterEndpoint
 		secrets = opts.Join.SecretsBundle
 	}
+
+	endpoint := controlPlaneEndpoint(opts.KubeEndpoint, opts.ClusterNetwork, joinEndpoint)
 
 	generated, err := hooks.generateConfig(ConfigInput{
 		ClusterName: opts.ClusterName,
@@ -683,9 +699,10 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 		// The address a client dials AFTER the install is derived from this
 		// block by the caller, so the certificate above and the address below
 		// cannot name two different hosts.
-		Network:        opts.Network,
-		ClusterNetwork: opts.ClusterNetwork,
-		Hostname:       opts.Hostname,
+		Network:              opts.Network,
+		ClusterNetwork:       opts.ClusterNetwork,
+		Hostname:             opts.Hostname,
+		ExtraSubjectAltNames: hostSANs(opts.KubeEndpoint, opts.ClusterNetwork),
 		// Dropped here, the node pulls every image from the internet and
 		// succeeds at doing it — which is why nothing downstream would notice:
 		// the failure is an image that exists ONLY on the mirror, days later,
@@ -697,13 +714,24 @@ func configure(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, 
 		return nil, err
 	}
 
-	// Written before the config is applied: if the apply fails, the artifacts
-	// that explain WHY are already on disk.
-	if err := writeArtifacts(opts.StateDir, map[string][]byte{
+	artifacts := map[string][]byte{
 		"controlplane.yaml": generated.ControlPlane,
 		"talosconfig":       generated.Talosconfig,
 		"secrets.yaml":      generated.Secrets,
-	}); err != nil {
+	}
+
+	// The endpoint a node JOINING this cluster must use. It cannot be read
+	// back from the kubeconfig: for a node on a cluster network that names the
+	// host forward, 127.0.0.1, which inside a joining guest is the guest itself.
+	// Written by every node on a cluster network, so any member can be named
+	// as the one to join.
+	if opts.ClusterNetwork != nil {
+		artifacts[ClusterEndpointArtifact] = []byte(endpoint + "\n")
+	}
+
+	// Written before the config is applied: if the apply fails, the artifacts
+	// that explain WHY are already on disk.
+	if err := writeArtifacts(opts.StateDir, artifacts); err != nil {
 		return nil, err
 	}
 
@@ -1201,11 +1229,20 @@ func joined(ctx context.Context, hooks *upHooks, opts UpOptions, p *printer, ins
 	// THIS node, by address. See WaitNodeReadyAt: the "every node is Ready"
 	// wait is satisfied by the cluster's EXISTING nodes and would return before
 	// this machine had registered at all.
-	if err := hooks.waitNodeReadyAt(ctx, opts.Join.Kubeconfig, installedAddr, nodeReadyTimeout); err != nil {
+	//
+	// The address the node REGISTERS with, which on a cluster network is its
+	// cluster address: installedAddr is then a host forward, 127.0.0.1, and no
+	// node's InternalIP is that.
+	nodeAddr := installedAddr
+	if opts.ClusterNetwork != nil {
+		nodeAddr = opts.ClusterNetwork.Address.Addr().String()
+	}
+
+	if err := hooks.waitNodeReadyAt(ctx, opts.Join.Kubeconfig, nodeAddr, nodeReadyTimeout); err != nil {
 		return err
 	}
 
-	p.step("kubeconfig", "wrote the cluster's kubeconfig, node %s Ready after %s", installedAddr, took(started))
+	p.step("kubeconfig", "wrote the cluster's kubeconfig, node %s Ready after %s", nodeAddr, took(started))
 
 	// ── 10/10 storage ───────────────────────────────────────────────────────
 	//

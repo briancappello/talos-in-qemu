@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -201,6 +202,11 @@ type ConfigInput struct {
 	// node name, or "" to let Talos generate one as before. Needs Talos v1.14
 	// or later.
 	Hostname string
+	// ExtraSubjectAltNames are further names for both certificates. Set for a
+	// node on a cluster network, whose host forward is no longer the endpoint
+	// and so is not named automatically. Empty means none, and a config
+	// identical to before the field existed.
+	ExtraSubjectAltNames []string
 	// Registries are image registry mirrors. Empty means the node pulls only
 	// from upstream, which is the correct default: a mirror that is not
 	// running turns every image pull into a timeout, so one is configured only
@@ -388,6 +394,21 @@ func GenerateConfig(in ConfigInput) (*Generated, error) {
 	if in.ClusterNetwork != nil {
 		genOpts = append(genOpts, generate.WithAdditionalSubjectAltNames(
 			[]string{in.ClusterNetwork.Address.Addr().String()}))
+	}
+
+	// Deduplicated against APIAddress: under QEMU the Talos and Kubernetes
+	// forwards usually share 127.0.0.1, and a certificate listing a name twice
+	// is noise in every diff of the config.
+	var extra []string
+
+	for _, san := range in.ExtraSubjectAltNames {
+		if san != in.APIAddress && !slices.Contains(extra, san) {
+			extra = append(extra, san)
+		}
+	}
+
+	if len(extra) > 0 {
+		genOpts = append(genOpts, generate.WithAdditionalSubjectAltNames(extra))
 	}
 
 	// THE EXISTING PKI, when there is one. Everything above describes a machine

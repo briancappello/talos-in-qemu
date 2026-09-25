@@ -96,23 +96,12 @@ func Reconfigure(ctx context.Context, opts ReconfigureOptions) ([]byte, error) {
 		return nil, err
 	}
 
-	generated, err := GenerateConfig(ConfigInput{
-		ClusterName:      opts.ClusterName,
-		Endpoint:         opts.KubeEndpoint,
-		APIAddress:       opts.APIAddress,
-		TalosVersion:     version,
-		ConsoleArg:       opts.ConsoleArg,
-		SystemDisk:       opts.SystemDisk,
-		DataDiskSerial:   opts.DataDiskSerial,
-		EphemeralMaxSize: opts.EphemeralMaxSize,
-		DisableKexec:     opts.DisableKexec,
-		Network:          opts.Network,
-		ClusterNetwork:   opts.ClusterNetwork,
-		Hostname:         opts.Hostname,
-		Registries:       opts.Registries,
-		ConfigPatches:    opts.ConfigPatches,
-		SecretsBundle:    secretsBundle,
-	})
+	in, err := reconfigureInput(opts, version, secretsBundle)
+	if err != nil {
+		return nil, err
+	}
+
+	generated, err := GenerateConfig(in)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +144,45 @@ func Reconfigure(ctx context.Context, opts ReconfigureOptions) ([]byte, error) {
 	}
 
 	return generated.ControlPlane, nil
+}
+
+// reconfigureInput is the ConfigInput a reconfigure regenerates from. It must
+// match what Up generated for the same machine, or the "regeneration" is a
+// change nobody asked for.
+//
+// THE ENDPOINT THE NODE WAS INSTALLED WITH, for a node on a cluster network:
+// Up recorded it in the state dir, and for a joiner it is the owner's address,
+// which nothing in this machine's own manifest names. Otherwise the caller's
+// KubeEndpoint, which for a joined hardware node the caller has already
+// resolved to the cluster's.
+func reconfigureInput(opts ReconfigureOptions, version string, secretsBundle []byte) (ConfigInput, error) {
+	endpoint := opts.KubeEndpoint
+
+	if opts.ClusterNetwork != nil {
+		var err error
+		if endpoint, err = ReadClusterEndpoint(opts.StateDir); err != nil {
+			return ConfigInput{}, err
+		}
+	}
+
+	return ConfigInput{
+		ClusterName:          opts.ClusterName,
+		Endpoint:             endpoint,
+		APIAddress:           opts.APIAddress,
+		TalosVersion:         version,
+		ConsoleArg:           opts.ConsoleArg,
+		SystemDisk:           opts.SystemDisk,
+		DataDiskSerial:       opts.DataDiskSerial,
+		EphemeralMaxSize:     opts.EphemeralMaxSize,
+		DisableKexec:         opts.DisableKexec,
+		Network:              opts.Network,
+		ClusterNetwork:       opts.ClusterNetwork,
+		Hostname:             opts.Hostname,
+		ExtraSubjectAltNames: hostSANs(opts.KubeEndpoint, opts.ClusterNetwork),
+		Registries:           opts.Registries,
+		ConfigPatches:        opts.ConfigPatches,
+		SecretsBundle:        secretsBundle,
+	}, nil
 }
 
 // applyToRunningNode applies a config over the AUTHENTICATED API.

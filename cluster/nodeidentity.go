@@ -3,7 +3,12 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/siderolabs/talos/pkg/machinery/cel"
 	"github.com/siderolabs/talos/pkg/machinery/cel/celenv"
@@ -30,6 +35,78 @@ type ClusterNetwork struct {
 	// HardwareAddr is the MAC of the NIC on that segment. The link is selected
 	// by it, never by name, for the same reason Network.HardwareAddr is.
 	HardwareAddr string
+}
+
+// kubeAPIPort is kube-apiserver's port on the node itself. The in-cluster
+// endpoint names it directly: other nodes dial the node, not a host forward.
+const kubeAPIPort = "6443"
+
+// InClusterEndpoint is the Kubernetes API endpoint other nodes use to reach
+// this node's API server: its cluster address on 6443.
+func (cn *ClusterNetwork) InClusterEndpoint() string {
+	return "https://" + net.JoinHostPort(cn.Address.Addr().String(), kubeAPIPort)
+}
+
+// ClusterEndpointArtifact is the state-dir file holding the in-cluster API
+// endpoint of a node on a cluster network. Joiners read it; the kubeconfig
+// cannot stand in for it, because its server is the host's forward.
+const ClusterEndpointArtifact = "cluster-endpoint"
+
+// ReadClusterEndpoint reads ClusterEndpointArtifact from a state directory.
+func ReadClusterEndpoint(stateDir string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(stateDir, ClusterEndpointArtifact))
+	if err != nil {
+		return "", fmt.Errorf("reading the in-cluster API endpoint: %w\n\n"+
+			"  %s is written by `tinq up` for every node on a cluster network. Without it the\n"+
+			"  endpoint the node was installed with is unknown, and guessing it would point\n"+
+			"  the node at an address its peers may not serve", err, ClusterEndpointArtifact)
+	}
+
+	endpoint := strings.TrimSpace(string(b))
+
+	if u, err := url.Parse(endpoint); err != nil || u.Scheme != "https" || u.Hostname() == "" {
+		return "", fmt.Errorf("%s in %s holds %q, which is not an https:// URL with a host",
+			ClusterEndpointArtifact, stateDir, endpoint)
+	}
+
+	return endpoint, nil
+}
+
+// controlPlaneEndpoint is the cluster.controlPlane.endpoint written into the
+// machine config. ONE derivation, used by Up and by Reconfigure, so a
+// reconfigure regenerates exactly the endpoint the node was installed with.
+//
+//   - A joining node points at the cluster it joins, never at itself.
+//   - A node on a cluster network points at its own cluster address: the
+//     host forward kubeEndpoint names is 127.0.0.1 inside every guest, which is
+//     the guest itself, so no other node could reach the API there.
+//   - Otherwise the endpoint is kubeEndpoint, as it always was.
+func controlPlaneEndpoint(kubeEndpoint string, cn *ClusterNetwork, joinEndpoint string) string {
+	switch {
+	case joinEndpoint != "":
+		return joinEndpoint
+	case cn != nil:
+		return cn.InClusterEndpoint()
+	default:
+		return kubeEndpoint
+	}
+}
+
+// hostSANs are the extra certificate names a node on a cluster network needs:
+// the HOST keeps reaching its API through the forward in kubeEndpoint, which is
+// no longer the control-plane endpoint and so is not named automatically.
+// Empty for a node without a cluster network, whose endpoint IS the forward.
+func hostSANs(kubeEndpoint string, cn *ClusterNetwork) []string {
+	if cn == nil {
+		return nil
+	}
+
+	u, err := url.Parse(kubeEndpoint)
+	if err != nil || u.Hostname() == "" {
+		return nil
+	}
+
+	return []string{u.Hostname()}
 }
 
 // clusterLinkName is the Talos-side alias of the cluster NIC. It names the

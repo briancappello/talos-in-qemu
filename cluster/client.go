@@ -585,3 +585,35 @@ func EndpointFromKubeconfig(kubeconfig []byte) (string, error) {
 
 	return entry.Server, nil
 }
+
+// KubeconfigWithServer returns the kubeconfig with its current context's
+// cluster server replaced by server. Everything else — the CA, the client
+// certificate — is kept: the API server's certificate names both addresses.
+//
+// The kubeconfig is SECRET; a parse failure goes through errSecretParse.
+func KubeconfigWithServer(kubeconfig []byte, server string) ([]byte, error) {
+	cfg, err := clientcmd.Load(kubeconfig)
+	if err != nil {
+		return nil, errSecretParse("kubeconfig")
+	}
+
+	context, ok := cfg.Contexts[cfg.CurrentContext]
+	if !ok {
+		return nil, errors.New("the kubeconfig names no current context, so its server cannot be pointed at the host forward")
+	}
+
+	entry, ok := cfg.Clusters[context.Cluster]
+	if !ok {
+		return nil, fmt.Errorf("the kubeconfig's current context names cluster %q, which it does not define",
+			context.Cluster)
+	}
+
+	entry.Server = server
+
+	out, err := clientcmd.Write(*cfg)
+	if err != nil {
+		return nil, errors.New("re-encoding the kubeconfig failed")
+	}
+
+	return out, nil
+}
