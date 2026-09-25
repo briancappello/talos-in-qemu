@@ -34,7 +34,7 @@ const defaultClusterNetworkName = "cluster"
 // slirpNet is QEMU user-mode networking's guest segment. Every guest's first
 // NIC sits on it at 10.0.2.15, so a cluster network overlapping it would give
 // the node two routes to one prefix.
-var slirpNet = netip.MustParsePrefix("10.0.2.0/24")
+var slirpNet = cluster.UserModeNetwork
 
 // clusterNetwork is a parsed spec.clusterNetwork.
 type clusterNetwork struct {

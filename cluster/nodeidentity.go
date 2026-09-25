@@ -126,6 +126,10 @@ const (
 	egressLinkName  = "egress0"
 )
 
+// UserModeNetwork is QEMU user-mode networking's guest segment: every guest's
+// first NIC is 10.0.2.15 on it, and every host forward lands there.
+var UserModeNetwork = netip.MustParsePrefix("10.0.2.0/24")
+
 // errNeedsDocumentModel refuses a node identity feature on an image whose
 // Talos version predates the document model it is written in.
 func errNeedsDocumentModel(field, version string) error {
@@ -211,6 +215,24 @@ func withNodeIdentity(cfg config.Provider, in ConfigInput) (config.Provider, err
 				// node, and routes out of the cluster NIC everywhere.
 				d.FlannelExtraArgs = append(d.FlannelExtraArgs,
 					"--iface-can-reach="+in.ClusterNetwork.Address.Masked().Addr().String())
+				doc = d
+			}
+		case *k8s.KubeProxyConfigV1Alpha1:
+			if in.ClusterNetwork != nil {
+				d = d.DeepCopy()
+				// kube-proxy (nftables) serves NodePorts only on the node's
+				// PRIMARY address, which the cluster network makes 10.254.x.
+				// The host forwards land on the user-mode NIC instead, so a
+				// forwarded NodePort (ingress) answered nothing. Name both.
+				// A single-node VM never showed it: its primary address WAS
+				// the user-mode one. A config patch APPENDS to this list
+				// (machinery merges lists), so consumers must not restate it.
+				if d.ProxyConfig.Object == nil {
+					d.ProxyConfig.Object = map[string]any{}
+				}
+				d.ProxyConfig.Object["nodePortAddresses"] = []any{
+					in.ClusterNetwork.Address.Masked().String(), UserModeNetwork.String(),
+				}
 				doc = d
 			}
 		case *network.HostnameConfigV1Alpha1:

@@ -228,3 +228,58 @@ func TestClusterNetworkKeepsDHCPOnTheEgressNIC(t *testing.T) {
 		t.Errorf("a cluster network without the egress MAC = %v, want a refusal", redactErr(err))
 	}
 }
+
+// The host forwards land on the user-mode NIC. kube-proxy in nftables mode
+// serves NodePorts only on the primary address, which the cluster network
+// makes 10.254.x, so a forwarded NodePort (ingress) answered nothing until
+// both segments were named. Measured live on a three-node v1.14.1 cluster.
+func TestClusterNetworkServesNodePortsOnBothNICs(t *testing.T) {
+	proxies := docOf[*k8s.KubeProxyConfigV1Alpha1](t, loaded(t, networkedInput()))
+	if len(proxies) != 1 {
+		t.Fatalf("want one KubeProxyConfig, got %d", len(proxies))
+	}
+
+	got, _ := proxies[0].ProxyConfig.Object["nodePortAddresses"].([]any)
+	want := []any{"10.254.0.0/24", "10.0.2.0/24"}
+	if !slices.Equal(got, want) {
+		t.Errorf("kube-proxy nodePortAddresses = %v, want %v", got, want)
+	}
+
+	// EDITED, not replaced: machinery's image survives.
+	if proxies[0].ProxyImage == "" {
+		t.Error("the kube-proxy image is gone from KubeProxyConfig")
+	}
+}
+
+func TestSingleNodeLeavesKubeProxyAlone(t *testing.T) {
+	in := networkedInput()
+	in.ClusterNetwork = nil
+	in.Endpoint = "https://127.0.0.1:6443"
+
+	for _, p := range docOf[*k8s.KubeProxyConfigV1Alpha1](t, loaded(t, in)) {
+		if _, set := p.ProxyConfig.Object["nodePortAddresses"]; set {
+			t.Errorf("a single-node VM got nodePortAddresses %v; its primary address is already the forwarded one",
+				p.ProxyConfig.Object["nodePortAddresses"])
+		}
+	}
+}
+
+// A consumer patch does NOT replace the list: machinery's merge APPENDS list
+// values. So a consumer must not restate these addresses (it would duplicate
+// them), and to remove one it needs a `$patch: delete`-style replacement, not a
+// plain patch. Pinned so the comment above stays true.
+func TestAConfigPatchAppendsToNodePortAddresses(t *testing.T) {
+	in := networkedInput()
+	in.ConfigPatches = []string{"apiVersion: v1alpha1\nkind: KubeProxyConfig\nconfig:\n  nodePortAddresses:\n    - 192.0.2.0/24\n"}
+
+	proxies := docOf[*k8s.KubeProxyConfigV1Alpha1](t, loaded(t, in))
+	if len(proxies) != 1 {
+		t.Fatalf("want one KubeProxyConfig, got %d", len(proxies))
+	}
+
+	got, _ := proxies[0].ProxyConfig.Object["nodePortAddresses"].([]any)
+	want := []any{"10.254.0.0/24", "10.0.2.0/24", "192.0.2.0/24"}
+	if !slices.Equal(got, want) {
+		t.Errorf("after the patch nodePortAddresses = %v, want %v", got, want)
+	}
+}

@@ -256,6 +256,12 @@ tinq destroy --with-joiners <owner.yaml>  # the whole cluster
 
 A joiner's `up` refuses while the owner is down. Run one `up` or `destroy` at a time per site.
 
+### Behaviour a consumer can rely on (found by the homelab consumer)
+
+- **Forwarded NodePorts work.** With `clusterNetwork`, tinq sets kube-proxy `nodePortAddresses` to the cluster segment and `10.0.2.0/24`, so a host forward to a NodePort (ingress) reaches it. kube-proxy in nftables mode otherwise serves NodePorts only on the primary address, which the cluster network makes 10.254.x. Do not restate the addresses in a config patch: machinery APPENDS list values, so they would appear twice.
+- **`tinq stop` waits up to 3 minutes** for Talos's own shutdown sequence (cordon and drain, then the kubelet's graceful node shutdown) before escalating. Measured on the three-node cluster: drain 28s, kubelet 22s, power-off phase at 51.5s; the former 60s budget escalated to SIGTERM on every stop of a node that ran workloads.
+- **Known limit:** `tinq controller` reconciles serially, so one stopping machine holds the loop for up to ~3m25s. The file verbs are unaffected. See the note on `driverkit.Run`.
+
 ### Required changes in the homelab repository
 
 - `homelab/cluster_context.py` must accept `spec.joins` for VM profiles. Today it refuses the field.

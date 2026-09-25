@@ -807,7 +807,16 @@ func (h *hvf) Stop(ctx context.Context, m *unstructured.Unstructured) error {
 }
 
 const (
-	gracefulStopTimeout = 60 * time.Second
+	// Long enough for Talos's OWN shutdown sequence, which runs before the
+	// power-off: cordon and drain (bounded by Talos), then the kubelet's
+	// graceful node shutdown (shutdownGracePeriod, 30s + 10s for critical pods
+	// by default). Measured on a three-node v1.14.1 cluster with ordinary
+	// workloads: drain 28s, kubelet 22s, power-off phase reached at 51.5s -- so
+	// 60s escalated to SIGTERM on every stop of a node that ran anything, a
+	// power cut announced as a graceful stop. A single idle node never showed
+	// it. Three minutes covers the sequence with headroom; a guest that needs
+	// more is wedged, and the ladder below still gets it.
+	gracefulStopTimeout = 3 * time.Minute
 	sigtermTimeout      = 5 * time.Second
 	// How often waitGone re-asks, and therefore the WORST-CASE latency of a
 	// Ctrl-C landing mid-wait. Shortening it makes cancellation crisper and
@@ -970,7 +979,7 @@ func halt(ctx context.Context, pid int, dir string) error {
 // The poll is a select on ctx.Done(), not time.Sleep, because a sleeping wait is
 // an UNINTERRUPTIBLE one. With a bare sleep the whole ladder was deaf to
 // cancellation for as long as it ran — up to ~85s per machine (15s shutdown RPC
-// + 60s graceful + 5s SIGTERM + 5s SIGKILL) — and driverkit.Run only looks at
+// + 3m graceful + 5s SIGTERM + 5s SIGKILL) — and driverkit.Run only looks at
 // ctx BETWEEN reconcile ticks, never during one, so a Ctrl-C mid-stop was
 // ignored for over a minute with no output to say why. Cancellation is now
 // observed within one poll interval.

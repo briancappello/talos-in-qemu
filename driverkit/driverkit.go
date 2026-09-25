@@ -131,8 +131,8 @@ type Config struct {
 // so no driver can get that half subtly wrong.
 //
 // DEFERRED: reconciliation is SERIAL. One machine that is stopping holds the
-// loop for as long as its stop takes — for the qemu driver, up to ~85s (15s
-// shutdown RPC + 60s graceful power-off + 5s SIGTERM + 5s SIGKILL) — and every
+// loop for as long as its stop takes — for the qemu driver, up to ~3m25s (15s
+// shutdown RPC + 3m graceful power-off + 5s SIGTERM + 5s SIGKILL) — and every
 // other machine waits it out. That is a real stall, and it is knowingly not
 // fixed:
 //
@@ -148,6 +148,12 @@ type Config struct {
 //
 // The trigger is a CONDITION, not a date: revisit when a second machine can
 // exist. Until then a slow neighbour is the cheaper failure.
+//
+// THE TRIGGER HAS FIRED (add-vm-multinode-cluster): VMs now join one cluster
+// over a cluster network, and a graceful stop now takes up to 3m. The
+// file-driven verbs (`tinq up/stop/destroy`) are unaffected; this loop is
+// not, and needs the per-key locking described above before it serves a
+// multi-node site. Recorded, not fixed here.
 //
 // Cancellation is NOT part of that deferral and is already handled: the driver
 // verbs take this ctx and must honour it, so a Ctrl-C mid-stop returns within a
