@@ -46,7 +46,7 @@ Record the commands and sanitized results in `openspec/changes/add-vm-multinode-
 - [x] 6.1 Two-node cluster from `examples/`: both nodes Ready, distinct `INTERNAL-IP`s on the cluster CIDR, two etcd members with cluster-address peer URLs, and a cross-node pod-to-pod connection.
 - [x] 6.2 Three-node cluster: stop any one member, then show quorum and a successful `kubectl` write. Start it again and show three healthy members.
 - [x] 6.3 Each node's egress still works through its user-mode NIC (for example an image pull from a public registry), and each node's Talos API answers through its own host forward.
-- [ ] 6.4 A single-node machine file without the new fields comes up as before. The golden test from 1.2 still passes.
+- [x] 6.4 A single-node machine file without the new fields comes up as before. The golden test from 1.2 still passes.
 
 ## 7. Documentation And Hand-Back
 

@@ -123,6 +123,66 @@ The host joined the live segment and sent ARP probes:
 
 `TestProbeSegmentOverLoopback` runs the same probe against a responder on loopback in the unit suite.
 
+## 5.1 and 5.3 Lifecycle
+
+Destroying the OWNER while joiners exist is refused:
+
+```
+$ tinq destroy examples/multinode/cp0.yaml
+tinq: cp0 owns a cluster that cp1, cp2 joined, so it is not destroyed
+    tinq destroy --with-joiners examples/multinode/cp0.yaml
+```
+
+A running joiner leaves etcd, then goes. The name survives destroy and up (5.1):
+
+```
+$ tinq destroy examples/multinode/cp2.yaml
+cp2 left etcd
+$ talosctl ... etcd members         # cp0, cp1
+$ kubectl create configmap after-cp2-destroy ...   # created
+$ tinq up examples/multinode/cp2.yaml
+[ 9/10] kubeconfig    wrote the cluster's kubeconfig, node 10.254.0.13 Ready after 20s
+$ kubectl get node cp2 -o jsonpath='{.metadata.labels.kubernetes\.io/hostname}'
+cp2
+```
+
+The two-member case, where a member left in etcd would cost quorum:
+
+```
+$ tinq destroy examples/multinode/cp1.yaml    # 3 -> 2: cp0, cp2
+cp1 left etcd
+$ tinq destroy examples/multinode/cp2.yaml    # 2 -> 1
+cp2 left etcd
+$ talosctl ... etcd members
+cp0 https://10.254.0.11:2380
+$ kubectl create configmap after-two-to-one ...   # created
+```
+
+The whole cluster:
+
+```
+$ tinq up examples/multinode/cp1.yaml          # rejoin: owner-up, ARP probe, memory checks all pass
+$ tinq destroy --with-joiners examples/multinode/cp0.yaml
+destroying cp1, which joined cp0
+cp1 left etcd
+$ ls ~/.hvf/multinode      # gone; no qemu process left
+```
+
+## 6.4 Single node, unchanged
+
+`examples/bootstrap-machine.yaml`, which has none of the new fields, on `talos-v1.13.7-amd64.iso`:
+
+```
+[ 8/10] bootstrap     etcd bootstrapped
+[ 9/10] kubeconfig    wrote kubeconfig, node Ready after 1m28s
+[10/10] storage       local-path-provisioner v0.0.31, default StorageClass
+NAME            STATUS   INTERNAL-IP   OS-IMAGE
+talos-c28-pdd   Ready    10.0.2.15     Talos (v1.13.7)
+server: https://127.0.0.1:6443
+```
+
+No `cluster-endpoint` is written. The one new file in its state dir is `machine.yaml`, the site record. The golden tests (`TestGoldenSingleNodeVMConfig`, `TestGoldenSingleNodeMachineFile`) pass.
+
 ## Findings During The Live Runs
 
 ### F1. A LinkConfig switches off default DHCP on every link (fixed)
