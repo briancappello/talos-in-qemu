@@ -306,6 +306,37 @@ func checkBootstrapStage(stage runtimeres.MachineStage) error {
 	}
 }
 
+// KubeAPIAnswers makes ONE authenticated request to the Kubernetes API, with no
+// retries. It is a precondition check, not a wait: a joiner asks it about its
+// owner before booting anything, and a slow "no" is worse than a fast one.
+//
+// A TCP connect would prove nothing under QEMU: the host side of a forward
+// accepts a connection even when the guest behind it is unreachable.
+//
+// kubeconfig is SECRET and is neither logged nor placed in an error.
+func KubeAPIAnswers(ctx context.Context, kubeconfig []byte, timeout time.Duration) error {
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return errSecretParse("kubeconfig")
+	}
+
+	restConfig.Timeout = timeout
+
+	nodes, err := corev1client.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("building a Kubernetes client: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if _, err := nodes.Nodes().List(ctx, metav1.ListOptions{Limit: 1}); err != nil {
+		return fmt.Errorf("the Kubernetes API at %s did not answer: %w", restConfig.Host, err)
+	}
+
+	return nil
+}
+
 // WaitNodeReady waits for every registered Kubernetes node to report Ready.
 //
 // This is the KUBERNETES API, not the Talos one: the Talos API answers long

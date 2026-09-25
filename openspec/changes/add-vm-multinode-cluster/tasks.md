@@ -30,12 +30,12 @@
   - Unit part done. **Live check open** (runs with 6.1).
 - [x] 4.2 Factor the join resolver out of `adopt.go` `joinOptions` so that `spec.baremetal.joins` and `spec.joins` share it. For VMs it reads the in-cluster endpoint artifact, never the kubeconfig server. Verify that the existing `adopt_test.go` suite still passes, and add a test that a VM joiner never gets `127.0.0.1` as its endpoint.
 - [x] 4.3 Implement the join refusals (self, missing owner secrets or endpoint, site or network mismatch, no cluster network). Verify with one unit test per refusal.
-- [ ] 4.4 Implement the segment connectivity check before a joiner's config is applied. Verify it by blocking multicast on `lo` in a test environment, or with an injectable check in unit tests plus one manual live run, recorded in the change.
+- [x] 4.4 Implement the segment connectivity check before a joiner's config is applied. Verify it by blocking multicast on `lo` in a test environment, or with an injectable check in unit tests plus one manual live run, recorded in the change.
 
 ## 5. Hostname And Lifecycle
 
 - [ ] 5.1 Render `spec.hostname`. Verify live that the Kubernetes node name matches, and that it survives `destroy` and `up`.
-- [ ] 5.2 `up` on a joiner refuses while the owner is not Running with an answering API. Verify with a unit test using a fake owner state.
+- [x] 5.2 `up` on a joiner refuses while the owner is not Running with an answering API. Verify with a unit test using a fake owner state.
 - [ ] 5.3 `destroy` on a joiner removes the etcd member before destroying the VM. `destroy` on an owner refuses while joiners exist, unless the explicit flag is given. Verify both with unit tests, and live with a two-node cluster: etcd shows one member afterwards and API writes succeed.
 - [ ] 5.4 Add the host memory check before a joiner boots. Verify with a unit test using an injected `MemTotal`.
 

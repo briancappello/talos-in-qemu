@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/coglative/talos-in-qemu/cluster"
 	"github.com/coglative/talos-in-qemu/driverkit"
@@ -128,7 +130,58 @@ func vmJoinOptions(h *hvf, m *unstructured.Unstructured) (*cluster.JoinOptions, 
 			field, target, ocn.Name, ocn.CIDR, m.GetName(), cn.CIDR)
 	}
 
-	return joinArtifacts(field, target, owner.Dir, true)
+	join, err := joinArtifacts(field, target, owner.Dir, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// The owner must be THERE, not merely recorded: a joiner booted beside a
+	// stopped owner installs, then waits out an etcd join nobody can answer.
+	ownerUp := h.ownerUp
+	if ownerUp == nil {
+		ownerUp = h.realOwnerUp
+	}
+
+	if err := ownerUp(owner, join.Kubeconfig); err != nil {
+		return nil, fmt.Errorf("%s names %q, which is not up: %w\n\n"+
+			"  start the owner first:  tinq up <%s's machine file>\n"+
+			"  on a stopped cluster the owner comes up first, then each joiner",
+			field, target, err, target)
+	}
+
+	// And the segment must carry frames between them. See segment.go.
+	probe := h.probeSegment
+	if probe == nil {
+		probe = probeSegment
+	}
+
+	group, port := ocn.multicast(driverkit.Str(m, "spec", "site"))
+
+	if err := probe(group, port, ocn.Address); err != nil {
+		return nil, fmt.Errorf("cluster network %q: %w", cn.Name, err)
+	}
+
+	return join, nil
+}
+
+// ownerAPITimeout bounds the one request realOwnerUp makes. The owner is
+// either answering or it is not; this is not a wait for it to come up.
+const ownerAPITimeout = 10 * time.Second
+
+// realOwnerUp asks the host whether the owner's VM is running, and the owner's
+// Kubernetes API whether it answers, through the kubeconfig the joiner is about
+// to reuse.
+func (h *hvf) realOwnerUp(owner siteMachine, kubeconfig []byte) error {
+	state, _, err := h.Observe(context.Background(), owner.Unstructured)
+	if err != nil {
+		return err
+	}
+
+	if state != driverkit.Running {
+		return fmt.Errorf("its VM is %s", state)
+	}
+
+	return cluster.KubeAPIAnswers(context.Background(), kubeconfig, ownerAPITimeout)
 }
 
 // findOwner finds the recorded machine named target on m's site. A machine of

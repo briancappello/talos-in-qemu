@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,6 +90,7 @@ func joiner(t *testing.T, g *goldenHost, cluster string) *unstructured.Unstructu
 // recorded in-cluster endpoint instead.
 func TestVMJoinerNeverGetsTheHostForwardAsItsEndpoint(t *testing.T) {
 	g := newGoldenHost(t, "talos.iso")
+	healthyOwner(g.h)
 	seedOwner(t, g.h, netMachine(t, "cp0", 50000, ownerNet), allArtifacts)
 
 	opts, err := upOptions(g.h, joiner(t, g, joinerNet), driverkit.Absent, nil)
@@ -256,4 +258,78 @@ spec:
 	}
 
 	return m
+}
+
+// healthyOwner stands in for a running owner on a working segment.
+func healthyOwner(h *hvf) {
+	h.ownerUp = func(siteMachine, []byte) error { return nil }
+	h.probeSegment = func(netip.Addr, int, netip.Addr) error { return nil }
+}
+
+// 5.2: a joiner does not start before its owner. The owner being RECORDED is
+// not enough — a stopped owner has every artifact and answers nothing.
+func TestVMJoinerRefusesAnOwnerThatIsNotUp(t *testing.T) {
+	g := newGoldenHost(t, "talos.iso")
+	healthyOwner(g.h)
+	g.h.ownerUp = func(owner siteMachine, kubeconfig []byte) error {
+		if owner.GetName() != "cp0" || len(kubeconfig) == 0 {
+			t.Errorf("ownerUp was asked about %q with a kubeconfig of %d bytes", owner.GetName(), len(kubeconfig))
+		}
+
+		return errors.New("its VM is Stopped")
+	}
+
+	probed := false
+	g.h.probeSegment = func(netip.Addr, int, netip.Addr) error { probed = true; return nil }
+
+	seedOwner(t, g.h, netMachine(t, "cp0", 50000, ownerNet), allArtifacts)
+	m := joiner(t, g, joinerNet)
+
+	_, err := upOptions(g.h, m, driverkit.Absent, nil)
+	if err == nil || !strings.Contains(err.Error(), "Stopped") || !strings.Contains(err.Error(), "start the owner first") {
+		t.Fatalf("upOptions = %v, want a refusal saying to start the owner first", err)
+	}
+
+	if probed {
+		t.Error("the segment was probed for an owner that is not up")
+	}
+
+	if _, statErr := os.Stat(g.h.dir(m)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Error("the joiner's state directory exists after the refusal")
+	}
+}
+
+// 4.4: the probe is asked about the OWNER's address on the site's derived
+// segment, and its failure is the refusal, before anything is created.
+func TestVMJoinerRefusesAnUnusableSegment(t *testing.T) {
+	g := newGoldenHost(t, "talos.iso")
+	healthyOwner(g.h)
+
+	wantGroup, wantPort := (&clusterNetwork{Name: "cluster"}).multicast("s")
+
+	g.h.probeSegment = func(group netip.Addr, port int, target netip.Addr) error {
+		if group != wantGroup || port != wantPort || target.String() != "10.254.0.11" {
+			t.Errorf("probed %s:%d for %s, want %s:%d for the owner 10.254.0.11", group, port, target, wantGroup, wantPort)
+		}
+
+		return segmentUnusable(group, port, target, "lo", "no ARP reply within 5s")
+	}
+
+	seedOwner(t, g.h, netMachine(t, "cp0", 50000, ownerNet), allArtifacts)
+	m := joiner(t, g, joinerNet)
+
+	_, err := upOptions(g.h, m, driverkit.Absent, nil)
+	if err == nil {
+		t.Fatal("a joiner was accepted over a segment that carries nothing")
+	}
+
+	for _, want := range []string{`cluster network "cluster"`, "multicast", "ip maddr show lo"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+
+	if _, statErr := os.Stat(g.h.dir(m)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Error("the joiner's state directory exists after the refusal")
+	}
 }

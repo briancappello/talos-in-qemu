@@ -31,6 +31,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,6 +65,12 @@ type hvf struct {
 	// Deliberately NOT hoisted into main(): destroy must keep working on a host
 	// with no usable accelerator. Teardown cannot require a live hypervisor.
 	detect func() (*platform.Platform, error)
+
+	// ownerUp and probeSegment are the two questions a joiner puts to its
+	// owner before it boots. nil means the real ones (see join.go); tests
+	// substitute them because the real ones need a running VM.
+	ownerUp      func(owner siteMachine, kubeconfig []byte) error
+	probeSegment func(group netip.Addr, port int, target netip.Addr) error
 }
 
 func main() {
