@@ -1,0 +1,28 @@
+# The third control-plane node. With it the cluster keeps etcd quorum when any
+# one member stops. See cp0.yaml.
+apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata:
+  name: cp2
+  namespace: default
+spec:
+  site: multinode
+  role: talos-cp
+  image: talos-v1.14.1-amd64.iso
+  # ghcr.io/siderolabs/installer is not published for v1.14, so the default
+  # installer pin cannot install this image. This is Image Factory's vanilla
+  # installer (no extensions) for the same version.
+  installerImage: factory.talos.dev/installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.14.1
+  cpu: 2
+  memory: 4Gi
+  disk: 16Gi
+  hostname: cp2
+  joins: cp0
+  clusterNetwork:
+    cidr: 10.254.0.0/24
+    address: 10.254.0.13
+  hostForwards:
+    - hostPort: 50012
+      guestPort: 50000
+    - hostPort: 6455
+      guestPort: 6443

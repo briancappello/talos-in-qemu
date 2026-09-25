@@ -1,0 +1,155 @@
+# Evidence: Multi-Node VM Clusters
+
+Live acceptance runs for `add-vm-multinode-cluster`. The results are sanitized: no secrets, keys or tokens.
+
+## Environment
+
+- Host: Linux, KVM, `qemu-system-x86_64`, 62 GiB RAM.
+- Image: `talos-v1.14.1-amd64.iso`. Installer: `factory.talos.dev/installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.14.1` (see "Findings").
+- Machinery: v1.14.0. Kubernetes: v1.37.0 (derived).
+- Machine files: `examples/multinode/cp0.yaml` (owner), `cp1.yaml` and `cp2.yaml` (joiners). Site `multinode`, CIDR `10.254.0.0/24`.
+- Derived segment for site `multinode`, network `cluster`: `239.255.129.215:27494`.
+
+## 6.1 Two-node cluster
+
+```sh
+tinq up examples/multinode/cp0.yaml
+tinq up examples/multinode/cp1.yaml
+```
+
+The joiner's transcript:
+
+```
+[ 8/10] bootstrap     skipped (joining an existing cluster)
+[ 9/10] kubeconfig    wrote the cluster's kubeconfig, node 10.254.0.12 Ready after 17s
+[10/10] storage       skipped (the cluster this node joined owns its StorageClass)
+```
+
+Both nodes Ready, with distinct cluster addresses. No node shows `10.0.2.15`:
+
+```
+$ kubectl get nodes -o wide
+NAME   STATUS   ROLES           VERSION   INTERNAL-IP   OS-IMAGE
+cp0    Ready    control-plane   v1.37.0   10.254.0.11   Talos (v1.14.1)
+cp1    Ready    control-plane   v1.37.0   10.254.0.12   Talos (v1.14.1)
+```
+
+Two etcd members, with peer URLs on the cluster network:
+
+```
+$ talosctl -e 127.0.0.1:50010 -n 127.0.0.1 etcd members
+ID                 HOSTNAME   PEER URLS                  CLIENT URLS                LEARNER
+2d1a1ebbd7d7271e   cp1        https://10.254.0.12:2380   https://10.254.0.12:2379   false
+5f2e794a59987ea0   cp0        https://10.254.0.11:2380   https://10.254.0.11:2379   false
+```
+
+Flannel picks the cluster NIC through `--iface-can-reach=10.254.0.0` (D3):
+
+```
+match.go:206] Determining interface to use based on given ifcanreach: 10.254.0.0
+match.go:269] Using interface with name enp0s6 and address 10.254.0.11
+```
+
+Cross-node pod-to-pod. The server pod runs on cp1 and the client pod on cp0:
+
+```
+srv on cp1 at 10.244.1.3; cli on cp0 at 10.244.0.4
+$ kubectl exec cli -- wget -qO- -T 5 http://10.244.1.3:8080/index.html
+cross-node-ok
+```
+
+The joiner reused the owner's kubeconfig (`cmp` equal), and recorded the owner's in-cluster endpoint, `https://10.254.0.11:6443`.
+
+## 6.2 Three-node cluster, loss of one member
+
+```sh
+tinq up examples/multinode/cp2.yaml
+tinq stop examples/multinode/cp0.yaml     # the OWNER, the hardest case
+```
+
+The stopped member was the owner, which every joiner's config points at. `kubectl` went through cp1's own forward (`https://127.0.0.1:6454`). This also proves that a joiner's API certificate names the host forward:
+
+```
+$ talosctl -e 127.0.0.1:50011 -n 127.0.0.1 etcd status
+MEMBER             LEADER             RAFT TERM
+2d1a1ebbd7d7271e   2d1a1ebbd7d7271e   3
+$ kubectl get nodes
+cp0    NotReady,SchedulingDisabled   control-plane
+cp1    Ready                         control-plane
+cp2    Ready                         control-plane
+$ kubectl create configmap quorum-proof --from-literal=at=...
+configmap/quorum-proof created
+```
+
+Start the owner again:
+
+```
+$ tinq up examples/multinode/cp0.yaml
+[ 5/10] maintenance   skipped (already configured)
+[ 6/10] config        skipped (reusing the talosconfig in the state dir)
+[ 8/10] bootstrap     already bootstrapped (the node refused a second one)
+[ 9/10] kubeconfig    wrote kubeconfig, node Ready after 18s
+$ kubectl get nodes          # cp0, cp1, cp2 all Ready
+$ talosctl ... etcd members  # three members
+$ kubectl get configmap quorum-proof -o jsonpath='{.data.at}'
+2026-09-25T05:44:38Z         # the write made while cp0 was down
+```
+
+## 6.3 Egress and per-node Talos API
+
+Egress: each node pulled `busybox:1.36` from Docker Hub through its user-mode NIC (the `srv` pod on cp1, the `cli` pod on cp0). Each node's link state:
+
+```
+enp0s4/10.0.2.15/24       # user-mode NIC, DHCP (DHCPv4Config egress0)
+enp0s6/10.254.0.11/24     # cluster NIC, static (LinkConfig cluster0)
+```
+
+Each node's Talos API answers through its own forward, with its declared hostname:
+
+```
+$ talosctl -e 127.0.0.1:50010 -n 127.0.0.1 get hostname   ->  cp0
+$ talosctl -e 127.0.0.1:50011 -n 127.0.0.1 get hostname   ->  cp1
+```
+
+## 4.4 Segment probe against the live segment
+
+The host joined the live segment and sent ARP probes:
+
+```
+239.255.129.215:27494 probe 10.254.0.11 -> answered (0s)
+239.255.129.215:27494 probe 10.254.0.12 -> answered (0s)
+239.255.129.215:27494 probe 10.254.0.99 -> refused  (5.003s)
+```
+
+`TestProbeSegmentOverLoopback` runs the same probe against a responder on loopback in the unit suite.
+
+## Findings During The Live Runs
+
+### F1. A LinkConfig switches off default DHCP on every link (fixed)
+
+The first owner bring-up hung at step 7. The node never installed (`system.qcow2` stayed at 196 KB), and its Talos API timed out even with `--insecure`. The cause is in machinery v1.14.0, `config/container/container.go`:
+
+```go
+func (container *Container) RunDefaultDHCPOperators() bool {
+	return len(findMatchingDocs[config.NetworkCommonLinkConfig](container.documents)) == 0 &&
+		len(findMatchingDocs[config.NetworkDHCPConfig](container.documents)) == 0
+}
+```
+
+The cluster NIC's `LinkConfig` therefore stopped DHCP on the user-mode NIC. The node lost `10.0.2.15`, the host forwards went dead, and the installer could not be pulled. Fix (`7113253`): a networked VM's user-mode NIC gets a derived MAC, a `LinkAliasConfig` (`egress0`) and an explicit `DHCPv4Config`. `TestClusterNetworkKeepsDHCPOnTheEgressNIC` pins it.
+
+### F2. No `ghcr.io/siderolabs/installer` for v1.14 (not fixed, reported)
+
+tinq pins the installer to `ghcr.io/siderolabs/installer:<image version>`. That repository has tags up to v1.13.x and none for v1.14:
+
+```
+ghcr.io/siderolabs/installer:v1.14.1        MANIFEST_UNKNOWN
+ghcr.io/siderolabs/installer:v1.13.7        sha256:6b0e5ed9...
+factory.talos.dev/installer/<vanilla>:v1.14.1  sha256:29ae92d2...
+```
+
+With the default pin, **no v1.14 image can install**, multi-node or not. The examples set `installerImage` to the Image Factory vanilla installer. Changing the default is a design decision (a dependency on factory.talos.dev, and what a factory ISO with extensions needs), so it is outside this change.
+
+### F3. The transcript named the default installer even when `installerImage` overrode it (fixed, Tier 3)
+
+Step 6 printed `installer: ghcr.io/siderolabs/installer:v1.14.1 (pinned to YOUR image)` while the config used the factory image. Fixed in `5d8427a`, pinned by `TestStep6NamesTheInstallerOverride`.

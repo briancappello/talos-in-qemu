@@ -1,0 +1,45 @@
+# The OWNER of a multi-node VM cluster: the first control-plane node.
+#
+#   tinq up examples/multinode/cp0.yaml   # first: creates the cluster
+#   tinq up examples/multinode/cp1.yaml   # then: joins it
+#   tinq up examples/multinode/cp2.yaml   # optional third member, for quorum
+#
+# Two members give NO fault tolerance: etcd needs a majority, and one of two is
+# not one. Use two nodes for scheduling and isolation rehearsals, and three to
+# rehearse losing a node.
+#
+# Every VM of a cluster declares the SAME clusterNetwork name and cidr, and its
+# own address. The segment is a QEMU multicast socket bound to 127.0.0.1: no
+# root, no bridge, and nothing leaves this host. Check that loopback carries
+# multicast before the first run:
+#
+#   ip maddr show lo      # lists the groups loopback has joined
+#
+# Each VM keeps its own host ports. The host reaches every node's Talos API
+# through its own forward, and the cluster's API through the owner's.
+apiVersion: machine.hvf.fleet.io/v1alpha1
+kind: TalosMachine
+metadata:
+  name: cp0
+  namespace: default
+spec:
+  site: multinode
+  role: talos-cp
+  # The cluster network needs the Talos 1.14 document model.
+  image: talos-v1.14.1-amd64.iso
+  # ghcr.io/siderolabs/installer is not published for v1.14, so the default
+  # installer pin cannot install this image. This is Image Factory's vanilla
+  # installer (no extensions) for the same version.
+  installerImage: factory.talos.dev/installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.14.1
+  cpu: 2
+  memory: 4Gi
+  disk: 16Gi
+  hostname: cp0
+  clusterNetwork:
+    cidr: 10.254.0.0/24
+    address: 10.254.0.11
+  hostForwards:
+    - hostPort: 50010
+      guestPort: 50000
+    - hostPort: 6453
+      guestPort: 6443

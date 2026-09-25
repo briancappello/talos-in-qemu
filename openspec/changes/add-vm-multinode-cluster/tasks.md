@@ -20,14 +20,14 @@
 ## 3. The Cluster NIC
 
 - [x] 3.1 Derive the multicast group and port from site and network name, and the MAC from the machine name. Verify with tests that pin the values for fixed inputs and show that different sites and names differ.
-- [ ] 3.2 Add the second `-netdev socket,mcast=...,localaddr=127.0.0.1` NIC to the QEMU arguments when `clusterNetwork` is set. Verify with a `main_test.go` argument test. Verify on Linux with two VMs in maintenance mode that one can reach the other's address.
-  - Unit part done (`TestCreateAddsTheClusterNIC`). **Live part open:** in maintenance mode the cluster NIC has no address and the maintenance API has no ping, so the live check runs once 3.3 applies the static address.
+- [x] 3.2 Add the second `-netdev socket,mcast=...,localaddr=127.0.0.1` NIC to the QEMU arguments when `clusterNetwork` is set. Verify with a `main_test.go` argument test. Verify on Linux with two VMs in maintenance mode that one can reach the other's address.
+  - Unit part: `TestCreateAddsTheClusterNIC`. Live: verified with configured nodes rather than maintenance mode (the cluster NIC has no address before the config), by etcd peering, cross-node pod traffic and the ARP probe. See `evidence.md`.
 - [x] 3.3 Render the static address, the node IP, the etcd subnet and the CNI interface pinning from task 1.1. Verify with config-generation tests.
 
 ## 4. Endpoint And Join
 
 - [x] 4.1 For a networked owner, set the in-cluster endpoint to the owner's cluster address, add both addresses to the certificate SANs, keep the host forward in the kubeconfig, and write the in-cluster endpoint artifact. Verify with config tests, and with a live check that `kubectl` works from the host.
-  - Unit part done. **Live check open** (runs with 6.1).
+  - Live: verified, see `evidence.md` 6.1 and 6.2.
 - [x] 4.2 Factor the join resolver out of `adopt.go` `joinOptions` so that `spec.baremetal.joins` and `spec.joins` share it. For VMs it reads the in-cluster endpoint artifact, never the kubeconfig server. Verify that the existing `adopt_test.go` suite still passes, and add a test that a VM joiner never gets `127.0.0.1` as its endpoint.
 - [x] 4.3 Implement the join refusals (self, missing owner secrets or endpoint, site or network mismatch, no cluster network). Verify with one unit test per refusal.
 - [x] 4.4 Implement the segment connectivity check before a joiner's config is applied. Verify it by blocking multicast on `lo` in a test environment, or with an injectable check in unit tests plus one manual live run, recorded in the change.
@@ -43,9 +43,9 @@
 
 Record the commands and sanitized results in `openspec/changes/add-vm-multinode-cluster/evidence.md`.
 
-- [ ] 6.1 Two-node cluster from `examples/`: both nodes Ready, distinct `INTERNAL-IP`s on the cluster CIDR, two etcd members with cluster-address peer URLs, and a cross-node pod-to-pod connection.
-- [ ] 6.2 Three-node cluster: stop any one member, then show quorum and a successful `kubectl` write. Start it again and show three healthy members.
-- [ ] 6.3 Each node's egress still works through its user-mode NIC (for example an image pull from a public registry), and each node's Talos API answers through its own host forward.
+- [x] 6.1 Two-node cluster from `examples/`: both nodes Ready, distinct `INTERNAL-IP`s on the cluster CIDR, two etcd members with cluster-address peer URLs, and a cross-node pod-to-pod connection.
+- [x] 6.2 Three-node cluster: stop any one member, then show quorum and a successful `kubectl` write. Start it again and show three healthy members.
+- [x] 6.3 Each node's egress still works through its user-mode NIC (for example an image pull from a public registry), and each node's Talos API answers through its own host forward.
 - [ ] 6.4 A single-node machine file without the new fields comes up as before. The golden test from 1.2 still passes.
 
 ## 7. Documentation And Hand-Back
