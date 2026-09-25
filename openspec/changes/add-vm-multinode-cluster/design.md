@@ -72,6 +72,25 @@ The node's link on that NIC gets the static address, selected by the derived MAC
 
 No default route is added on the cluster NIC. Egress stays on the user-mode NIC.
 
+**Confirmed (task 1.1, machinery v1.14.0, Talos v1.14.1 contract).** Two new documents, both validated in metal mode next to the generated set with no warnings:
+
+```yaml
+apiVersion: v1alpha1
+kind: LinkAliasConfig
+name: cluster0
+selector:
+  match: mac(link.permanent_addr) == "52:54:00:xx:xx:xx"
+---
+apiVersion: v1alpha1
+kind: LinkConfig
+name: cluster0
+up: true
+addresses:
+  - address: 10.254.0.11/24
+```
+
+The 1.14 contract does not emit these documents, so tinq adds them. It adds no `routes`. The feature needs the 1.14 document model, so `clusterNetwork` is refused for an image older than Talos v1.14.
+
 ### D3. Kubernetes and etcd use the cluster network
 
 On a networked VM, the generated config sets:
@@ -79,13 +98,20 @@ On a networked VM, the generated config sets:
 - the etcd advertised subnets to the cluster CIDR;
 - Flannel's interface, pinned to the cluster NIC (for example by `--iface-can-reach` to the owner's address, or by interface selection). Otherwise Flannel's VXLAN picks the default-route NIC, and cross-node pod traffic is lost.
 
+**Confirmed (task 1.1).** The 1.14 contract already emits `KubeNodeConfig` (with `nodeIP: {}`) and `KubeFlannelCNIConfig`, and it keeps etcd in v1alpha1. tinq **edits the generated documents**. It does not replace them, because that would drop the labels and backend settings machinery put there:
+- kubelet node IP: `KubeNodeConfig.nodeIP.validSubnets: [<cidr>]`;
+- etcd: v1alpha1 `cluster.etcd.advertisedSubnets: [<cidr>]`. There is no etcd document in 1.14;
+- Flannel: `KubeFlannelCNIConfig.extraArgs: ["--iface-can-reach=<cidr network address>"]`.
+
+Flannel's arguments go into one DaemonSet for the whole cluster, so they cannot carry a per-node address. `--iface-can-reach=<own address>` resolves to `lo`. The **network address** of the CIDR (for example `10.254.0.0`) is the same on every node, and no node can hold it, because D2 refuses a host part of all zeroes. The route lookup for it leaves through the cluster NIC on every node. A `LinkAliasConfig` name is not used for Flannel: it is a Talos-side name, and nothing proves offline that Flannel can see it. Task 6.1 confirms the choice live.
+
 The acceptance check for this decision is behavioral, not textual: pod-to-pod traffic across nodes works, and `kubectl get nodes -o wide` shows distinct cluster addresses.
 
 ### D4. The endpoint is the owner's cluster address; the host keeps its forward
 
 For a networked VM **owner**:
 - `cluster.controlPlane.endpoint` = `https://<owner clusterNetwork.address>:6443`;
-- the API server certificate SANs include that address **and** the host forward address (`127.0.0.1`, or `hostAddr`), so both are valid TLS names;
+- the API server certificate SANs include that address **and** the host forward address (`127.0.0.1`, or `hostAddr`), so both are valid TLS names. On 1.14 `generate.WithAdditionalSubjectAltNames` already writes to both `machine.certSANs` and `KubeAPIServerConfig.certExtraSANs`, so the cluster address is one more entry in that list (confirmed in task 1.1);
 - the **kubeconfig** written for the host keeps the host forward as its server (`https://127.0.0.1:<hostPort>`). The host cannot reach the cluster network;
 - `talosconfig` endpoints stay per-node host forwards.
 
@@ -110,7 +136,9 @@ A joiner joins as a **control-plane** member, which is what config generation pr
 
 ### D6. `spec.hostname`
 
-An optional `spec.hostname` renders the Talos 1.14 hostname document, with automatic hostname generation off, so the Kubernetes node name is the declared name. Without it, the behavior is unchanged: Talos generates a name. The consumer schedules CI by `kubernetes.io/hostname`, so the name must be stable across `destroy`/`up`.
+An optional `spec.hostname` renders the Talos 1.14 hostname document, with automatic hostname generation off, so the Kubernetes node name is the declared name. Without it, the behavior is unchanged: Talos generates a name.
+
+**Confirmed (task 1.1).** The 1.14 contract emits `HostnameConfig` with `auto: stable`. tinq edits that document to `auto: off` with `hostname: <spec.hostname>`, and it validates. `auto: stable` already gives the same name across reboots. It does not give a name the operator chose, and it is not the same across `destroy`/`up`. The consumer schedules CI by `kubernetes.io/hostname`, so the name must be stable across `destroy`/`up`.
 
 ### D7. Lifecycle for a cluster of several VMs
 

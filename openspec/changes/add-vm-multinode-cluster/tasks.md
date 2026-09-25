@@ -8,8 +8,8 @@
 
 ## 1. Confirm The Talos 1.14 Config Model
 
-- [ ] 1.1 With config-generation unit tests (no QEMU), find the machinery v1.14.0 documents for four things: a static address on a NIC selected by MAC, the kubelet node IP subnets, the etcd advertised subnets, and a declared hostname with automatic hostnames off. Also find how Flannel's interface is pinned. Verify each document passes validation next to the documents machinery generates. Record the chosen kinds in `design.md` under D2, D3 and D6.
-- [ ] 1.2 Add a golden test: an existing single-node machine file produces byte-identical QEMU arguments and machine config before and after this change. Verify that it passes on the unchanged tree.
+- [x] 1.1 With config-generation unit tests (no QEMU), find the machinery v1.14.0 documents for four things: a static address on a NIC selected by MAC, the kubelet node IP subnets, the etcd advertised subnets, and a declared hostname with automatic hostnames off. Also find how Flannel's interface is pinned. Verify each document passes validation next to the documents machinery generates. Record the chosen kinds in `design.md` under D2, D3 and D6.
+- [x] 1.2 Add a golden test: an existing single-node machine file produces byte-identical QEMU arguments and machine config before and after this change. Verify that it passes on the unchanged tree.
 
 ## 2. Schema And Validation
 
