@@ -648,8 +648,19 @@ and two VMs of a site with the same host port.
 
 - **`stop`** works on any member. If you stop one of two members, the control
   plane stops. If you stop one of three, the cluster keeps quorum.
-- **`up`** on a stopped cluster: start the owner first, then each joiner. A
-  joiner refuses to start while its owner is down.
+- **`up`** on a stopped cluster: start the owner first, then each joiner, one
+  at a time. This works for any number of etcd members:
+  - The owner's `up` restarts the VM and waits for its Talos API. If a member
+    that joined it is still stopped, the owner alone has no etcd quorum, so
+    Kubernetes cannot answer yet. `up` then does not wait for a Ready node. It
+    names the stopped members and ends with success.
+  - The `up` of a joiner that is already a member needs the owner's VM to run
+    and the owner's Talos API to answer. It does not need the owner's
+    Kubernetes API. It then waits until its own node is Ready, which is
+    possible only when etcd has quorum. Thus the `up` of the last member ends
+    when Kubernetes answers.
+  - A joiner refuses to start while the owner's VM is not running. A joiner
+    that has never joined also needs the owner's Kubernetes API to answer.
 - **`destroy` on a joiner** removes its etcd member and its Kubernetes node
   first, then destroys the VM. A running joiner leaves etcd by itself. A
   stopped joiner is removed through a member that runs. If this is not

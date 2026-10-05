@@ -256,6 +256,8 @@ tinq destroy --with-joiners <owner.yaml>  # the whole cluster
 
 A joiner's `up` refuses while the owner is down. Run one `up` or `destroy` at a time per site.
 
+On a restart of a stopped cluster, the owner's `up` does not wait for Kubernetes while a member that joined it is stopped: without that member etcd may have no quorum. It names the stopped members and succeeds. Each joiner's `up` then waits until its own node is Ready, so the last member's `up` ends when Kubernetes answers. A consumer that waits for Kubernetes itself must do so after the last member's `up`, not after the owner's.
+
 ### Behaviour a consumer can rely on (found by the homelab consumer)
 
 - **Forwarded NodePorts work.** With `clusterNetwork`, tinq sets kube-proxy `nodePortAddresses` to the cluster segment and `10.0.2.0/24`, so a host forward to a NodePort (ingress) reaches it. kube-proxy in nftables mode otherwise serves NodePorts only on the primary address, which the cluster network makes 10.254.x. Do not restate the addresses in a config patch: machinery APPENDS list values, so they would appear twice.

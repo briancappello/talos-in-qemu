@@ -66,7 +66,11 @@ A VM with `spec.hostname` SHALL register with Kubernetes under exactly that name
 
 ### Requirement: Lifecycle commands respect cluster membership
 
-- `tinq up` on a joiner SHALL refuse while its owner is not Running with an answering API.
+- `tinq up` on a joiner SHALL refuse while its owner is not Running.
+- `tinq up` on a joiner that has never joined (no talosconfig in its state directory) SHALL also refuse while the owner's Kubernetes API does not answer.
+- `tinq up` on a joiner that is already a member (a talosconfig in its state directory) SHALL accept a Running owner whose authenticated Talos API answers in the installed system's stage. It SHALL NOT require the owner's Kubernetes API, because that API needs the etcd quorum this member is part of. It SHALL then wait until its own node is Ready.
+- `tinq up` on an owner whose etcd already exists SHALL NOT wait for a Ready Kubernetes node while a configured member that joined it, directly or through another member, is not Running. It SHALL end with success after its Talos API answers and the node refuses a second bootstrap, and it SHALL name the stopped members.
+- `tinq up` on a running cluster SHALL stay a no-op success, and the first bring-up of an owner or a joiner SHALL be unchanged.
 - `tinq destroy` on a joiner SHALL remove the member from etcd before it destroys the VM.
 - `tinq destroy` on an owner SHALL refuse while joiners of its site exist, unless an explicit flag destroys the joiners first.
 
@@ -74,6 +78,20 @@ A VM with `spec.hostname` SHALL register with Kubernetes under exactly that name
 
 - **WHEN** the owner is stopped and `tinq up` runs on a joiner
 - **THEN** it fails and says to start the owner first
+
+#### Scenario: A new joiner does not start beside an owner that does not serve
+
+- **WHEN** the owner is Running, its Kubernetes API does not answer, and `tinq up` runs on a joiner that has never joined
+- **THEN** it fails before creating anything and says to start the owner first
+
+#### Scenario: A stopped three-member cluster restarts in the documented order
+
+- **WHEN** all three VMs of a bootstrapped three-member cluster are stopped
+- **AND** `tinq up` runs on the owner, then on each joiner, one at a time
+- **THEN** the owner's `up` succeeds without waiting for Kubernetes and names the two stopped joiners
+- **AND** the first joiner's `up` is accepted while the owner's Kubernetes API does not answer, and succeeds when its own node is Ready
+- **AND** the second joiner's `up` succeeds when its own node is Ready
+- **AND** afterwards etcd lists three members and all three nodes are Ready
 
 #### Scenario: Destroying a joiner leaves a healthy cluster
 
