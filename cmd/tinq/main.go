@@ -615,6 +615,17 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		return cluster.UpOptions{}, err
 	}
 
+	// The members that joined THIS machine and are not running. Only the
+	// creating member asks: its run is the one that waits for every node, and
+	// a restarted cluster's owner comes up before its joiners. See
+	// cluster.UpOptions.StoppedMembers.
+	var stopped []string
+	if join == nil {
+		if stopped, err = d.stoppedMembers(context.Background(), m); err != nil {
+			return cluster.UpOptions{}, err
+		}
+	}
+
 	// The MACHINE's state dir, never the state root: the artifacts carry the
 	// identity they belong to, which is the property that makes -destroy sweep
 	// them. Written one level up they would outlive the cluster whose keys
@@ -654,6 +665,7 @@ func upOptions(d *hvf, m *unstructured.Unstructured, state driverkit.State,
 		ClusterNetwork: clusterNet,
 		Hostname:       hostname,
 		Join:           join,
+		StoppedMembers: stopped,
 
 		Boot: func() (int, error) {
 			// The same already-running rule `apply` applies, and it is what

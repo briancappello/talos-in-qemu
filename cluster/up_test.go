@@ -1453,6 +1453,63 @@ func TestUpTreatsAnAlreadyBootstrappedNodeAsSuccess(t *testing.T) {
 	}
 }
 
+// THE STOPPED-CLUSTER DEADLOCK. Every VM of a three-member cluster died; the
+// owner is restarted first, and alone it is one etcd vote of three. No quorum,
+// no kube-apiserver, so a Ready-node wait here can only time out — and the
+// joiners that would supply the quorum are refused until it returns. A restart
+// with stopped members ends at the Talos API and etcd's own "already exists".
+func TestUpRestartingAClusterWithStoppedMembersDoesNotWaitForKubernetes(t *testing.T) {
+	f := newFixture(t)
+	writeTalosconfig(t, f.dir)
+	f.rec.failAt = "bootstrap"
+	f.rec.err = alreadyBootstrappedError()
+	f.opts.StoppedMembers = []string{"cp1", "cp2"}
+
+	transcript := f.mustRun(t)
+
+	for _, op := range []string{"waitBootstrapReady", "bootstrap"} {
+		if !f.rec.did(op) {
+			t.Errorf("%s never ran on a restart\n"+
+				"  reason: the Talos API and etcd's refusal of a second bootstrap are what prove this "+
+				"member came back", op)
+		}
+	}
+
+	for _, op := range []string{"kubeconfig", "waitNodeReady", "installStorage"} {
+		if f.rec.did(op) {
+			t.Errorf("%s ran while cp1 and cp2 are stopped\n"+
+				"  reason: one member of three has no etcd quorum, so the Kubernetes API cannot "+
+				"answer until the joiners are up, and they are started AFTER this returns", op)
+		}
+	}
+
+	stepsInOrder(t, transcript)
+	wants(t, transcript, "cp1, cp2", "quorum", "tinq up")
+
+	// A skipped step must not claim work it did not do.
+	if strings.Contains(transcript, "node Ready") {
+		t.Errorf("a restart that never asked Kubernetes claims a Ready node\n%s", redact(transcript))
+	}
+}
+
+// First creation is untouched by recorded members: the field only changes a
+// run whose node has already been bootstrapped. A node that ACCEPTS the
+// bootstrap had no etcd, so no member can be waiting on it.
+func TestUpWithStoppedMembersStillFinishesAClusterItBootstraps(t *testing.T) {
+	f := newFixture(t)
+	f.opts.StoppedMembers = []string{"cp1"}
+
+	f.mustRun(t)
+
+	for _, op := range []string{"applyConfig", "bootstrap", "kubeconfig", "waitNodeReady", "installStorage"} {
+		if !f.rec.did(op) {
+			t.Errorf("%s never ran on a first bring-up\n"+
+				"  reason: a node that accepted the bootstrap created etcd just now; nothing can be "+
+				"waiting on it", op)
+		}
+	}
+}
+
 // The near-miss mutants, and the reason the matcher is a gRPC CODE rather than
 // a string: everything else from bootstrap is a real failure, and swallowing it
 // would leave `up` waiting on a node that can never become Ready.

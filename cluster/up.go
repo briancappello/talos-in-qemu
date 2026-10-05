@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
@@ -185,6 +186,18 @@ type UpOptions struct {
 	// issued for describes no cluster, and either one without the other is a
 	// half-join discovered at the worst possible moment.
 	Join *JoinOptions
+
+	// StoppedMembers names the OTHER etcd members of this machine's cluster
+	// whose VMs are not running, as resolved by the caller from its records.
+	// nil for a single-node cluster, and for one whose members are all up.
+	//
+	// It changes ONE thing, and only on a node that refuses a second bootstrap
+	// — a member whose etcd already exists: the run ends after step 8 instead
+	// of waiting for Kubernetes. That node is one vote of several, etcd has no
+	// quorum until the stopped members return, and kube-apiserver cannot serve
+	// without etcd. Waiting here would time out, and the members that would end
+	// the wait are started only after this run returns. See awaitingQuorum.
+	StoppedMembers []string
 
 	// Boot starts the VM, or adopts one already running, and returns its pid.
 	// Owned by package main: this package knows nothing about qemu.
@@ -557,6 +570,11 @@ func Up(ctx context.Context, opts UpOptions) error {
 		return joined(ctx, hooks, opts, p, installedAddr)
 	}
 
+	// rejoined is true when the node refused the bootstrap: its etcd existed
+	// before this run, so it is a member coming back rather than a cluster
+	// being created.
+	rejoined := false
+
 	switch err := hooks.bootstrap(ctx, talosconfig, installed); {
 	case err == nil:
 		p.step("bootstrap", "etcd bootstrapped")
@@ -570,8 +588,16 @@ func Up(ctx context.Context, opts UpOptions) error {
 		p.detail("guessed: a machine stopped between apply-config and bootstrap answers the")
 		p.detail("authenticated API with no etcd behind it, and skipping this on that")
 		p.detail("evidence waits for a Ready node that can never arrive")
+
+		rejoined = true
 	default:
 		return fail(err)
+	}
+
+	if rejoined && len(opts.StoppedMembers) > 0 {
+		awaitingQuorum(p, opts)
+
+		return nil
 	}
 
 	// ── 9/10 kubeconfig ─────────────────────────────────────────────────────
@@ -1209,6 +1235,44 @@ func fetchKubeconfig(ctx context.Context, talosconfig []byte, endpoint string) (
 	}
 
 	return kubeconfig, nil
+}
+
+// awaitingQuorum finishes the restart of a bootstrapped member whose cluster
+// still has stopped members, replacing steps 9 and 10.
+//
+// THE STOPPED-CLUSTER DEADLOCK is what it exists to break. When every VM of a
+// three-member cluster stops, the documented recovery is the owner first, then
+// each joiner. The owner alone is one etcd vote of three: etcd has no quorum,
+// kube-apiserver cannot serve, and step 9's Ready-node wait can only time out.
+// Meanwhile a joiner's `up` waits for that one to return. Nothing ends.
+//
+// What this run CAN prove it already has: the node answered the authenticated
+// Talos API in the installed system's stage, and refused a second bootstrap
+// because its etcd data exists. Kubernetes readiness is proved by the last
+// member's run, which waits for its own node to be Ready — something only a
+// cluster with quorum can report.
+//
+// Steps 9 and 10 are skipped rather than attempted: the kubeconfig in the state
+// dir is the one the first run wrote, and the StorageClass is already in etcd.
+func awaitingQuorum(p *printer, opts UpOptions) {
+	stopped := strings.Join(opts.StoppedMembers, ", ")
+
+	p.step("kubeconfig", "skipped (waiting for etcd quorum: %s not running)", stopped)
+	p.detail("this node is one etcd member of a cluster whose other members are stopped.")
+	p.detail("etcd needs a majority of its members to serve, and kube-apiserver needs etcd,")
+	p.detail("so a Ready-node wait here could only time out. The kubeconfig in the state")
+	p.detail("dir is the one the first run wrote")
+
+	p.step("storage", "skipped (the cluster's StorageClass is already in etcd)")
+
+	p.line("")
+	p.line("  restarted; Kubernetes answers once enough members are up. Start each of them:")
+
+	for _, name := range opts.StoppedMembers {
+		p.line("    tinq up <%s's machine file>", name)
+	}
+
+	p.line("")
 }
 
 // joined finishes a bring-up that JOINED a cluster, replacing steps 9 and 10.

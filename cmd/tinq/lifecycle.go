@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/coglative/talos-in-qemu/cluster"
@@ -132,6 +133,61 @@ func (h *hvf) joinersOf(m *unstructured.Unstructured) ([]siteMachine, error) {
 			out = append(out, o)
 		}
 	}
+
+	return out, nil
+}
+
+// stoppedMembers returns, by name and sorted, the members of m's cluster that
+// joined it — directly, or through another member — and whose VMs are not
+// running.
+//
+// Only CONFIGURED members count: a joiner with no talosconfig never applied a
+// config, so it never became an etcd member and holds no vote anyone waits for.
+// The same reading leaveCluster makes.
+func (h *hvf) stoppedMembers(ctx context.Context, m *unstructured.Unstructured) ([]string, error) {
+	seen := map[string]bool{m.GetName(): true}
+	queue := []*unstructured.Unstructured{m}
+
+	var out []string
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+
+		joiners, err := h.joinersOf(cur)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, j := range joiners {
+			if seen[j.GetName()] {
+				continue
+			}
+
+			seen[j.GetName()] = true
+			queue = append(queue, j.Unstructured)
+
+			_, configured, err := cluster.ReadTalosconfig(j.Dir)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", j.GetName(), err)
+			}
+
+			if !configured {
+				continue
+			}
+
+			state, _, err := h.Observe(ctx, j.Unstructured)
+			if err != nil {
+				return nil, fmt.Errorf("observing %s: %w", j.GetName(), err)
+			}
+
+			if state != driverkit.Running {
+				out = append(out, j.GetName())
+			}
+		}
+	}
+
+	sort.Strings(out)
 
 	return out, nil
 }

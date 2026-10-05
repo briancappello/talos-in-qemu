@@ -354,6 +354,65 @@ func TestVMJoinerRefusesAnOwnerThatIsNotUp(t *testing.T) {
 	}
 }
 
+// joinerOf is a member named name at address .addr of the shared segment,
+// joining target.
+func joinerOf(t *testing.T, name string, port, addr int, target string) *unstructured.Unstructured {
+	t.Helper()
+
+	m := netMachine(t, name, port, "cidr: 10.254.0.0/24\naddress: 10.254.0."+itoa(addr)+"\n")
+	m.Object["spec"].(map[string]interface{})["joins"] = target
+
+	return m
+}
+
+// THE STOPPED-CLUSTER DEADLOCK, owner side. Restarting the owner of a cluster
+// whose members are stopped must tell cluster.Up who they are, so the run ends
+// at the Talos API instead of waiting for a Kubernetes that has no etcd quorum.
+// A member that joined through another member counts; a running one, and one
+// that was never configured (no etcd vote), do not.
+func TestOwnerUpNamesItsStoppedMembers(t *testing.T) {
+	g := newGoldenHost(t, "talos.iso")
+	fakeISO(t, filepath.Join(g.images, "talos.iso"), "TALOS_V1_14_1")
+
+	owner := netMachine(t, "cp0", 50000, ownerNet)
+	member(t, g.h, owner, false)
+	member(t, g.h, joinerOf(t, "cp1", 50001, 12, "cp0"), false)
+	member(t, g.h, joinerOf(t, "cp2", 50002, 13, "cp1"), false)
+	member(t, g.h, joinerOf(t, "cp3", 50003, 14, "cp0"), true)
+	seed(t, g.h, joinerOf(t, "cp4", 50004, 15, "cp0"))
+
+	opts, err := upOptions(g.h, owner, driverkit.Stopped, nil)
+	if err != nil {
+		t.Fatalf("upOptions: %v", err)
+	}
+
+	if got := strings.Join(opts.StoppedMembers, ","); got != "cp1,cp2" {
+		t.Errorf("StoppedMembers = %q, want \"cp1,cp2\"\n"+
+			"  reason: cp1 and cp2 are configured and stopped; cp3 is running, and cp4 never "+
+			"applied a config, so neither holds a vote the owner waits for", got)
+	}
+}
+
+// And the other side: a cluster whose members all run, and a single node, are
+// restarted exactly as before — the run waits for Kubernetes.
+func TestOwnerUpWithEveryMemberRunningNamesNone(t *testing.T) {
+	g := newGoldenHost(t, "talos.iso")
+	fakeISO(t, filepath.Join(g.images, "talos.iso"), "TALOS_V1_14_1")
+
+	owner := netMachine(t, "cp0", 50000, ownerNet)
+	member(t, g.h, owner, false)
+	member(t, g.h, joinerOf(t, "cp1", 50001, 12, "cp0"), true)
+
+	opts, err := upOptions(g.h, owner, driverkit.Stopped, nil)
+	if err != nil {
+		t.Fatalf("upOptions: %v", err)
+	}
+
+	if opts.StoppedMembers != nil {
+		t.Errorf("StoppedMembers = %q with every member running, want none", opts.StoppedMembers)
+	}
+}
+
 // 4.4: the probe is asked about the OWNER's address on the site's derived
 // segment, and its failure is the refusal, before anything is created.
 func TestVMJoinerRefusesAnUnusableSegment(t *testing.T) {
