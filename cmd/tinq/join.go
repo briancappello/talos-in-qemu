@@ -137,12 +137,25 @@ func vmJoinOptions(h *hvf, m *unstructured.Unstructured) (*cluster.JoinOptions, 
 
 	// The owner must be THERE, not merely recorded: a joiner booted beside a
 	// stopped owner installs, then waits out an etcd join nobody can answer.
+	//
+	// HOW "there" is asked depends on whether this machine is already a
+	// member. A new joiner needs the cluster SERVING, so it asks Kubernetes.
+	// An existing member — it has a talosconfig, so it applied a config and
+	// joined etcd — may be one of the votes the owner's etcd is waiting for:
+	// after a whole cluster stopped, the owner alone has no quorum and its
+	// Kubernetes cannot answer until members like this one return. It asks
+	// for the owner's VM and Talos API instead. See realOwnerUp.
+	_, member, err := cluster.ReadTalosconfig(h.dir(m))
+	if err != nil {
+		return nil, err
+	}
+
 	ownerUp := h.ownerUp
 	if ownerUp == nil {
 		ownerUp = h.realOwnerUp
 	}
 
-	if err := ownerUp(owner, join.Kubeconfig); err != nil {
+	if err := ownerUp(owner, join.Kubeconfig, member); err != nil {
 		return nil, fmt.Errorf("%s names %q, which is not up: %w\n\n"+
 			"  start the owner first:  tinq up <%s's machine file>\n"+
 			"  on a stopped cluster the owner comes up first, then each joiner",
@@ -174,10 +187,17 @@ func vmJoinOptions(h *hvf, m *unstructured.Unstructured) (*cluster.JoinOptions, 
 // either answering or it is not; this is not a wait for it to come up.
 const ownerAPITimeout = 10 * time.Second
 
-// realOwnerUp asks the host whether the owner's VM is running, and the owner's
-// Kubernetes API whether it answers, through the kubeconfig the joiner is about
-// to reuse.
-func (h *hvf) realOwnerUp(owner siteMachine, kubeconfig []byte) error {
+// realOwnerUp asks the host whether the owner's VM is running, then asks the
+// owner itself.
+//
+// A NEW joiner asks the owner's Kubernetes API, through the kubeconfig it is
+// about to reuse: joining needs a cluster that is serving.
+//
+// An existing MEMBER asks the owner's authenticated Talos API instead, with the
+// owner's talosconfig. Asking Kubernetes would deadlock a stopped cluster's
+// restart: the owner alone is one etcd vote of several, its kube-apiserver
+// cannot serve without quorum, and this member is part of that quorum.
+func (h *hvf) realOwnerUp(owner siteMachine, kubeconfig []byte, member bool) error {
 	state, _, err := h.Observe(context.Background(), owner.Unstructured)
 	if err != nil {
 		return err
@@ -187,7 +207,20 @@ func (h *hvf) realOwnerUp(owner siteMachine, kubeconfig []byte) error {
 		return fmt.Errorf("its VM is %s", state)
 	}
 
-	return cluster.KubeAPIAnswers(context.Background(), kubeconfig, ownerAPITimeout)
+	if !member {
+		return cluster.KubeAPIAnswers(context.Background(), kubeconfig, ownerAPITimeout)
+	}
+
+	talosconfig, configured, err := cluster.ReadTalosconfig(owner.Dir)
+	if err != nil {
+		return err
+	}
+
+	if !configured {
+		return fmt.Errorf("its talosconfig is not in %s, so its Talos API cannot be asked", owner.Dir)
+	}
+
+	return cluster.TalosAPIAnswers(context.Background(), talosconfig, talosEndpoint(owner.Unstructured), ownerAPITimeout)
 }
 
 // findOwner finds the recorded machine named target on m's site. A machine of

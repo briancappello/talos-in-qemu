@@ -253,6 +253,41 @@ func TestWaitBootstrapReadyNeedsTheClusterPKI(t *testing.T) {
 	}
 }
 
+// TalosAPIAnswers is a precondition, not a wait: a joiner asks it about its
+// owner before booting anything, so a socket that accepts and never speaks
+// Talos is a FAST "no", inside the bound it was given.
+func TestTalosAPIAnswersIsOneBoundedRequest(t *testing.T) {
+	t.Parallel()
+
+	addr, _ := acceptOnlyListener(t)
+
+	err := runBounded(t, 10*time.Second, func() error {
+		return TalosAPIAnswers(context.Background(), mustGenerateDefault(t).Talosconfig, addr, time.Second)
+	})
+	if err == nil {
+		t.Fatal("a socket that accepts but never speaks Talos was reported answering")
+	}
+
+	if !strings.Contains(err.Error(), addr) {
+		t.Errorf("the refusal does not name the endpoint it asked: %s", redactErr(err))
+	}
+}
+
+// Without the cluster PKI there is nothing to ask with, and the refusal must
+// not quote the credential it could not parse.
+func TestTalosAPIAnswersNeedsTheClusterPKI(t *testing.T) {
+	t.Parallel()
+
+	addr, _ := acceptOnlyListener(t)
+
+	err := runBounded(t, 5*time.Second, func() error {
+		return TalosAPIAnswers(context.Background(), []byte("\tnot a talosconfig\n"), addr, 30*time.Second)
+	})
+	if err == nil || strings.Contains(err.Error(), "not a talosconfig") {
+		t.Fatalf("TalosAPIAnswers with rubbish credentials = %v, want a refusal that does not echo them", err)
+	}
+}
+
 func TestWaitsRefuseAnEmptyEndpoint(t *testing.T) {
 	t.Parallel()
 

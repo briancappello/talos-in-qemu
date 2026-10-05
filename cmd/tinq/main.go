@@ -68,8 +68,9 @@ type hvf struct {
 
 	// ownerUp and probeSegment are the two questions a joiner puts to its
 	// owner before it boots. nil means the real ones (see join.go); tests
-	// substitute them because the real ones need a running VM.
-	ownerUp      func(owner siteMachine, kubeconfig []byte) error
+	// substitute them because the real ones need a running VM. member is true
+	// when the joiner is already a member of the owner's cluster.
+	ownerUp      func(owner siteMachine, kubeconfig []byte, member bool) error
 	probeSegment func(group netip.Addr, port int, target netip.Addr) error
 	// members are the etcd and Kubernetes calls destroy makes on a cluster of
 	// several VMs. nil means the real ones (see lifecycle.go).

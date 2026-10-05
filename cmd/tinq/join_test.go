@@ -262,7 +262,7 @@ spec:
 
 // healthyOwner stands in for a running owner on a working segment.
 func healthyOwner(h *hvf) {
-	h.ownerUp = func(siteMachine, []byte) error { return nil }
+	h.ownerUp = func(siteMachine, []byte, bool) error { return nil }
 	h.probeSegment = func(netip.Addr, int, netip.Addr) error { return nil }
 	h.memTotal = func() (int, error) { return 64 << 10, nil }
 }
@@ -326,9 +326,13 @@ func TestHostMemTotalReadsThisHost(t *testing.T) {
 func TestVMJoinerRefusesAnOwnerThatIsNotUp(t *testing.T) {
 	g := newGoldenHost(t, "talos.iso")
 	healthyOwner(g.h)
-	g.h.ownerUp = func(owner siteMachine, kubeconfig []byte) error {
+	g.h.ownerUp = func(owner siteMachine, kubeconfig []byte, member bool) error {
 		if owner.GetName() != "cp0" || len(kubeconfig) == 0 {
 			t.Errorf("ownerUp was asked about %q with a kubeconfig of %d bytes", owner.GetName(), len(kubeconfig))
+		}
+
+		if member {
+			t.Error("a joiner with no talosconfig was treated as an existing member")
 		}
 
 		return errors.New("its VM is Stopped")
@@ -351,6 +355,124 @@ func TestVMJoinerRefusesAnOwnerThatIsNotUp(t *testing.T) {
 
 	if _, statErr := os.Stat(g.h.dir(m)); !errors.Is(statErr, os.ErrNotExist) {
 		t.Error("the joiner's state directory exists after the refusal")
+	}
+}
+
+// quorumlessOwner stands in for the owner of a stopped three-member cluster,
+// restarted alone: its VM runs and its Talos API answers, but its Kubernetes
+// API cannot, because one etcd vote of three is no quorum.
+func quorumlessOwner(calls *[]bool) func(siteMachine, []byte, bool) error {
+	return func(_ siteMachine, _ []byte, member bool) error {
+		*calls = append(*calls, member)
+
+		if member {
+			return nil
+		}
+
+		return errors.New("the Kubernetes API at https://127.0.0.1:6443 did not answer: connection reset by peer")
+	}
+}
+
+// THE STOPPED-CLUSTER DEADLOCK, joiner side. A joiner that is already a member
+// — it holds a talosconfig, so it applied a config and joined etcd — is part of
+// the quorum its owner is waiting for. Requiring the owner's Kubernetes API
+// first refuses the one machine that could make it answer.
+func TestVMJoinerRestartAcceptsAnOwnerWaitingForQuorum(t *testing.T) {
+	g := newGoldenHost(t, "talos.iso")
+	healthyOwner(g.h)
+
+	var calls []bool
+	g.h.ownerUp = quorumlessOwner(&calls)
+
+	seedOwner(t, g.h, netMachine(t, "cp0", 50000, ownerNet), allArtifacts)
+	m := joiner(t, g, joinerNet)
+	member(t, g.h, m, false)
+
+	opts, err := upOptions(g.h, m, driverkit.Stopped, nil)
+	if err != nil {
+		t.Fatalf("a member restarting beside its running owner was refused: %v\n"+
+			"  reason: the owner's Kubernetes API needs etcd quorum, and this member is part of it", err)
+	}
+
+	if opts.Join == nil {
+		t.Error("the restarted member resolved no join")
+	}
+
+	if len(calls) != 1 || !calls[0] {
+		t.Errorf("ownerUp calls (member?) = %v, want one, asking about an existing member", calls)
+	}
+}
+
+// The original reason for the check still holds for a NEW joiner: booted beside
+// an owner whose cluster is not serving, it installs and then waits out an etcd
+// join nobody can answer. Only an existing member is let through.
+func TestVMJoinerNeverJoinedStillNeedsTheOwnersKubernetes(t *testing.T) {
+	g := newGoldenHost(t, "talos.iso")
+	healthyOwner(g.h)
+
+	var calls []bool
+	g.h.ownerUp = quorumlessOwner(&calls)
+
+	seedOwner(t, g.h, netMachine(t, "cp0", 50000, ownerNet), allArtifacts)
+	m := joiner(t, g, joinerNet)
+
+	_, err := upOptions(g.h, m, driverkit.Absent, nil)
+	if err == nil {
+		t.Fatal("a new joiner was accepted beside an owner whose Kubernetes API does not answer")
+	}
+
+	for _, want := range []string{"cp0", "Kubernetes API", "start the owner first"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+
+	if _, statErr := os.Stat(g.h.dir(m)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Error("the joiner's state directory exists after the refusal")
+	}
+}
+
+// An existing member is still refused a STOPPED owner: the documented order is
+// owner first, and the owner is what holds the endpoint every member dials.
+func TestVMJoinerRestartStillRefusesAStoppedOwner(t *testing.T) {
+	g := newGoldenHost(t, "talos.iso")
+	healthyOwner(g.h)
+
+	owner := netMachine(t, "cp0", 50000, ownerNet)
+	seedOwner(t, g.h, owner, allArtifacts)
+	member(t, g.h, owner, false)
+	g.h.ownerUp = nil // the real check: the VM is asked first, and it is Stopped
+
+	m := joiner(t, g, joinerNet)
+	member(t, g.h, m, false)
+
+	_, err := upOptions(g.h, m, driverkit.Stopped, nil)
+	if err == nil || !strings.Contains(err.Error(), "Stopped") || !strings.Contains(err.Error(), "start the owner first") {
+		t.Fatalf("upOptions = %v, want a refusal saying the owner is Stopped and to start it first", err)
+	}
+}
+
+// realOwnerUp's member branch asks the owner's Talos API with the OWNER's
+// credential. Without one there is nothing to ask with, and the refusal says
+// which file is missing rather than dialling.
+func TestRealOwnerUpForAMemberNeedsTheOwnersTalosconfig(t *testing.T) {
+	h := &hvf{stateRoot: t.TempDir()}
+
+	owner := netMachine(t, "cp0", 50000, ownerNet)
+	dir := member(t, h, owner, true)
+
+	if err := os.Remove(filepath.Join(dir, "talosconfig")); err != nil {
+		t.Fatal(err)
+	}
+
+	o, err := findOwner(h, joinerOf(t, "cp1", 50001, 12, "cp0"), "cp0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = h.realOwnerUp(o, nil, true)
+	if err == nil || !strings.Contains(err.Error(), "talosconfig") {
+		t.Fatalf("realOwnerUp = %v, want a refusal naming the owner's missing talosconfig", err)
 	}
 }
 

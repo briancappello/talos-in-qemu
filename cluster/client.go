@@ -306,6 +306,34 @@ func checkBootstrapStage(stage runtimeres.MachineStage) error {
 	}
 }
 
+// TalosAPIAnswers makes ONE authenticated request to a node's Talos API, with
+// no retries, and accepts only the installed system's own stages. It is
+// KubeAPIAnswers' counterpart for a node whose Kubernetes cannot answer yet: a
+// restarted etcd member waiting for the quorum its peers bring.
+//
+// The stage, not just the handshake, for the reason WaitBootstrapReady gives:
+// a maintenance boot that took a config serves the cluster PKI too.
+//
+// talosconfig is SECRET and is neither logged nor placed in an error.
+func TalosAPIAnswers(ctx context.Context, talosconfig []byte, endpoint string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	c, err := AuthenticatedClient(ctx, talosconfig, endpoint)
+	if err != nil {
+		return err
+	}
+
+	defer c.Close() //nolint:errcheck
+
+	status, err := safe.StateGet[*runtimeres.MachineStatus](ctx, c.COSI, runtimeres.NewMachineStatus().Metadata())
+	if err != nil {
+		return fmt.Errorf("the Talos API at %s did not answer: %w", endpoint, err)
+	}
+
+	return checkBootstrapStage(status.TypedSpec().Stage)
+}
+
 // KubeAPIAnswers makes ONE authenticated request to the Kubernetes API, with no
 // retries. It is a precondition check, not a wait: a joiner asks it about its
 // owner before booting anything, and a slow "no" is worse than a fast one.
