@@ -73,6 +73,7 @@ A VM with `spec.hostname` SHALL register with Kubernetes under exactly that name
 - `tinq up` on a running cluster SHALL stay a no-op success, and the first bring-up of an owner or a joiner SHALL be unchanged.
 - `tinq destroy` on a joiner SHALL remove the member from etcd before it destroys the VM.
 - `tinq destroy` on an owner SHALL refuse while joiners of its site exist, unless an explicit flag destroys the joiners first.
+- The explicit flag SHALL destroy every machine that joined, directly or through another member. On the machine that created the cluster, it SHALL destroy the whole cluster without etcd calls, whether its members are Running or stopped, because no member survives. On a machine that joined, each destroyed member SHALL first be removed from etcd.
 
 #### Scenario: A joiner does not start before its owner
 
@@ -102,6 +103,12 @@ A VM with `spec.hostname` SHALL register with Kubernetes under exactly that name
 
 - **WHEN** a joiner's state directory exists and `tinq destroy` runs on the owner without the explicit flag
 - **THEN** nothing is destroyed, and the message names the joiners and the flag
+
+#### Scenario: A stopped cluster is destroyed as a whole
+
+- **WHEN** all three VMs of a bootstrapped three-member cluster are stopped
+- **AND** `tinq destroy --with-joiners` runs on the owner
+- **THEN** it succeeds without `--force`, and no state directory and no qemu process of the cluster remains
 
 ### Requirement: Host capacity is checked before a joiner boots
 

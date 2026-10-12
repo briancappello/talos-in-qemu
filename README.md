@@ -668,6 +668,11 @@ and two VMs of a site with the same host port.
   the member by hand with `talosctl etcd remove-member`.
 - **`destroy` on the owner** refuses while joiners exist.
   `destroy --with-joiners` destroys each joiner first, then the owner.
+  This includes a joiner that joined through another joiner. The whole
+  cluster goes, so `destroy` does not change etcd, and it works when the
+  members are stopped. `--with-joiners` on a joiner destroys that joiner and
+  the machines that joined through it. The owner stays, so each of them first
+  leaves etcd.
   `--force` destroys the owner alone, and the joiners become orphans.
 
 Run one `up` or `destroy` at a time per site. The checks read the state

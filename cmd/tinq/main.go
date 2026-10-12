@@ -205,7 +205,7 @@ func newRootCmd() *cobra.Command {
 	var destroyOpts destroyOptions
 
 	destroy.Flags().BoolVar(&destroyOpts.withJoiners, "with-joiners", false,
-		"also destroy the machines that joined this one, each leaving etcd first")
+		"also destroy the machines that joined this one; on the machine that created the cluster, the whole cluster goes, stopped or running")
 	destroy.Flags().BoolVar(&destroyOpts.force, "force", false,
 		"destroy even if joiners are orphaned or the etcd member cannot be removed")
 	destroy.RunE = func(cmd *cobra.Command, args []string) error {

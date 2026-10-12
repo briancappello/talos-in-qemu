@@ -208,25 +208,89 @@ func TestDestroyJoinerThatCannotLeaveIsRefusedUnlessForced(t *testing.T) {
 	}
 }
 
-func TestDestroyOwnerWithJoinersTakesThemFirst(t *testing.T) {
+// chain is a three-member cluster where cp2 joined THROUGH cp1, not cp0. A
+// joiner's state directory holds the cluster's secrets too, so this is a
+// cluster tinq builds.
+func chain(t *testing.T) (cp0, cp1, cp2 *unstructured.Unstructured) {
+	t.Helper()
+
+	cp0, cp1 = ownerAndJoiner(t)
+	cp2 = netMachine(t, "cp2", 50002, "cidr: 10.254.0.0/24\naddress: 10.254.0.13\n")
+	cp2.Object["spec"].(map[string]interface{})["joins"] = "cp1"
+
+	return cp0, cp1, cp2
+}
+
+// --with-joiners on the machine that CREATED the cluster takes all of it, so
+// no member survives to need etcd membership cleaned up. It must not ask
+// etcd, whatever the members' power states: a stopped cluster has no member to
+// ask through, and one with a single member up has no quorum to answer.
+func TestDestroyWholeClusterDoesNotTouchEtcd(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		running [3]bool
+	}{
+		{"every member stopped", [3]bool{false, false, false}},
+		{"only the owner running, no quorum", [3]bool{true, false, false}},
+		{"every member running", [3]bool{true, true, true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &hvf{stateRoot: t.TempDir()}
+			rec := &memberCalls{leaveErr: errors.New("etcd: no quorum")}
+			h.members = rec.ops()
+
+			cp0, cp1, cp2 := chain(t)
+			dirs := []string{
+				member(t, h, cp0, tc.running[0]),
+				member(t, h, cp1, tc.running[1]),
+				member(t, h, cp2, tc.running[2]),
+			}
+
+			if err := destroyMachine(context.Background(), h, machineFile(t, cp0), destroyOptions{withJoiners: true}); err != nil {
+				t.Fatalf("destroy --with-joiners: %v", err)
+			}
+
+			for _, d := range dirs {
+				if exists(d) {
+					t.Errorf("destroy --with-joiners left %s behind", d)
+				}
+			}
+
+			if len(rec.calls) != 0 {
+				t.Errorf("a whole-cluster destroy touched the cluster: %q", rec.calls)
+			}
+		})
+	}
+}
+
+// --with-joiners on a member that itself JOINED takes only part of the
+// cluster: the owner survives, and every member taken leaves etcd first —
+// cp2, which joined through cp1, as well as cp1.
+func TestDestroyJoinerWithJoinersStillLeavesEtcd(t *testing.T) {
 	h := &hvf{stateRoot: t.TempDir()}
 	rec := &memberCalls{}
 	h.members = rec.ops()
 
-	owner, joiner := ownerAndJoiner(t)
-	ownerDir := member(t, h, owner, true)
-	joinerDir := member(t, h, joiner, true)
+	cp0, cp1, cp2 := chain(t)
+	ownerDir := member(t, h, cp0, true)
+	cp1Dir := member(t, h, cp1, true)
+	cp2Dir := member(t, h, cp2, false)
 
-	if err := destroyMachine(context.Background(), h, machineFile(t, owner), destroyOptions{withJoiners: true}); err != nil {
+	if err := destroyMachine(context.Background(), h, machineFile(t, cp1), destroyOptions{withJoiners: true}); err != nil {
 		t.Fatalf("destroy --with-joiners: %v", err)
 	}
 
-	if len(rec.calls) == 0 || !strings.HasPrefix(rec.calls[0], "leave 127.0.0.1:50001") {
-		t.Errorf("cluster calls = %q, want the joiner to leave etcd first", rec.calls)
+	want := []string{
+		"remove via 127.0.0.1:50000 peer 10.254.0.13 talosconfig-of-cp2", "deleteNode 10.254.0.13",
+		"leave 127.0.0.1:50001 talosconfig-of-cp1", "deleteNode 10.254.0.12",
+	}
+	if strings.Join(rec.calls, "|") != strings.Join(want, "|") {
+		t.Errorf("cluster calls = %q, want %q", rec.calls, want)
 	}
 
-	if exists(joinerDir) || exists(ownerDir) {
-		t.Error("destroy --with-joiners left a state directory behind")
+	if exists(cp1Dir) || exists(cp2Dir) || !exists(ownerDir) {
+		t.Errorf("cp1 gone=%v cp2 gone=%v owner kept=%v; want all true",
+			!exists(cp1Dir), !exists(cp2Dir), exists(ownerDir))
 	}
 }
 

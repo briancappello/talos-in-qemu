@@ -186,6 +186,20 @@ $ kubectl get nodes                                 # rt0, rt1, rt2 Ready
 
 Directly after the last `up`, two nodes still showed `SchedulingDisabled`. This is the cordon from Talos's graceful shutdown. Talos removed it by itself in less than 90s. tinq does nothing about it.
 
+Destroy of a fully stopped three-member cluster (2026-10-12). rt2 joined through rt1, and rt1 joined rt0. All three were stopped. The binary before the fix refused, and destroyed nothing:
+
+```
+$ tinq destroy --with-joiners rt0.yaml        # before the fix: exit 1
+destroying rt1, which joined rt0
+tinq: rt1 was not removed from etcd, so it is not destroyed: rt1 is Stopped and
+no other member of the cluster is running to remove it through
+$ tinq destroy --with-joiners rt0.yaml        # after the fix: exit 0
+destroying the whole cluster of rt0; etcd membership is not changed, since no member survives
+destroying rt2, which joined rt1
+destroying rt1, which joined rt0
+$ ls ~/.hvf/restart-test                      # gone; no qemu process left
+```
+
 ## 6.4 Single node, unchanged
 
 `examples/bootstrap-machine.yaml`, which has none of the new fields, on `talos-v1.13.7-amd64.iso`:

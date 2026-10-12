@@ -29,7 +29,9 @@ import (
 
 // destroyOptions are the destroy verb's flags.
 type destroyOptions struct {
-	// withJoiners destroys the owner's joiners first, each leaving etcd.
+	// withJoiners destroys the machines that joined this one, directly or
+	// through another member, first. Each leaves etcd only when the cluster
+	// outlives the run; destroying the creating machine takes all of it.
 	withJoiners bool
 	// force destroys regardless: an owner with joiners (they are orphaned),
 	// or a joiner whose etcd member cannot be removed.
@@ -85,11 +87,34 @@ func destroyMachine(ctx context.Context, d *hvf, path string, opts destroyOption
 	if len(joiners) > 0 {
 		switch {
 		case opts.withJoiners:
-			for _, j := range joiners {
-				log.Printf("destroying %s, which joined %s", j.GetName(), m.GetName())
+			// Every member that joined through m, not only the direct ones: a
+			// member destroyed with its own joiners still recorded would orphan
+			// them. Taken in reverse, so each goes before the one it joined.
+			all, err := d.allJoinersOf(m)
+			if err != nil {
+				return err
+			}
 
-				if err := d.leaveCluster(ctx, j.Unstructured, opts.force); err != nil {
-					return err
+			// THE WHOLE CLUSTER goes when m is the machine that created it. Then
+			// no member survives to need etcd membership cleaned up, and asking
+			// etcd can only get in the way: a stopped cluster has no member to
+			// ask through, and one with a single member running has no quorum
+			// to answer. A taken member is removed from etcd only when the
+			// cluster outlives this run.
+			whole := driverkit.Str(m, "spec", "joins") == ""
+			if whole {
+				log.Printf("destroying the whole cluster of %s; etcd membership is not changed, "+
+					"since no member survives", m.GetName())
+			}
+
+			for i := len(all) - 1; i >= 0; i-- {
+				j := all[i]
+				log.Printf("destroying %s, which joined %s", j.GetName(), driverkit.Str(j.Unstructured, "spec", "joins"))
+
+				if !whole {
+					if err := d.leaveCluster(ctx, j.Unstructured, opts.force); err != nil {
+						return err
+					}
 				}
 
 				if err := d.Destroy(ctx, j.Unstructured); err != nil {
@@ -137,18 +162,15 @@ func (h *hvf) joinersOf(m *unstructured.Unstructured) ([]siteMachine, error) {
 	return out, nil
 }
 
-// stoppedMembers returns, by name and sorted, the members of m's cluster that
-// joined it — directly, or through another member — and whose VMs are not
-// running.
-//
-// Only CONFIGURED members count: a joiner with no talosconfig never applied a
-// config, so it never became an etcd member and holds no vote anyone waits for.
-// The same reading leaveCluster makes.
-func (h *hvf) stoppedMembers(ctx context.Context, m *unstructured.Unstructured) ([]string, error) {
+// allJoinersOf returns the recorded machines that joined m directly, or through
+// another member that did, breadth first: every machine comes after the one it
+// joined. A joiner's state directory holds the cluster's secrets too, so
+// spec.joins may name any member, not only the one that created the cluster.
+func (h *hvf) allJoinersOf(m *unstructured.Unstructured) ([]siteMachine, error) {
 	seen := map[string]bool{m.GetName(): true}
 	queue := []*unstructured.Unstructured{m}
 
-	var out []string
+	var out []siteMachine
 
 	for len(queue) > 0 {
 		cur := queue[0]
@@ -166,24 +188,45 @@ func (h *hvf) stoppedMembers(ctx context.Context, m *unstructured.Unstructured) 
 
 			seen[j.GetName()] = true
 			queue = append(queue, j.Unstructured)
+			out = append(out, j)
+		}
+	}
 
-			_, configured, err := cluster.ReadTalosconfig(j.Dir)
-			if err != nil {
-				return nil, fmt.Errorf("%s: %w", j.GetName(), err)
-			}
+	return out, nil
+}
 
-			if !configured {
-				continue
-			}
+// stoppedMembers returns, by name and sorted, the members of m's cluster that
+// joined it — directly, or through another member — and whose VMs are not
+// running.
+//
+// Only CONFIGURED members count: a joiner with no talosconfig never applied a
+// config, so it never became an etcd member and holds no vote anyone waits for.
+// The same reading leaveCluster makes.
+func (h *hvf) stoppedMembers(ctx context.Context, m *unstructured.Unstructured) ([]string, error) {
+	joiners, err := h.allJoinersOf(m)
+	if err != nil {
+		return nil, err
+	}
 
-			state, _, err := h.Observe(ctx, j.Unstructured)
-			if err != nil {
-				return nil, fmt.Errorf("observing %s: %w", j.GetName(), err)
-			}
+	var out []string
 
-			if state != driverkit.Running {
-				out = append(out, j.GetName())
-			}
+	for _, j := range joiners {
+		_, configured, err := cluster.ReadTalosconfig(j.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", j.GetName(), err)
+		}
+
+		if !configured {
+			continue
+		}
+
+		state, _, err := h.Observe(ctx, j.Unstructured)
+		if err != nil {
+			return nil, fmt.Errorf("observing %s: %w", j.GetName(), err)
+		}
+
+		if state != driverkit.Running {
+			out = append(out, j.GetName())
 		}
 	}
 
