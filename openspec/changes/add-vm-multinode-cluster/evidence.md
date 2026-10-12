@@ -168,6 +168,24 @@ cp1 left etcd
 $ ls ~/.hvf/multinode      # gone; no qemu process left
 ```
 
+Restart of a fully stopped three-member cluster (2026-10-12, at c2ed96c). Three members on their own site, all Ready, then all three stopped:
+
+```
+$ tinq stop rt2.yaml & tinq stop rt1.yaml & tinq stop rt0.yaml & wait   # no qemu process left
+$ tinq up rt0.yaml                                  # owner first: 18s, exit 0
+[ 8/10] bootstrap     already bootstrapped (the node refused a second one)
+[ 9/10] kubeconfig    skipped (waiting for etcd quorum: rt1, rt2 not running)
+[10/10] storage       skipped (the cluster's StorageClass is already in etcd)
+$ tinq up rt1.yaml                                  # 41s, exit 0
+[ 9/10] kubeconfig    wrote the cluster's kubeconfig, node 10.254.9.12 Ready after 22s
+$ tinq up rt2.yaml                                  # 20s, exit 0
+[ 9/10] kubeconfig    wrote the cluster's kubeconfig, node 10.254.9.13 Ready after 1s
+$ talosctl ... etcd members                         # rt0, rt1, rt2, no learners
+$ kubectl get nodes                                 # rt0, rt1, rt2 Ready
+```
+
+Directly after the last `up`, two nodes still showed `SchedulingDisabled`. This is the cordon from Talos's graceful shutdown. Talos removed it by itself in less than 90s. tinq does nothing about it.
+
 ## 6.4 Single node, unchanged
 
 `examples/bootstrap-machine.yaml`, which has none of the new fields, on `talos-v1.13.7-amd64.iso`:
